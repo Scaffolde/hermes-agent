@@ -1,0 +1,7 @@
+name: obsidian
+version: 0.1.0
+description: "Obsidian/SecondBrain memory — direct Markdown archive and keyword recall provider."
+hooks:
+  - on_memory_write
+  - sync_turn
+  - on_pre_compress

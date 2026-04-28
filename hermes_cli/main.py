@@ -7645,7 +7645,15 @@ def cmd_profile(args):
 
 
 def cmd_dashboard(args):
-    """Start the web UI server."""
+    """Start or inspect the web UI server."""
+    dashboard_command = getattr(args, "dashboard_command", None)
+    if dashboard_command in {"health", "status"}:
+        from hermes_cli.dashboard_health import format_probe_result, probe_dashboard
+
+        result = probe_dashboard(host=args.host, port=args.port)
+        print(format_probe_result(result))
+        sys.exit(0 if result.ok else 1)
+
     try:
         import fastapi  # noqa: F401
         import uvicorn  # noqa: F401
@@ -10000,6 +10008,12 @@ Examples:
         "dashboard",
         help="Start the web UI dashboard",
         description="Launch the Hermes Agent web dashboard for managing config, API keys, and sessions",
+    )
+    dashboard_parser.add_argument(
+        "dashboard_command",
+        nargs="?",
+        choices=["health", "status"],
+        help="Optional dashboard action: health/status probes the running server",
     )
     dashboard_parser.add_argument(
         "--port", type=int, default=9119, help="Port (default 9119)"

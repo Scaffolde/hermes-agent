@@ -224,6 +224,24 @@ class TestSkillViewQualifiedName:
         assert result["success"] is True
         assert result["name"] == "my-local"
 
+    def test_bare_name_resolves_frontmatter_name_when_directory_differs(self, tmp_path, monkeypatch):
+        from tools.skills_tool import skill_view, skills_list
+
+        skill_dir = tmp_path / "local-skills" / "gstack-browse"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: browse\ndescription: Browse via gstack\n---\nBrowse body.\n"
+        )
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", tmp_path / "local-skills")
+
+        listed = json.loads(skills_list())
+        assert [s["name"] for s in listed["skills"]] == ["browse"]
+
+        result = json.loads(skill_view("browse"))
+        assert result["success"] is True
+        assert result["name"] == "browse"
+        assert "Browse body." in result["content"]
+
     def test_plugin_exists_but_skill_missing(self, tmp_path):
         from tools.skills_tool import skill_view
 

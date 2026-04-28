@@ -52,6 +52,29 @@ class TestProviderEnvDetection:
 
 
 class TestDoctorToolAvailabilityOverrides:
+    def test_tool_unavailable_reason_uses_specific_auth_or_context_hints(self):
+        assert doctor._tool_unavailable_reason({"name": "homeassistant", "env_vars": []}) == "(not authenticated/configured: HASS_URL, HASS_TOKEN)"
+        assert doctor._tool_unavailable_reason({"name": "spotify", "env_vars": []}) == "(not authenticated: run hermes auth spotify)"
+        assert doctor._tool_unavailable_reason({"name": "hermes-yuanbao", "env_vars": []}) == "(requires active yuanbao gateway session)"
+        assert doctor._tool_unavailable_reason({"name": "yuanbao", "env_vars": []}) == "(requires active yuanbao gateway session)"
+        assert doctor._tool_unavailable_reason({"name": "web", "env_vars": ["EXA_API_KEY"]}) == "(missing EXA_API_KEY)"
+
+    def test_splits_intentionally_disabled_optional_tools_from_broken_tools(self):
+        unavailable = [
+            {"name": "homeassistant", "env_vars": ["HASS_TOKEN"]},
+            {"name": "spotify", "env_vars": []},
+            {"name": "hermes-yuanbao", "env_vars": []},
+            {"name": "browser", "env_vars": []},
+        ]
+
+        active, disabled = doctor._split_disabled_tool_availability(
+            unavailable,
+            {"homeassistant", "spotify", "yuanbao"},
+        )
+
+        assert [item["name"] for item in disabled] == ["homeassistant", "spotify", "hermes-yuanbao"]
+        assert [item["name"] for item in active] == ["browser"]
+
     def test_marks_honcho_available_when_configured(self, monkeypatch):
         monkeypatch.setattr(doctor, "_honcho_is_configured_for_doctor", lambda: True)
 

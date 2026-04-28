@@ -10,7 +10,7 @@ import subprocess
 import shutil
 from pathlib import Path
 
-from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
+from hermes_cli.config import get_project_root, get_hermes_home, get_env_path, load_config
 from hermes_constants import display_hermes_home
 
 PROJECT_ROOT = get_project_root()
@@ -117,6 +117,59 @@ def _apply_doctor_tool_availability_overrides(available: list[str], unavailable:
             continue
         updated_unavailable.append(item)
     return updated_available, updated_unavailable
+
+
+def _doctor_disabled_toolsets() -> set[str]:
+    """Return globally disabled toolsets from config.yaml for doctor reporting."""
+    try:
+        agent_cfg = load_config().get("agent") or {}
+    except Exception:
+        return set()
+    disabled = agent_cfg.get("disabled_toolsets") or []
+    return {str(item) for item in disabled}
+
+
+def _toolset_disabled_aliases(name: str) -> set[str]:
+    """Return config aliases that disable a registry/toolset availability row."""
+    aliases = {name}
+    if name.startswith("hermes-"):
+        aliases.add(name.removeprefix("hermes-"))
+    return aliases
+
+
+def _split_disabled_tool_availability(
+    unavailable: list[dict],
+    disabled_toolsets: set[str],
+) -> tuple[list[dict], list[dict]]:
+    """Separate intentionally disabled optional toolsets from broken checks."""
+    active_unavailable: list[dict] = []
+    disabled_unavailable: list[dict] = []
+    for item in unavailable:
+        aliases = _toolset_disabled_aliases(str(item.get("name", "")))
+        if aliases & disabled_toolsets:
+            disabled_unavailable.append(item)
+        else:
+            active_unavailable.append(item)
+    return active_unavailable, disabled_unavailable
+
+
+def _tool_unavailable_reason(item: dict) -> str:
+    """Return a precise, non-stigmatizing availability reason for doctor output."""
+    env_vars = item.get("missing_vars") or item.get("env_vars") or []
+    if env_vars:
+        return f"(missing {', '.join(env_vars)})"
+
+    name = item.get("name", "")
+    if name == "homeassistant":
+        return "(not authenticated/configured: HASS_URL, HASS_TOKEN)"
+    if name == "spotify":
+        return "(not authenticated: run hermes auth spotify)"
+    if name in {"yuanbao", "hermes-yuanbao"}:
+        return "(requires active yuanbao gateway session)"
+    if name in {"browser", "browser-cdp"}:
+        return "(system dependency not met)"
+    return "(availability check failed)"
+
 
 
 def check_ok(text: str, detail: str = ""):
@@ -1070,18 +1123,18 @@ def run_doctor(args):
         
         available, unavailable = check_tool_availability()
         available, unavailable = _apply_doctor_tool_availability_overrides(available, unavailable)
+        disabled_toolsets = _doctor_disabled_toolsets()
+        unavailable, disabled_unavailable = _split_disabled_tool_availability(unavailable, disabled_toolsets)
         
         for tid in available:
             info = TOOLSET_REQUIREMENTS.get(tid, {})
             check_ok(info.get("name", tid))
         
+        for item in disabled_unavailable:
+            check_info(f"{item['name']} optional-disabled (agent.disabled_toolsets)")
+
         for item in unavailable:
-            env_vars = item.get("missing_vars") or item.get("env_vars") or []
-            if env_vars:
-                vars_str = ", ".join(env_vars)
-                check_warn(item["name"], f"(missing {vars_str})")
-            else:
-                check_warn(item["name"], "(system dependency not met)")
+            check_warn(item["name"], _tool_unavailable_reason(item))
 
         # Count disabled tools with API key requirements
         api_disabled = [u for u in unavailable if (u.get("missing_vars") or u.get("env_vars"))]
