@@ -2656,7 +2656,7 @@ class AIAgent:
         return "openai.azure.com" in url
 
     def _resolved_api_call_timeout(self) -> float:
-        """Resolve the effective per-call request timeout in seconds.
+        """Resolve the per-call API timeout for OpenAI-wire requests.
 
         Priority:
           1. ``providers.<id>.models.<model>.timeout_seconds`` (per-model override)
@@ -2674,6 +2674,40 @@ class AIAgent:
         if cfg is not None:
             return cfg
         return float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
+
+    def _is_nvidia_deepseek_v4_pro_route(self, model: str | None = None) -> bool:
+        """Return True for the slow free NVIDIA NIM DeepSeek V4 Pro route."""
+        eff_model = str(model if model is not None else self.model or "").strip().lower()
+        if eff_model in {"deepseek-v4-pro", "deepseek-ai/deepseek-v4-pro"}:
+            return self.provider == "nvidia" or base_url_host_matches(
+                str(self.base_url or ""),
+                "integrate.api.nvidia.com",
+            )
+        return False
+
+    def _resolved_stream_read_timeout(self, *, model: str | None = None) -> float:
+        """Resolve httpx streaming read timeout.
+
+        Explicit provider/model config and ``HERMES_STREAM_READ_TIMEOUT`` still
+        win.  When the user has not overridden the default 120s read timeout,
+        known long-prefill routes (local endpoints and NVIDIA DeepSeek V4 Pro)
+        inherit the broader API timeout instead of failing before first token.
+        """
+        cfg = get_provider_request_timeout(self.provider, self.model)
+        if cfg is not None:
+            return cfg
+
+        env_timeout = os.getenv("HERMES_STREAM_READ_TIMEOUT")
+        if env_timeout is not None:
+            return float(env_timeout)
+
+        stream_read_timeout = 120.0
+        base_timeout = self._resolved_api_call_timeout()
+        if self.base_url and is_local_endpoint(self.base_url):
+            return base_timeout
+        if self._is_nvidia_deepseek_v4_pro_route(model):
+            return base_timeout
+        return stream_read_timeout
 
     def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
         """Resolve the base non-stream stale timeout and whether it is implicit.
@@ -6445,27 +6479,19 @@ class AIAgent:
             import httpx as _httpx
             # Per-provider / per-model request_timeout_seconds (from config.yaml)
             # wins over the HERMES_API_TIMEOUT env default if the user set it.
-            _provider_timeout_cfg = get_provider_request_timeout(self.provider, self.model)
-            _base_timeout = (
-                _provider_timeout_cfg
-                if _provider_timeout_cfg is not None
-                else float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
-            )
-            # Read timeout: config wins here too.  Otherwise use
-            # HERMES_STREAM_READ_TIMEOUT (default 120s) for cloud providers.
-            if _provider_timeout_cfg is not None:
-                _stream_read_timeout = _provider_timeout_cfg
-            else:
-                _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
-                # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
-                # prefill on large contexts before producing the first token.
-                # Auto-increase the httpx read timeout unless the user explicitly
-                # overrode HERMES_STREAM_READ_TIMEOUT.
-                if _stream_read_timeout == 120.0 and self.base_url and is_local_endpoint(self.base_url):
-                    _stream_read_timeout = _base_timeout
+            _base_timeout = self._resolved_api_call_timeout()
+            _stream_model = str(api_kwargs.get("model") or self.model or "").strip().lower()
+            _stream_read_timeout = self._resolved_stream_read_timeout(model=_stream_model)
+            if _stream_read_timeout == _base_timeout:
+                if self.base_url and is_local_endpoint(self.base_url):
                     logger.debug(
                         "Local provider detected (%s) — stream read timeout raised to %.0fs",
                         self.base_url, _stream_read_timeout,
+                    )
+                elif self._is_nvidia_deepseek_v4_pro_route(_stream_model):
+                    logger.debug(
+                        "NVIDIA DeepSeek V4 Pro route detected — stream read timeout raised to %.0fs",
+                        _stream_read_timeout,
                     )
             stream_kwargs = {
                 **api_kwargs,

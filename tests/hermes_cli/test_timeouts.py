@@ -212,6 +212,75 @@ def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
     assert agent2._resolved_api_call_timeout() == 1800.0
 
 
+def test_nvidia_deepseek_v4_pro_inherits_api_timeout_for_stream_reads(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_STREAM_READ_TIMEOUT", raising=False)
+    monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
+
+    from run_agent import AIAgent
+    agent = AIAgent(
+        model="deepseek-ai/deepseek-v4-pro",
+        provider="nvidia",
+        api_key="sk-dummy",
+        base_url="https://integrate.api.nvidia.com/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+
+    assert agent._is_nvidia_deepseek_v4_pro_route() is True
+    assert agent._resolved_stream_read_timeout() == 1800.0
+
+
+def test_stream_read_timeout_env_override_wins_for_nvidia_deepseek(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("HERMES_STREAM_READ_TIMEOUT", "240")
+
+    from run_agent import AIAgent
+    agent = AIAgent(
+        model="deepseek-v4-pro",
+        provider="nvidia",
+        api_key="sk-dummy",
+        base_url="https://integrate.api.nvidia.com/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+
+    assert agent._resolved_stream_read_timeout() == 240.0
+
+
+def test_stream_read_timeout_model_config_wins_for_nvidia_deepseek(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("HERMES_STREAM_READ_TIMEOUT", "240")
+    _write_config(tmp_path, """\
+        providers:
+          nvidia:
+            models:
+              deepseek-ai/deepseek-v4-pro:
+                timeout_seconds: 900
+        """)
+
+    from run_agent import AIAgent
+    agent = AIAgent(
+        model="deepseek-ai/deepseek-v4-pro",
+        provider="nvidia",
+        api_key="sk-dummy",
+        base_url="https://integrate.api.nvidia.com/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+
+    assert agent._resolved_stream_read_timeout() == 900.0
+
+
 def test_resolved_api_call_stale_timeout_priority(monkeypatch, tmp_path):
     """AIAgent stale timeout honors config > env > default priority."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
