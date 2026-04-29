@@ -211,6 +211,12 @@ class ChatCompletionsTransport(ProviderTransport):
         if timeout is not None:
             api_kwargs["timeout"] = timeout
 
+        nvidia_model = (model or "").strip().lower()
+        is_nvidia_deepseek_v4_pro = (
+            params.get("is_nvidia_nim", False)
+            and nvidia_model == "deepseek-ai/deepseek-v4-pro"
+        )
+
         # Temperature
         fixed_temp = params.get("fixed_temperature")
         omit_temp = params.get("omit_temperature", False)
@@ -218,6 +224,11 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs.pop("temperature", None)
         elif fixed_temp is not None:
             api_kwargs["temperature"] = fixed_temp
+        elif is_nvidia_deepseek_v4_pro:
+            # NVIDIA's DeepSeek V4 Pro sample requires explicit sampling params;
+            # it is not interchangeable with the generic OpenAI-compatible path.
+            api_kwargs["temperature"] = 1
+            api_kwargs["top_p"] = 0.95
 
         # Qwen metadata (caller precomputes {sessionId, promptId})
         qwen_meta = params.get("qwen_session_metadata")
@@ -345,6 +356,12 @@ class ChatCompletionsTransport(ProviderTransport):
 
         if is_qwen:
             extra_body["vl_high_resolution_images"] = True
+
+        if is_nvidia_deepseek_v4_pro:
+            # build.nvidia.com documents DeepSeek V4 Pro with thinking disabled
+            # via chat_template_kwargs. Send it as an extra_body key so the
+            # OpenAI SDK serializes it into the top-level JSON request body.
+            extra_body["chat_template_kwargs"] = {"thinking": False}
 
         if provider_name in {"gemini", "google-gemini-cli"}:
             thinking_config = _build_gemini_thinking_config(model, reasoning_config)

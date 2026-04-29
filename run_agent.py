@@ -6470,7 +6470,6 @@ class AIAgent:
             stream_kwargs = {
                 **api_kwargs,
                 "stream": True,
-                "stream_options": {"include_usage": True},
                 "timeout": _httpx.Timeout(
                     connect=30.0,
                     read=_stream_read_timeout,
@@ -6478,6 +6477,13 @@ class AIAgent:
                     pool=30.0,
                 ),
             }
+            _stream_model = str(stream_kwargs.get("model") or "").strip().lower()
+            _is_nvidia_deepseek_v4_pro = (
+                base_url_host_matches(str(self.base_url or ""), "integrate.api.nvidia.com")
+                and _stream_model == "deepseek-ai/deepseek-v4-pro"
+            )
+            if not _is_nvidia_deepseek_v4_pro:
+                stream_kwargs["stream_options"] = {"include_usage": True}
             request_client_holder["client"] = self._create_request_openai_client(
                 reason="chat_completion_stream_request",
                 api_kwargs=stream_kwargs,
