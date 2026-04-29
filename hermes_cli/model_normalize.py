@@ -114,6 +114,19 @@ _LOWERCASE_MODEL_PROVIDERS: frozenset[str] = frozenset({
     "xiaomi",
 })
 
+# NVIDIA NIM uses provider-specific catalog slugs for some third-party models
+# hosted on build.nvidia.com. Users often paste native/direct family names
+# (e.g. ``deepseek-v4-pro``); repair these aliases for manual model entry.
+_NVIDIA_MODEL_ALIASES: dict[str, str] = {
+    "deepseek-v4-pro": "deepseek-ai/deepseek-v4-pro",
+    "deepseek-v4-flash": "deepseek-ai/deepseek-v4-flash",
+    "deepseek-v3.2": "deepseek-ai/deepseek-v3.2",
+    "minimax-m2.7": "minimaxai/minimax-m2.7",
+    "minimax-m2.5": "minimaxai/minimax-m2.5",
+    "glm-5.1": "z-ai/glm-5.1",
+    "glm5": "z-ai/glm5",
+}
+
 # ---------------------------------------------------------------------------
 # DeepSeek special handling
 # ---------------------------------------------------------------------------
@@ -179,9 +192,20 @@ def _normalize_for_deepseek(model_name: str) -> str:
     return "deepseek-chat"
 
 
+def _normalize_for_nvidia(model_name: str) -> str:
+    """Map common family-native names to NVIDIA NIM catalog slugs."""
+    name = (model_name or "").strip()
+    if not name:
+        return name
+    if "/" in name:
+        return name
+    return _NVIDIA_MODEL_ALIASES.get(name.lower(), name)
+
+
 # ---------------------------------------------------------------------------
 # Helper utilities
 # ---------------------------------------------------------------------------
+
 
 def _strip_vendor_prefix(model_name: str) -> str:
     """Remove a ``vendor/`` prefix if present.
@@ -390,6 +414,12 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
 
     # --- Aggregators: need vendor/model format ---
     if provider in _AGGREGATOR_PROVIDERS:
+        if provider == "ai-gateway" and "/" not in name:
+            lowered = name.lower()
+            if lowered.startswith("glm-"):
+                return f"zai/{name}"
+            if lowered.startswith("grok-"):
+                return f"xai/{name}"
         return _prepend_vendor(name)
 
     # --- OpenCode Zen: Claude stays hyphenated; other models keep dots ---
@@ -441,6 +471,10 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
         if "/" in bare:
             return bare
         return _normalize_for_deepseek(bare)
+
+    # --- NVIDIA NIM: selected hosted third-party models need provider slugs ---
+    if provider == "nvidia":
+        return _normalize_for_nvidia(name)
 
     # --- Direct providers: repair matching provider prefixes only ---
     if provider in _MATCHING_PREFIX_STRIP_PROVIDERS:

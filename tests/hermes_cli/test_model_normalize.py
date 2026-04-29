@@ -164,6 +164,26 @@ class TestAggregatorProviders:
         result = normalize_model_for_provider("anthropic/claude-sonnet-4.6", "openrouter")
         assert result == "anthropic/claude-sonnet-4.6"
 
+    @pytest.mark.parametrize("model,expected", [
+        ("glm-5.1", "zai/glm-5.1"),
+        ("grok-4.20-reasoning", "xai/grok-4.20-reasoning"),
+    ])
+    def test_ai_gateway_uses_vercel_vendor_slugs(self, model, expected):
+        result = normalize_model_for_provider(model, "ai-gateway")
+        assert result == expected
+
+
+class TestNvidiaNimModelNormalization:
+    @pytest.mark.parametrize("model,expected", [
+        ("deepseek-v4-pro", "deepseek-ai/deepseek-v4-pro"),
+        ("deepseek-v4-flash", "deepseek-ai/deepseek-v4-flash"),
+        ("minimax-m2.7", "minimaxai/minimax-m2.7"),
+        ("glm-5.1", "z-ai/glm-5.1"),
+        ("deepseek-ai/deepseek-v4-pro", "deepseek-ai/deepseek-v4-pro"),
+    ])
+    def test_nvidia_repairs_common_bare_family_names(self, model, expected):
+        assert normalize_model_for_provider(model, "nvidia") == expected
+
 
 class TestIssue6211NativeProviderPrefixNormalization:
     @pytest.mark.parametrize("model,target_provider,expected", [
