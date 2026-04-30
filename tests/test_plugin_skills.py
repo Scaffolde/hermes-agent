@@ -242,6 +242,27 @@ class TestSkillViewQualifiedName:
         assert result["name"] == "browse"
         assert "Browse body." in result["content"]
 
+    def test_skill_view_serializes_yaml_date_metadata(self, tmp_path, monkeypatch):
+        from tools.skills_tool import skill_view
+
+        skill_dir = tmp_path / "local-skills" / "dated-metadata"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: dated-metadata\n"
+            "description: Skill with unquoted YAML date metadata\n"
+            "metadata:\n"
+            "  curator:\n"
+            "    umbrella_built: 2026-04-30\n"
+            "---\n"
+            "Body.\n"
+        )
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", tmp_path / "local-skills")
+
+        result = json.loads(skill_view("dated-metadata"))
+        assert result["success"] is True
+        assert result["metadata"]["curator"]["umbrella_built"] == "2026-04-30"
+
     def test_plugin_exists_but_skill_missing(self, tmp_path):
         from tools.skills_tool import skill_view
 
