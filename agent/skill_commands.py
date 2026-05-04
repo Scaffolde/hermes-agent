@@ -23,8 +23,37 @@ logger = logging.getLogger(__name__)
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
+_SKILL_CAMEL_BOUNDARY_1 = re.compile(r"(.)([A-Z][a-z]+)")
+_SKILL_CAMEL_BOUNDARY_2 = re.compile(r"([a-z0-9])([A-Z])")
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
+
+
+def _normalize_skill_command_slug(raw_name: str) -> str:
+    """Return Hermes' historical compact slash slug for a skill name."""
+    cmd_name = str(raw_name or "").lower().replace(' ', '-').replace('_', '-')
+    cmd_name = _SKILL_INVALID_CHARS.sub('', cmd_name)
+    return _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
+
+
+def _skill_command_slugs(raw_name: str) -> list[str]:
+    """Return all slash slugs for a skill, preserving compatibility.
+
+    Hermes historically lowercased CamelCase skill names without inserting word
+    breaks, so ``RootCauseAnalysis`` became ``/rootcauseanalysis``. Keep that
+    compact form, and also expose a human-readable kebab alias such as
+    ``/root-cause-analysis`` so Scaffolde-projected CamelCase skills are
+    discoverable from slash help and autocomplete.
+    """
+    compact = _normalize_skill_command_slug(raw_name)
+    camel_split = _SKILL_CAMEL_BOUNDARY_1.sub(r"\1-\2", str(raw_name or ""))
+    camel_split = _SKILL_CAMEL_BOUNDARY_2.sub(r"\1-\2", camel_split)
+    kebab = _normalize_skill_command_slug(camel_split)
+    slugs: list[str] = []
+    for slug in (compact, kebab):
+        if slug and slug not in slugs:
+            slugs.append(slug)
+    return slugs
 
 
 def _resolve_skill_commands_platform() -> Optional[str]:
@@ -283,20 +312,21 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                                 description = line[:80]
                                 break
                     seen_names.add(name)
-                    # Normalize to hyphen-separated slug, stripping
-                    # non-alnum chars (e.g. +, /) to avoid invalid
-                    # Telegram command names downstream.
-                    cmd_name = name.lower().replace(' ', '-').replace('_', '-')
-                    cmd_name = _SKILL_INVALID_CHARS.sub('', cmd_name)
-                    cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
-                    if not cmd_name:
-                        continue
-                    _skill_commands[f"/{cmd_name}"] = {
+                    skill_info = {
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
                         "skill_dir": str(skill_md.parent),
                     }
+                    registered = False
+                    for cmd_name in _skill_command_slugs(str(name)):
+                        key = f"/{cmd_name}"
+                        if key in _skill_commands:
+                            continue
+                        _skill_commands[key] = skill_info
+                        registered = True
+                    if not registered:
+                        continue
                 except Exception:
                     continue
     except Exception:

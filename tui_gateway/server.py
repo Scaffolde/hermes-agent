@@ -4005,10 +4005,20 @@ def _(rid, params: dict) -> dict:
         try:
             from agent.skill_commands import scan_skill_commands
 
+            skill_pairs: list[list[str]] = []
             for k, info in sorted(scan_skill_commands().items()):
                 d = str(info.get("description", "Skill"))
-                all_pairs.append([k, d[:120] + ("…" if len(d) > 120 else "")])
+                desc = d[:120] + ("…" if len(d) > 120 else "")
+                canon[k.lower()] = k
+                all_pairs.append([k, desc])
+                skill_pairs.append([k, desc])
                 skill_count += 1
+            if skill_pairs:
+                bucket = "Skill Commands"
+                if bucket not in cat_map:
+                    cat_map[bucket] = []
+                    cat_order.append(bucket)
+                cat_map[bucket].extend(skill_pairs)
         except Exception as e:
             warning = f"skill discovery unavailable: {e}"
 
@@ -4677,7 +4687,7 @@ def _(rid, params: dict) -> dict:
         items = [
             {
                 "text": c.text,
-                "display": c.display or c.text,
+                "display": to_plain_text(c.display) if c.display else c.text,
                 "meta": to_plain_text(c.display_meta) if c.display_meta else "",
             }
             for c in completer.get_completions(doc, None)

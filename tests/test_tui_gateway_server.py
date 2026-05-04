@@ -1232,6 +1232,55 @@ def test_complete_slash_includes_tui_mouse_command():
     assert any(item["text"] == "/mouse" for item in resp["result"]["items"])
 
 
+def test_commands_catalog_groups_skill_commands(monkeypatch):
+    fake_skills = {
+        "/premortem": {"name": "premortem", "description": "Run a premortem"},
+        "/root-cause-analysis": {
+            "name": "RootCauseAnalysis",
+            "description": "Find root causes",
+        },
+    }
+    monkeypatch.setattr(
+        "agent.skill_commands.scan_skill_commands",
+        lambda: fake_skills,
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+    result = resp["result"]
+
+    skill_categories = [
+        cat for cat in result["categories"] if cat["name"] == "Skill Commands"
+    ]
+    assert skill_categories
+    assert ["/premortem", "Run a premortem"] in skill_categories[0]["pairs"]
+    assert result["skill_count"] == 2
+    assert result["canon"]["/root-cause-analysis"] == "/root-cause-analysis"
+
+
+def test_complete_slash_includes_skill_kebab_alias(monkeypatch):
+    fake_skills = {
+        "/root-cause-analysis": {
+            "name": "RootCauseAnalysis",
+            "description": "Find root causes",
+        }
+    }
+    monkeypatch.setattr(
+        "agent.skill_commands.get_skill_commands",
+        lambda: fake_skills,
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "complete.slash", "params": {"text": "/root-c"}}
+    )
+
+    assert any(
+        item["display"] == "/root-cause-analysis"
+        for item in resp["result"]["items"]
+    )
+
+
 def test_complete_slash_details_args():
     resp_root = server.handle_request(
         {"id": "0", "method": "complete.slash", "params": {"text": "/details"}}

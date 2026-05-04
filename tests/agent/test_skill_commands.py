@@ -10,6 +10,7 @@ from agent.skill_commands import (
     build_skill_invocation_message,
     resolve_skill_command_key,
     scan_skill_commands,
+    _skill_command_slugs,
 )
 
 
@@ -177,6 +178,20 @@ class TestScanSkillCommands:
             assert "/telegram-only" not in telegram_again
             assert "/discord-only" in telegram_again
 
+
+    def test_camelcase_skills_get_legacy_and_kebab_aliases(self, tmp_path):
+        """Scaffolde CamelCase skills should be discoverable as kebab slash aliases."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "RootCauseAnalysis")
+            result = scan_skill_commands()
+
+        assert _skill_command_slugs("RootCauseAnalysis") == [
+            "rootcauseanalysis",
+            "root-cause-analysis",
+        ]
+        assert "/rootcauseanalysis" in result
+        assert "/root-cause-analysis" in result
+        assert result["/root-cause-analysis"]["name"] == "RootCauseAnalysis"
 
     def test_special_chars_stripped_from_cmd_key(self, tmp_path):
         """Skill names with +, /, or other special chars produce clean cmd keys."""
