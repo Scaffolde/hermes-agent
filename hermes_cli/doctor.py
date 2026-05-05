@@ -163,6 +163,20 @@ def _split_disabled_tool_availability(
     return active_unavailable, disabled_unavailable
 
 
+def _split_runtime_gated_tool_availability(
+    unavailable: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Separate toolsets that are intentionally hidden outside a worker runtime."""
+    active_unavailable: list[dict] = []
+    runtime_gated: list[dict] = []
+    for item in unavailable:
+        if item.get("name") == "kanban":
+            runtime_gated.append(item)
+        else:
+            active_unavailable.append(item)
+    return active_unavailable, runtime_gated
+
+
 def _tool_unavailable_reason(item: dict) -> str:
     """Return a precise, non-stigmatizing availability reason for doctor output."""
     env_vars = item.get("missing_vars") or item.get("env_vars") or []
@@ -1270,6 +1284,7 @@ def run_doctor(args):
         available, unavailable = _apply_doctor_tool_availability_overrides(available, unavailable)
         disabled_toolsets = _doctor_disabled_toolsets()
         unavailable, disabled_unavailable = _split_disabled_tool_availability(unavailable, disabled_toolsets)
+        unavailable, runtime_gated_unavailable = _split_runtime_gated_tool_availability(unavailable)
         
         for tid in available:
             info = TOOLSET_REQUIREMENTS.get(tid, {})
@@ -1277,6 +1292,9 @@ def run_doctor(args):
         
         for item in disabled_unavailable:
             check_info(f"{item['name']} optional-disabled (agent.disabled_toolsets)")
+
+        for item in runtime_gated_unavailable:
+            check_info(f"{item['name']} runtime-gated (available inside kanban worker tasks)")
 
         for item in unavailable:
             check_warn(item["name"], _tool_unavailable_reason(item))

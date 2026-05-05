@@ -189,6 +189,13 @@ class TestLaunchdPlistPath:
         else:
             raise AssertionError("PATH key not found in plist")
 
+
+    def test_plist_sets_higher_file_descriptor_limit(self):
+        plist = gateway_cli.generate_launchd_plist()
+        assert "<key>SoftResourceLimits</key>" in plist
+        assert "<key>NumberOfFiles</key>" in plist
+        assert "<integer>65536</integer>" in plist
+
     def test_plist_path_includes_current_env_path(self, monkeypatch):
         monkeypatch.setenv("PATH", "/custom/bin:/usr/bin:/bin")
         plist = gateway_cli.generate_launchd_plist()
