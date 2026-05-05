@@ -24,6 +24,7 @@ import re
 import subprocess
 
 _IS_WINDOWS = platform.system() == "Windows"
+_IS_DARWIN = platform.system() == "Darwin"
 from pathlib import Path
 from typing import Dict, Optional, Any
 
@@ -53,6 +54,19 @@ def _kill_port_process(port: int) -> None:
                             )
                         except subprocess.SubprocessError:
                             pass
+        elif _IS_DARWIN:
+            # macOS fuser doesn't support port/tcp syntax; use lsof instead
+            result = subprocess.run(
+                ["lsof", "-ti", f":{port}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                pids = [p.strip() for p in result.stdout.strip().splitlines() if p.strip()]
+                if pids:
+                    subprocess.run(
+                        ["kill"] + pids,
+                        capture_output=True, timeout=5,
+                    )
         else:
             result = subprocess.run(
                 ["fuser", f"{port}/tcp"],
@@ -63,8 +77,8 @@ def _kill_port_process(port: int) -> None:
                     ["fuser", "-k", f"{port}/tcp"],
                     capture_output=True, timeout=5,
                 )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("_kill_port_process(port=%d) failed: %s", port, exc)
 
 
 def _terminate_bridge_process(proc, *, force: bool = False) -> None:
@@ -354,6 +368,18 @@ class WhatsAppAdapter(BasePlatformAdapter):
             return True
         return self._message_matches_mention_patterns(data)
     
+    async def _close_stale_session(self) -> None:
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+
+    async def _cancel_stale_poll(self) -> None:
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
     async def connect(self) -> bool:
         """
         Start the WhatsApp bridge.
@@ -419,7 +445,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
                                 print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
                                 self._mark_connected()
                                 self._bridge_process = None  # Not managed by us
+                                await self._close_stale_session()
                                 self._http_session = aiohttp.ClientSession()
+                                await self._cancel_stale_poll()
                                 self._poll_task = asyncio.create_task(self._poll_messages())
                                 return True
                             else:
@@ -526,9 +554,11 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     print(f"[{self.name}]   If session expired, re-pair: hermes whatsapp")
             
             # Create a persistent HTTP session for all bridge communication
+            await self._close_stale_session()
             self._http_session = aiohttp.ClientSession()
 
             # Start message polling task
+            await self._cancel_stale_poll()
             self._poll_task = asyncio.create_task(self._poll_messages())
             
             self._mark_connected()
@@ -628,6 +658,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         self._bridge_process = None
         self._close_bridge_log()
+        self._shutting_down = False
         print(f"[{self.name}] Disconnected")
     
     def format_message(self, content: str) -> str:
@@ -944,6 +975,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         """Poll the bridge for incoming messages."""
         import aiohttp
 
+        poll_backoff = 0
+
         while self._running:
             if not self._http_session:
                 break
@@ -962,6 +995,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                             event = await self._build_message_event(msg_data)
                             if event:
                                 await self.handle_message(event)
+                        poll_backoff = 0
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -970,8 +1004,10 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     print(f"[{self.name}] {bridge_exit}")
                     break
                 print(f"[{self.name}] Poll error: {e}")
-                await asyncio.sleep(5)
-            
+                backoff_sleep = min(5 * 2 ** poll_backoff, 60)
+                poll_backoff += 1
+                await asyncio.sleep(backoff_sleep)
+
             await asyncio.sleep(1)  # Poll interval
     
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:

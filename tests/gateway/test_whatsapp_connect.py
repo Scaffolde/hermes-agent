@@ -64,6 +64,7 @@ def _make_adapter():
     adapter._auto_tts_disabled_chats = set()
     adapter._message_queue = asyncio.Queue()
     adapter._http_session = None
+    adapter._poll_task = None
     return adapter
 
 
@@ -478,6 +479,7 @@ class TestKillPortProcess:
         mock_check = MagicMock(returncode=0)
 
         with patch("gateway.platforms.whatsapp._IS_WINDOWS", False), \
+             patch("gateway.platforms.whatsapp._IS_DARWIN", False), \
              patch("gateway.platforms.whatsapp.subprocess.run", return_value=mock_check) as mock_run:
             _kill_port_process(3000)
 
@@ -491,6 +493,7 @@ class TestKillPortProcess:
         mock_check = MagicMock(returncode=1)  # port not in use
 
         with patch("gateway.platforms.whatsapp._IS_WINDOWS", False), \
+             patch("gateway.platforms.whatsapp._IS_DARWIN", False), \
              patch("gateway.platforms.whatsapp.subprocess.run", return_value=mock_check) as mock_run:
             _kill_port_process(3000)
 
