@@ -1160,6 +1160,7 @@ class GatewayRunner:
                     retention_days=int(_ckpt_cfg.get("retention_days", 7)),
                     min_interval_hours=int(_ckpt_cfg.get("min_interval_hours", 24)),
                     delete_orphans=bool(_ckpt_cfg.get("delete_orphans", True)),
+                    max_total_size_mb=int(_ckpt_cfg.get("max_total_size_mb", 500)),
                 )
         except Exception as exc:
             logger.debug("checkpoint auto-maintenance skipped: %s", exc)
@@ -12928,12 +12929,19 @@ class GatewayRunner:
         # - Slack DM threading needs event_message_id fallback (reply thread)
         # - Telegram uses message_thread_id only for forum topics; passing a
         #   normal DM/group message id as thread_id causes send failures
+        # - Feishu only honors reply_in_thread when sending a reply, so topic
+        #   progress uses the triggering event message as the reply target
         # - Other platforms should use explicit source.thread_id only
         if source.platform == Platform.SLACK:
             _progress_thread_id = source.thread_id or event_message_id
         else:
             _progress_thread_id = source.thread_id
         _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _progress_reply_to = (
+            event_message_id
+            if source.platform == Platform.FEISHU and source.thread_id and event_message_id
+            else None
+        )
 
         async def send_progress_messages():
             if not progress_queue:
@@ -13047,15 +13055,30 @@ class GatewayRunner:
                                     adapter.name,
                                 )
                             can_edit = False
-                            await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                            await adapter.send(
+                                chat_id=source.chat_id,
+                                content=msg,
+                                reply_to=_progress_reply_to,
+                                metadata=_progress_metadata,
+                            )
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
                             full_text = "\n".join(progress_lines)
-                            result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
+                            result = await adapter.send(
+                                chat_id=source.chat_id,
+                                content=full_text,
+                                reply_to=_progress_reply_to,
+                                metadata=_progress_metadata,
+                            )
                         else:
                             # Editing unsupported: send just this line
-                            result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                            result = await adapter.send(
+                                chat_id=source.chat_id,
+                                content=msg,
+                                reply_to=_progress_reply_to,
+                                metadata=_progress_metadata,
+                            )
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
 
@@ -13155,7 +13178,17 @@ class GatewayRunner:
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
-        _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
+            # Feishu topics only keep messages inside the topic when they are
+            # sent via the reply API with reply_in_thread=true. Status/interim,
+            # approval, and stream-consumer paths usually only receive metadata,
+            # so carry the triggering message id as a Feishu-specific fallback.
+            _status_thread_metadata: Optional[Dict[str, Any]] = {
+                "thread_id": _progress_thread_id,
+                "reply_to_message_id": event_message_id,
+            }
+        else:
+            _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -13299,7 +13332,7 @@ class GatewayRunner:
                             adapter=_adapter,
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
-                            metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
+                            metadata=_status_thread_metadata,
                             on_new_message=(
                                 (lambda: progress_queue.put(("__reset__",)))
                                 if progress_queue is not None

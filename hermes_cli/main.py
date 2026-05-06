@@ -1706,7 +1706,7 @@ def _is_profile_api_key_provider(provider_id: str) -> bool:
     """Return True when provider_id maps to a profile with auth_type='api_key'.
 
     Used as a catch-all in select_provider_and_model() so that new providers
-    declared in providers/*.py automatically dispatch to _model_flow_api_key_provider
+    declared in plugins/model-providers/<name>/ automatically dispatch to _model_flow_api_key_provider
     without requiring an explicit elif branch here.
     """
     try:
@@ -9386,6 +9386,20 @@ Examples:
         "-l", "--label", help="Label for the snapshot (only used with --quick)"
     )
     backup_parser.set_defaults(func=cmd_backup)
+
+    # =========================================================================
+    # checkpoints command
+    # =========================================================================
+    checkpoints_parser = subparsers.add_parser(
+        "checkpoints",
+        help="Inspect / prune / clear ~/.hermes/checkpoints/",
+        description="Manage the filesystem checkpoint store — the shadow git "
+        "repo hermes uses to snapshot working directories before "
+        "write_file/patch/terminal calls. Lets you see how much "
+        "space checkpoints occupy, force a prune, or wipe the base.",
+    )
+    from hermes_cli.checkpoints import register_cli as _register_checkpoints_cli
+    _register_checkpoints_cli(checkpoints_parser)
 
     # =========================================================================
     # import command
