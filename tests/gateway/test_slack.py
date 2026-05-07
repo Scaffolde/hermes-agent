@@ -940,6 +940,51 @@ class TestIncomingDocumentHandling:
         assert msg_event.text == "hello world"
 
     @pytest.mark.asyncio
+    async def test_first_class_user_channel_mention_is_routed(self, adapter):
+        """A public-channel mention of the Scaff Olde user account is addressable."""
+        adapter._team_user_ids = {"T123": "U_PAI"}
+        adapter._team_user_clients = {"T123": AsyncMock()}
+        event = self._make_event(
+            text="<@U_PAI> hello from channel",
+            channel_type="channel",
+        )
+        event.update({"channel": "C123", "team": "T123"})
+
+        with patch.object(adapter, "_resolve_user_name", new_callable=AsyncMock) as resolve:
+            resolve.return_value = "Gary"
+            await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_awaited_once()
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "hello from channel"
+        assert msg_event.source.chat_type == "group"
+        assert msg_event.source.thread_id == "1234567890.000001"
+        assert ("C123", "1234567890.000001") in adapter._user_addressed_threads
+
+    @pytest.mark.asyncio
+    async def test_first_class_user_addressed_thread_replies_use_user_client(self, adapter):
+        """Replies in a first-class-user-addressed channel thread post as the user."""
+        user_client = AsyncMock()
+        user_client.chat_postMessage = AsyncMock(return_value={"ts": "1234567890.000002"})
+        bot_client = AsyncMock()
+        bot_client.chat_postMessage = AsyncMock(return_value={"ts": "999"})
+        adapter._channel_team = {"C123": "T123"}
+        adapter._team_user_clients = {"T123": user_client}
+        adapter._team_clients = {"T123": bot_client}
+        adapter._user_addressed_threads = {("C123", "1234567890.000001")}
+
+        result = await adapter.send(
+            "C123",
+            "reply from first-class user",
+            metadata={"thread_id": "1234567890.000001"},
+        )
+
+        assert result.success is True
+        user_client.chat_postMessage.assert_awaited_once()
+        bot_client.chat_postMessage.assert_not_called()
+        assert "1234567890.000002" in adapter._user_sent_message_ts
+
+    @pytest.mark.asyncio
     async def test_rich_text_quotes_and_lists_are_extracted(self, adapter):
         """Nested quote and list content should be surfaced from rich_text blocks."""
         event = self._make_event(

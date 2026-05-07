@@ -292,8 +292,12 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_mode_task: Optional[asyncio.Task] = None
         # Multi-workspace support
         self._team_clients: Dict[str, Any] = {}   # team_id → WebClient
+        self._team_user_clients: Dict[str, Any] = {}  # team_id → Scaff Olde user WebClient
+        self._team_user_ids: Dict[str, str] = {}      # team_id → Scaff Olde user_id
         self._team_bot_user_ids: Dict[str, str] = {}          # team_id → bot_user_id
         self._channel_team: Dict[str, str] = {}                # channel_id → team_id
+        self._user_addressed_threads: set[tuple[str, str]] = set()  # (channel_id, thread_ts)
+        self._user_sent_message_ts: set[str] = set()  # messages posted with Scaff Olde user token
         # Dedup cache: prevents duplicate bot responses when Socket Mode
         # reconnects redeliver events.
         self._dedup = MessageDeduplicator()
@@ -506,6 +510,11 @@ class SlackAdapter(BasePlatformAdapter):
 
         # Support comma-separated bot tokens for multi-workspace
         bot_tokens = [t.strip() for t in raw_token.split(",") if t.strip()]
+        # Optional Scaff Olde first-class-account path. When pai@scaffolde.ai
+        # authorizes the app with user scopes, these xoxp user tokens let Hermes
+        # reply in DMs addressed to that user rather than only the bot transport.
+        raw_user_token = os.getenv("SLACK_USER_TOKEN") or os.getenv("SLACK_SCAFF_OLDE_USER_TOKEN")
+        user_tokens = [t.strip() for t in (raw_user_token or "").split(",") if t.strip()]
 
         # Also load tokens from OAuth token file
         from hermes_constants import get_hermes_home
@@ -568,6 +577,26 @@ class SlackAdapter(BasePlatformAdapter):
                 logger.info(
                     "[Slack] Authenticated as @%s in workspace %s (team: %s)",
                     bot_name, team_name, team_id,
+                )
+
+            # Register optional Scaff Olde user tokens. These do not replace
+            # Socket Mode's app token; they provide a user-perspective Web API
+            # client for DMs/private conversations the bot token cannot see.
+            for token in user_tokens:
+                user_client = AsyncWebClient(token=token)
+                _apply_slack_proxy(user_client, proxy_url)
+                auth_response = await user_client.auth_test()
+                team_id = auth_response.get("team_id", "")
+                user_id = auth_response.get("user_id", "")
+                user_name = auth_response.get("user", "unknown")
+                team_name = auth_response.get("team", "unknown")
+                if team_id:
+                    self._team_user_clients[team_id] = user_client
+                    if user_id:
+                        self._team_user_ids[team_id] = user_id
+                logger.info(
+                    "[Slack] Authenticated Scaff Olde user token as @%s in workspace %s (team: %s)",
+                    user_name, team_name, team_id,
                 )
 
             # Register message event handler
@@ -692,9 +721,22 @@ class SlackAdapter(BasePlatformAdapter):
 
         logger.info("[Slack] Disconnected")
 
-    def _get_client(self, chat_id: str) -> Any:
-        """Return the workspace-specific WebClient for a channel."""
+    def _get_client(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> Any:
+        """Return the workspace-specific WebClient for a channel.
+
+        DMs addressed to the Scaff Olde first-class Slack account, and channel
+        threads that began with a mention of that account, should use the user
+        token so replies come from the first-class user rather than the app bot.
+        """
         team_id = self._channel_team.get(chat_id)
+        thread_ts = None
+        if metadata:
+            thread_ts = metadata.get("thread_id") or metadata.get("thread_ts")
+        user_thread = bool(thread_ts and (chat_id, str(thread_ts)) in self._user_addressed_threads)
+        if team_id and team_id in self._team_user_clients and (chat_id.startswith("D") or user_thread):
+            return self._team_user_clients[team_id]
+        if chat_id.startswith("D") and not team_id and len(self._team_user_clients) == 1:
+            return next(iter(self._team_user_clients.values()))
         if team_id and team_id in self._team_clients:
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
@@ -735,6 +777,14 @@ class SlackAdapter(BasePlatformAdapter):
             # Controlled via platform config: gateway.slack.reply_broadcast
             broadcast = self.config.extra.get("reply_broadcast", False)
 
+            selected_client = self._get_client(chat_id, metadata=metadata)
+            selected_team_id = self._channel_team.get(chat_id)
+            using_user_client = bool(
+                selected_team_id
+                and selected_team_id in self._team_user_clients
+                and selected_client is self._team_user_clients[selected_team_id]
+            )
+
             for i, chunk in enumerate(chunks):
                 kwargs = {
                     "channel": chat_id,
@@ -747,7 +797,7 @@ class SlackAdapter(BasePlatformAdapter):
                     if broadcast and i == 0:
                         kwargs["reply_broadcast"] = True
 
-                last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+                last_result = await selected_client.chat_postMessage(**kwargs)
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -757,6 +807,8 @@ class SlackAdapter(BasePlatformAdapter):
             # replies without requiring @mention.
             sent_ts = last_result.get("ts") if last_result else None
             if sent_ts:
+                if using_user_client:
+                    self._user_sent_message_ts.add(str(sent_ts))
                 self._bot_message_ts.add(sent_ts)
                 # Also register the thread root so replies-to-my-replies work
                 if thread_ts:
@@ -802,7 +854,7 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postEphemeral(**kwargs)
+            result = await self._get_client(chat_id, metadata=metadata).chat_postEphemeral(**kwargs)
             return SendResult(
                 success=True,
                 message_id=result.get("message_ts") or result.get("ts"),
@@ -825,7 +877,12 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         try:
             formatted = self.format_message(content)
-            await self._get_client(chat_id).chat_update(
+            client = self._get_client(chat_id)
+            if str(message_id) in self._user_sent_message_ts:
+                team_id = self._channel_team.get(chat_id)
+                if team_id and team_id in self._team_user_clients:
+                    client = self._team_user_clients[team_id]
+            await client.chat_update(
                 channel=chat_id,
                 ts=message_id,
                 text=formatted,
@@ -1728,12 +1785,23 @@ class SlackAdapter(BasePlatformAdapter):
                 return
             elif allow_bots == "mentions":
                 text_check = event.get("text", "")
-                if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
+                team_id_for_bot = event.get("team") or event.get("team_id") or ""
+                user_uid_for_bot = self._team_user_ids.get(team_id_for_bot, "")
+                mentioned_self = bool(
+                    (self._bot_user_id and f"<@{self._bot_user_id}>" in text_check)
+                    or (user_uid_for_bot and f"<@{user_uid_for_bot}>" in text_check)
+                )
+                if not mentioned_self:
                     return
             # "all" falls through to process the message
             # Always ignore our own messages to prevent echo loops
             msg_user = event.get("user", "")
-            if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
+            team_id_for_bot = event.get("team") or event.get("team_id") or ""
+            user_uid_for_bot = self._team_user_ids.get(team_id_for_bot, "")
+            if msg_user and (
+                (self._bot_user_id and msg_user == self._bot_user_id)
+                or (user_uid_for_bot and msg_user == user_uid_for_bot)
+            ):
                 return
 
         # Ignore message edits and deletions
@@ -1853,6 +1921,17 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id and channel_id:
             self._channel_team[channel_id] = team_id
 
+        # Ignore messages sent by either Hermes transport identity. The bot path
+        # is handled above for bot_message events; the first-class user path can
+        # arrive as an ordinary user message from Slack's perspective.
+        user_uid = self._team_user_ids.get(team_id, "") if team_id else ""
+        bot_uid_for_self = self._team_bot_user_ids.get(team_id, self._bot_user_id) if team_id else self._bot_user_id
+        if user_id and (
+            (bot_uid_for_self and user_id == bot_uid_for_self)
+            or (user_uid and user_id == user_uid)
+        ):
+            return
+
         # Determine if this is a DM or channel message
         channel_type = event.get("channel_type", "")
         if not channel_type and channel_id.startswith("D"):
@@ -1881,8 +1960,11 @@ class SlackAdapter(BasePlatformAdapter):
         #   3. The message is in a thread where the bot was previously @mentioned, OR
         #   4. There's an existing session for this thread (survives restarts)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+        user_uid = self._team_user_ids.get(team_id, "")
         routing_text = original_text or ""
-        is_mentioned = bot_uid and f"<@{bot_uid}>" in routing_text
+        is_bot_mentioned = bool(bot_uid and f"<@{bot_uid}>" in routing_text)
+        is_user_mentioned = bool(user_uid and f"<@{user_uid}>" in routing_text)
+        is_mentioned = is_bot_mentioned or is_user_mentioned
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
@@ -1913,14 +1995,27 @@ class SlackAdapter(BasePlatformAdapter):
                     return
 
         if is_mentioned:
-            # Strip the bot mention from the text
-            text = text.replace(f"<@{bot_uid}>", "").strip()
+            # Strip direct Slack mentions for either supported Hermes identity.
+            if bot_uid:
+                text = text.replace(f"<@{bot_uid}>", "").strip()
+            if user_uid:
+                text = text.replace(f"<@{user_uid}>", "").strip()
+
+            # Remember first-class-user-addressed threads so outbound replies
+            # use the user token/client instead of the bot transport.
+            if is_user_mentioned and channel_id and thread_ts:
+                self._user_addressed_threads.add((channel_id, str(thread_ts)))
+                if len(self._user_addressed_threads) > self._MENTIONED_THREADS_MAX:
+                    to_remove = list(self._user_addressed_threads)[:self._MENTIONED_THREADS_MAX // 2]
+                    for key in to_remove:
+                        self._user_addressed_threads.discard(key)
+
             # Register this thread so all future messages auto-trigger the bot.
             # Skipped in strict mode: strict_mention=true bots must be
             # re-mentioned every turn, so remembering the thread would
             # defeat the feature (and re-enable agent-to-agent ack loops).
-            if event_thread_ts and not self._slack_strict_mention():
-                self._mentioned_threads.add(event_thread_ts)
+            if thread_ts and not self._slack_strict_mention():
+                self._mentioned_threads.add(str(thread_ts))
                 if len(self._mentioned_threads) > self._MENTIONED_THREADS_MAX:
                     to_remove = list(self._mentioned_threads)[:self._MENTIONED_THREADS_MAX // 2]
                     for t in to_remove:
@@ -2227,7 +2322,7 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            result = await self._get_client(chat_id, metadata=metadata).chat_postMessage(**kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts:
                 self._approval_resolved[msg_ts] = False
@@ -2295,7 +2390,7 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            result = await self._get_client(chat_id, metadata=metadata).chat_postMessage(**kwargs)
             return SendResult(success=True, message_id=result.get("ts", ""), raw_response=result)
         except Exception as e:
             logger.error("[Slack] send_slash_confirm failed: %s", e, exc_info=True)

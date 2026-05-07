@@ -48,13 +48,19 @@ def _build_full_manifest(bot_name: str, bot_description: str) -> dict:
             "background_color": "#1a1a2e",
         },
         "features": {
+            "app_home": {
+                # Make the Slack app DM surface a first-class chat surface.
+                "home_tab_enabled": False,
+                "messages_tab_enabled": True,
+                "messages_tab_read_only_enabled": False,
+            },
             "bot_user": {
                 "display_name": bot_name[:80],
                 "always_online": True,
             },
             "slash_commands": slashes,
             "assistant_view": {
-                "assistant_description": "Chat with Hermes in threads and DMs.",
+                "assistant_description": "Chat with Scaff Olde in threads and DMs.",
             },
         },
         "oauth_config": {
@@ -65,14 +71,40 @@ def _build_full_manifest(bot_name: str, bot_description: str) -> dict:
                     "channels:history",
                     "channels:read",
                     "chat:write",
+                    "chat:write.customize",
                     "commands",
                     "files:read",
                     "files:write",
                     "groups:history",
+                    "groups:read",
                     "im:history",
                     "im:read",
                     "im:write",
+                    "mpim:history",
+                    "mpim:read",
+                    "mpim:write",
                     "users:read",
+                    "users:read.email",
+                ],
+                # User scopes are for the Scaff Olde first-class-account path:
+                # pai@scaffolde.ai authorizes the app and Hermes can receive
+                # user_events / reply with that user's token instead of only
+                # operating as the bot transport.
+                "user": [
+                    "channels:history",
+                    "channels:read",
+                    "chat:write",
+                    "files:read",
+                    "groups:history",
+                    "groups:read",
+                    "im:history",
+                    "im:read",
+                    "im:write",
+                    "mpim:history",
+                    "mpim:read",
+                    "mpim:write",
+                    "users:read",
+                    "users:read.email",
                 ],
             },
         },
@@ -85,6 +117,13 @@ def _build_full_manifest(bot_name: str, bot_description: str) -> dict:
                     "message.channels",
                     "message.groups",
                     "message.im",
+                    "message.mpim",
+                ],
+                "user_events": [
+                    "message.channels",
+                    "message.groups",
+                    "message.im",
+                    "message.mpim",
                 ],
             },
             "interactivity": {
