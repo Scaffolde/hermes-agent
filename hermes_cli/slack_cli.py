@@ -60,7 +60,7 @@ def _build_full_manifest(bot_name: str, bot_description: str) -> dict:
             },
             "slash_commands": slashes,
             "assistant_view": {
-                "assistant_description": "Chat with Scaff Olde in threads and DMs.",
+                "assistant_description": f"Chat with {bot_name[:80]} in threads and DMs.",
             },
         },
         "oauth_config": {
@@ -86,8 +86,8 @@ def _build_full_manifest(bot_name: str, bot_description: str) -> dict:
                     "users:read",
                     "users:read.email",
                 ],
-                # User scopes are for the Scaff Olde first-class-account path:
-                # pai@scaffolde.ai authorizes the app and Hermes can receive
+                # User scopes are for the optional first-class-account path:
+                # a Slack user can authorize the app and Hermes can receive
                 # user_events / reply with that user's token instead of only
                 # operating as the bot transport.
                 "user": [

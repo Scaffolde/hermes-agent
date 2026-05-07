@@ -941,7 +941,7 @@ class TestIncomingDocumentHandling:
 
     @pytest.mark.asyncio
     async def test_first_class_user_channel_mention_is_routed(self, adapter):
-        """A public-channel mention of the Scaff Olde user account is addressable."""
+        """A public-channel mention of the configured Slack user account is addressable."""
         adapter._team_user_ids = {"T123": "U_PAI"}
         adapter._team_user_clients = {"T123": AsyncMock()}
         event = self._make_event(

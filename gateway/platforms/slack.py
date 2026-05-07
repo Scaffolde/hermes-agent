@@ -521,10 +521,10 @@ class SlackAdapter(BasePlatformAdapter):
             user_token_env_vars = [v.strip() for v in user_token_env_vars.split(",") if v.strip()]
         elif not isinstance(user_token_env_vars, list):
             user_token_env_vars = []
-        # Keep the generic name first; retain the Scaffolde-specific alias only
-        # as backward-compatible local configuration for existing installs.
+        # Keep the generic default plus any installer-provided names from
+        # slack.extra.user_token_env/user_token_env_vars.
         env_var_names = [str(v).strip() for v in user_token_env_vars if str(v).strip()]
-        env_var_names.extend(["SLACK_USER_TOKEN", "SLACK_SCAFF_OLDE_USER_TOKEN"])
+        env_var_names.append("SLACK_USER_TOKEN")
         raw_user_tokens = []
         for env_name in dict.fromkeys(env_var_names):
             raw_value = os.getenv(env_name)
