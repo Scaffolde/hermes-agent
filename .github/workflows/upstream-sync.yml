@@ -57,6 +57,9 @@ jobs:
           if ! git merge --no-ff --no-edit upstream/main; then
             git status --short
             CONFLICTS="$(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+            gh label create upstream-sync \
+              --color "7B42BC" \
+              --description "Automated upstream synchronization for the Scaffolde Hermes fork" || true
             gh issue create \
               --title "Hermes upstream sync conflict: ${UPSTREAM_SHA:0:12}" \
               --body "Automatic merge of NousResearch/hermes-agent@${UPSTREAM_SHA} into pai-scaffolde/hermes-agent failed. Conflicts: ${CONFLICTS:-unknown}. Resolve locally by merging upstream/main into main without rebasing, preserving Scaffolde-specific patches." \
