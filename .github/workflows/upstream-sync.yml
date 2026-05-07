@@ -1,0 +1,100 @@
+name: Sync Nous upstream
+
+on:
+  schedule:
+    - cron: "17 11 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream/main into fork PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "pai-scaffolde-upstream-sync"
+          git config user.email "actions@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch origin main
+          git fetch upstream main
+
+      - name: Merge upstream into sync branch
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BRANCH="sync/upstream-main"
+          git checkout -B "$BRANCH" origin/main
+
+          UPSTREAM_SHA="$(git rev-parse upstream/main)"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Fork main already contains upstream/main ${UPSTREAM_SHA}."
+            exit 0
+          fi
+
+          if ! git merge --no-ff --no-edit upstream/main; then
+            git status --short
+            CONFLICTS="$(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+            gh issue create \
+              --title "Hermes upstream sync conflict: ${UPSTREAM_SHA:0:12}" \
+              --body "Automatic merge of NousResearch/hermes-agent@${UPSTREAM_SHA} into pai-scaffolde/hermes-agent failed. Conflicts: ${CONFLICTS:-unknown}. Resolve locally by merging upstream/main into main without rebasing, preserving Scaffolde-specific patches." \
+              --label "upstream-sync" || true
+            exit 1
+          fi
+
+          git push --force-with-lease origin "$BRANCH"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update PR
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BRANCH="sync/upstream-main"
+          UPSTREAM_SHA="${{ steps.merge.outputs.upstream_sha }}"
+          BODY="Daily fork sync from NousResearch/hermes-agent@${UPSTREAM_SHA}.
+
+This PR intentionally keeps Scaffolde-specific patches in pai-scaffolde/hermes-agent and does not contribute changes back upstream.
+
+Merge policy:
+- review conflicts and Scaffolde patch files carefully
+- never rebase fork main
+- merge only after tests pass
+- update scaffolde-ai runtime_baseline.required_revision after this lands"
+
+          EXISTING="$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" \
+              --title "chore: sync NousResearch upstream into Hermes fork" \
+              --body "$BODY"
+            gh pr comment "$EXISTING" --body "Refreshed upstream sync branch to NousResearch/hermes-agent@${UPSTREAM_SHA}."
+          else
+            gh pr create \
+              --head "$BRANCH" \
+              --base main \
+              --title "chore: sync NousResearch upstream into Hermes fork" \
+              --body "$BODY"
+          fi
