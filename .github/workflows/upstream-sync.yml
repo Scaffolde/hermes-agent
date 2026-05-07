@@ -75,15 +75,18 @@ jobs:
           set -euo pipefail
           BRANCH="sync/upstream-main"
           UPSTREAM_SHA="${{ steps.merge.outputs.upstream_sha }}"
-          BODY="Daily fork sync from NousResearch/hermes-agent@${UPSTREAM_SHA}.
+          BODY="$(cat <<EOF
+          Daily fork sync from NousResearch/hermes-agent@${UPSTREAM_SHA}.
 
-This PR intentionally keeps Scaffolde-specific patches in pai-scaffolde/hermes-agent and does not contribute changes back upstream.
+          This PR intentionally keeps Scaffolde-specific patches in pai-scaffolde/hermes-agent and does not contribute changes back upstream.
 
-Merge policy:
-- review conflicts and Scaffolde patch files carefully
-- never rebase fork main
-- merge only after tests pass
-- update scaffolde-ai runtime_baseline.required_revision after this lands"
+          Merge policy:
+          - review conflicts and Scaffolde patch files carefully
+          - never rebase fork main
+          - merge only after tests pass
+          - update scaffolde-ai runtime_baseline.required_revision after this lands
+          EOF
+          )"
 
           EXISTING="$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
           if [ -n "$EXISTING" ]; then
