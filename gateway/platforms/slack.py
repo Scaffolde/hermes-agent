@@ -292,12 +292,12 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_mode_task: Optional[asyncio.Task] = None
         # Multi-workspace support
         self._team_clients: Dict[str, Any] = {}   # team_id → WebClient
-        self._team_user_clients: Dict[str, Any] = {}  # team_id → Scaff Olde user WebClient
-        self._team_user_ids: Dict[str, str] = {}      # team_id → Scaff Olde user_id
+        self._team_user_clients: Dict[str, Any] = {}  # team_id → optional user-token WebClient
+        self._team_user_ids: Dict[str, str] = {}      # team_id → optional user-token user_id
         self._team_bot_user_ids: Dict[str, str] = {}          # team_id → bot_user_id
         self._channel_team: Dict[str, str] = {}                # channel_id → team_id
         self._user_addressed_threads: set[tuple[str, str]] = set()  # (channel_id, thread_ts)
-        self._user_sent_message_ts: set[str] = set()  # messages posted with Scaff Olde user token
+        self._user_sent_message_ts: set[str] = set()  # messages posted with optional user token
         # Dedup cache: prevents duplicate bot responses when Socket Mode
         # reconnects redeliver events.
         self._dedup = MessageDeduplicator()
@@ -510,11 +510,27 @@ class SlackAdapter(BasePlatformAdapter):
 
         # Support comma-separated bot tokens for multi-workspace
         bot_tokens = [t.strip() for t in raw_token.split(",") if t.strip()]
-        # Optional Scaff Olde first-class-account path. When pai@scaffolde.ai
-        # authorizes the app with user scopes, these xoxp user tokens let Hermes
-        # reply in DMs addressed to that user rather than only the bot transport.
-        raw_user_token = os.getenv("SLACK_USER_TOKEN") or os.getenv("SLACK_SCAFF_OLDE_USER_TOKEN")
-        user_tokens = [t.strip() for t in (raw_user_token or "").split(",") if t.strip()]
+
+        # Optional first-class Slack user path. Installers can authorize the app
+        # with user scopes and provide xoxp user token(s) via env vars so Hermes
+        # can receive user_events and reply from that Slack user identity instead
+        # of only operating through the bot transport. Values stay local in .env;
+        # the code only names configurable environment variables.
+        user_token_env_vars = self.config.extra.get("user_token_env_vars") or self.config.extra.get("user_token_env")
+        if isinstance(user_token_env_vars, str):
+            user_token_env_vars = [v.strip() for v in user_token_env_vars.split(",") if v.strip()]
+        elif not isinstance(user_token_env_vars, list):
+            user_token_env_vars = []
+        # Keep the generic name first; retain the Scaffolde-specific alias only
+        # as backward-compatible local configuration for existing installs.
+        env_var_names = [str(v).strip() for v in user_token_env_vars if str(v).strip()]
+        env_var_names.extend(["SLACK_USER_TOKEN", "SLACK_SCAFF_OLDE_USER_TOKEN"])
+        raw_user_tokens = []
+        for env_name in dict.fromkeys(env_var_names):
+            raw_value = os.getenv(env_name)
+            if raw_value:
+                raw_user_tokens.extend(t.strip() for t in raw_value.split(",") if t.strip())
+        user_tokens = list(dict.fromkeys(raw_user_tokens))
 
         # Also load tokens from OAuth token file
         from hermes_constants import get_hermes_home
@@ -579,7 +595,7 @@ class SlackAdapter(BasePlatformAdapter):
                     bot_name, team_name, team_id,
                 )
 
-            # Register optional Scaff Olde user tokens. These do not replace
+            # Register optional Slack user tokens. These do not replace
             # Socket Mode's app token; they provide a user-perspective Web API
             # client for DMs/private conversations the bot token cannot see.
             for token in user_tokens:
@@ -595,7 +611,7 @@ class SlackAdapter(BasePlatformAdapter):
                     if user_id:
                         self._team_user_ids[team_id] = user_id
                 logger.info(
-                    "[Slack] Authenticated Scaff Olde user token as @%s in workspace %s (team: %s)",
+                    "[Slack] Authenticated optional user token as @%s in workspace %s (team: %s)",
                     user_name, team_name, team_id,
                 )
 
@@ -724,9 +740,9 @@ class SlackAdapter(BasePlatformAdapter):
     def _get_client(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> Any:
         """Return the workspace-specific WebClient for a channel.
 
-        DMs addressed to the Scaff Olde first-class Slack account, and channel
+        DMs addressed to an optional first-class Slack user account, and channel
         threads that began with a mention of that account, should use the user
-        token so replies come from the first-class user rather than the app bot.
+        token so replies come from that Slack user rather than the app bot.
         """
         team_id = self._channel_team.get(chat_id)
         thread_ts = None
