@@ -57,7 +57,9 @@ jobs:
           if ! git merge --no-ff --no-edit upstream/main; then
             git status --short
             CONFLICTS="$(git diff --name-only --diff-filter=U | tr '\n' ' ')"
-            echo "::error title=Hermes upstream sync conflict::Automatic merge of NousResearch/hermes-agent@${UPSTREAM_SHA} failed. Conflicts: ${CONFLICTS:-unknown}"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Hermes upstream sync conflict::Automatic merge of NousResearch/hermes-agent@${UPSTREAM_SHA} failed. Conflicts: ${CONFLICTS:-unknown}"
             {
               echo "## Hermes upstream sync conflict"
               echo ""
@@ -67,7 +69,8 @@ jobs:
               echo ""
               echo "Resolve locally by merging upstream/main into main without rebasing, preserving Scaffolde-specific patches."
             } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
+            git merge --abort || true
+            exit 0
           fi
 
           git push --force-with-lease origin "$BRANCH"
