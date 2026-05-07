@@ -1,6 +1,6 @@
 name: Sync Nous upstream
 
-on:
+"on":
   schedule:
     - cron: "17 11 * * *"
   workflow_dispatch:
