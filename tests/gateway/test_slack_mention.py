@@ -373,6 +373,29 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     assert _os.environ["SLACK_FREE_RESPONSE_CHANNELS"] == "C0AQWDLHY9M,C9999999999"
 
 
+def test_config_bridges_top_level_slack_extra(monkeypatch, tmp_path):
+    from gateway.config import load_gateway_config
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "slack:\n"
+        "  channel_prompts: {}\n"
+        "  extra:\n"
+        "    user_token_env: SLACK_SCAFF_OLDE_USER_TOKEN\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+
+    config = load_gateway_config()
+
+    slack_config = config.platforms[Platform.SLACK]
+    assert slack_config.enabled is True
+    assert slack_config.extra.get("user_token_env") == "SLACK_SCAFF_OLDE_USER_TOKEN"
+
+
 def test_top_level_slack_settings_do_not_disable_env_token_setup(monkeypatch, tmp_path):
     from gateway.config import load_gateway_config
 
