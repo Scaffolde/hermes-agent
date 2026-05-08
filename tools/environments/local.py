@@ -165,6 +165,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
 
+    _prepend_hermes_bin_to_path(sanitized)
+
     # Per-profile HOME isolation for background processes (same as _make_run_env).
     from hermes_constants import get_subprocess_home
     _profile_home = get_subprocess_home()
@@ -219,6 +221,20 @@ _SANE_PATH = (
 )
 
 
+def _prepend_hermes_bin_to_path(env: dict) -> None:
+    """Expose Hermes-managed helper binaries (tirith, etc.) to subprocesses."""
+    try:
+        from hermes_constants import get_hermes_home
+        hermes_bin = str(get_hermes_home() / "bin")
+    except Exception:
+        return
+
+    existing_path = env.get("PATH", "")
+    parts = [p for p in existing_path.split(":") if p]
+    if hermes_bin not in parts:
+        env["PATH"] = f"{hermes_bin}:{existing_path}" if existing_path else hermes_bin
+
+
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
@@ -237,6 +253,7 @@ def _make_run_env(env: dict) -> dict:
     existing_path = run_env.get("PATH", "")
     if "/usr/bin" not in existing_path.split(":"):
         run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
+    _prepend_hermes_bin_to_path(run_env)
 
     # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,
     # npm …) into {HERMES_HOME}/home/ when that directory exists.  Only the

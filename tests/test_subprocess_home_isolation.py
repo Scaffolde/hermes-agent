@@ -116,6 +116,20 @@ class TestMakeRunEnvHomeInjection:
 
         assert result["HOME"] == "/home/user"
 
+    def test_prepends_hermes_bin_to_path(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HOME", "/root")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+        from tools.environments.local import _make_run_env
+        result = _make_run_env({})
+
+        path_parts = result["PATH"].split(os.pathsep)
+        assert path_parts[0] == str(hermes_home / "bin")
+        assert path_parts.count(str(hermes_home / "bin")) == 1
+
 
 # ---------------------------------------------------------------------------
 # _sanitize_subprocess_env() injection
@@ -146,6 +160,19 @@ class TestSanitizeSubprocessEnvHomeInjection:
         result = _sanitize_subprocess_env(base_env)
 
         assert result["HOME"] == "/root"
+
+    def test_prepends_hermes_bin_to_path(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        base_env = {"HOME": "/root", "PATH": "/usr/bin"}
+        from tools.environments.local import _sanitize_subprocess_env
+        result = _sanitize_subprocess_env(base_env)
+
+        path_parts = result["PATH"].split(os.pathsep)
+        assert path_parts[0] == str(hermes_home / "bin")
+        assert path_parts.count(str(hermes_home / "bin")) == 1
 
 
 # ---------------------------------------------------------------------------
