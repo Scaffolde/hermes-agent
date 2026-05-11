@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -36,6 +37,33 @@ def test_init_db_is_idempotent(kanban_home):
         tasks = kb.list_tasks(conn)
     assert len(tasks) == 1
     assert tasks[0].title == "persisted"
+
+
+def test_optional_column_migration_tolerates_restart_race(tmp_path):
+    """A stale PRAGMA snapshot should not crash on duplicate ALTER TABLE.
+
+    During gateway restart, two processes can both observe a legacy schema,
+    then one process adds an optional column before the other reaches its
+    ALTER TABLE. SQLite raises ``duplicate column name`` in the loser; the
+    migration should treat that as success.
+    """
+    db_path = tmp_path / "race.db"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT)")
+    conn.execute("ALTER TABLE tasks ADD COLUMN max_retries INTEGER")
+
+    stale_cols: set[str] = {"id", "title"}
+    added = kb._add_optional_column_if_missing(
+        conn,
+        "tasks",
+        "max_retries",
+        "ALTER TABLE tasks ADD COLUMN max_retries INTEGER",
+        stale_cols,
+    )
+
+    assert added is False
+    assert "max_retries" in stale_cols
 
 
 def test_init_creates_expected_tables(kanban_home):
@@ -277,7 +305,7 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         assert payload["host_local"] is True
 
 
-def test_max_runtime_uses_current_run_start_after_retry(kanban_home):
+def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch):
     """A retry should get a fresh max-runtime window.
 
     ``tasks.started_at`` intentionally records the first time the task ever
@@ -303,6 +331,7 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home):
             (old_started, 999999, first_run_id),
         )
 
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
         timed_out = kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
         assert timed_out == [t]
         assert kb.get_task(conn, t).status == "ready"

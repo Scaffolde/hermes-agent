@@ -6,6 +6,65 @@ description: "Set up Hermes Agent as a Microsoft Teams bot"
 
 # Microsoft Teams Setup
 
+Hermes supports two Microsoft Teams modes:
+
+1. **Bot Framework app** (`teams`) — Teams calls a public HTTPS webhook. Use this for a conventional bot identity.
+2. **First-class Teams user** (`teams_user`) — Hermes uses Microsoft Graph delegated auth and sends messages as a real work/school Teams user. Use this when you want Slack-like behavior where the agent has its own Teams account.
+
+## First-class Teams user mode
+
+Requirements:
+
+- A work/school Microsoft 365 / Entra user with a Teams license.
+- A public-client Entra app registration with delegated Graph scopes:
+  - `User.Read`
+  - `Team.ReadBasic.All`
+  - `Channel.ReadBasic.All`
+  - `ChannelMessage.Read.All`
+  - `ChannelMessage.Send`
+  - `Chat.Read`
+  - `Chat.ReadWrite`
+- Admin consent for those delegated scopes.
+
+Install the dependency:
+
+```bash
+pip install 'hermes-agent[teams-user]'
+```
+
+Configure `~/.hermes/config.yaml`:
+
+```yaml
+platforms:
+  teams_user:
+    enabled: true
+    extra:
+      tenant_id: "<tenant-id>"
+      client_id: "<public-client-app-id>"
+      poll_interval: 15
+      channels:
+        - team_id: "<team-id>"
+          channel_id: "<channel-id>"
+          name: "General"
+```
+
+Or use environment variables:
+
+```bash
+TEAMS_USER_ENABLED=true
+TEAMS_USER_TENANT_ID=<tenant-id>
+TEAMS_USER_CLIENT_ID=<public-client-app-id>
+TEAMS_USER_HOME_CHANNEL=<team-id>/<channel-id>
+```
+
+On first gateway start, MSAL opens an interactive browser login for the delegated Teams user and stores a refreshable token cache at `~/.hermes/teams-user-msal-cache.bin` unless `TEAMS_USER_CACHE_PATH` or `extra.cache_path` overrides it.
+
+Channel chat IDs use `team-id/channel-id`. Direct/group chat IDs use `chat:<chat-id>`.
+
+---
+
+## Bot Framework mode
+
 Connect Hermes Agent to Microsoft Teams as a bot. Unlike Slack's Socket Mode, Teams delivers messages by calling a **public HTTPS webhook**, so your instance needs a publicly reachable endpoint — either a dev tunnel (local dev) or a real domain (production).
 
 Need meeting summaries from Microsoft Graph events rather than normal bot conversations? Use the dedicated setup page: [Teams Meetings](/docs/user-guide/messaging/teams-meetings).

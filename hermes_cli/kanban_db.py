@@ -974,14 +974,35 @@ def _add_column_if_missing(
 
     Returns ``True`` when the column was actually added by this call.
     Swallows ``duplicate column name`` errors so a concurrent connection
-    that ran the same migration first does not crash the dispatcher tick
-    (issue #21708).
+    that ran the same migration first does not crash the dispatcher tick.
     """
     try:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
         return True
     except sqlite3.OperationalError as exc:
         if "duplicate column name" in str(exc).lower():
+            return False
+        raise
+
+
+def _add_optional_column_if_missing(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    ddl: str,
+    known_cols: set[str],
+) -> bool:
+    """Add an optional column using a stale schema snapshot safely."""
+    if column in known_cols:
+        return False
+    try:
+        conn.execute(ddl)
+        known_cols.add(column)
+        return True
+    except sqlite3.OperationalError as exc:
+        message = str(exc).lower()
+        if "duplicate column name" in message and column in message:
+            known_cols.add(column)
             return False
         raise
 
@@ -997,13 +1018,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "result" not in cols:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
     if "idempotency_key" not in cols:
-        _add_column_if_missing(
+        added = _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency "
-            "ON tasks(idempotency_key)"
-        )
+        if added:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency "
+                "ON tasks(idempotency_key)"
+            )
     # Legacy column migration: ``spawn_failures`` → ``consecutive_failures``
     # and ``last_spawn_error`` → ``last_failure_error``.
     #
@@ -1080,11 +1102,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # historical events (they predate runs and can't be attributed).
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
-        _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_run "
-            "ON task_events(run_id, id)"
-        )
+        added = _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
+        if added:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_run "
+                "ON task_events(run_id, id)"
+            )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"

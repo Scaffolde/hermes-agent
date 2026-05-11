@@ -92,6 +92,7 @@ class Platform(Enum):
     DISCORD = "discord"
     WHATSAPP = "whatsapp"
     SLACK = "slack"
+    TEAMS_USER = "teams_user"
     SIGNAL = "signal"
     MATTERMOST = "mattermost"
     MATRIX = "matrix"
@@ -394,6 +395,9 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
         cfg.extra.get("account_id") and (cfg.token or cfg.extra.get("token"))
     ),
     Platform.WHATSAPP: lambda cfg: True,  # bridge handles auth
+    Platform.TEAMS_USER: lambda cfg: bool(
+        cfg.extra.get("tenant_id") and cfg.extra.get("client_id")
+    ),
     Platform.SIGNAL: lambda cfg: bool(cfg.extra.get("http_url")),
     Platform.EMAIL: lambda cfg: bool(cfg.extra.get("address")),
     Platform.SMS: lambda cfg: bool(os.getenv("TWILIO_ACCOUNT_SID")),
@@ -1276,6 +1280,40 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=slack_home,
             name=os.getenv("SLACK_HOME_CHANNEL_NAME", ""),
             thread_id=os.getenv("SLACK_HOME_CHANNEL_THREAD_ID") or None,
+        )
+
+    # Microsoft Teams first-class user (delegated Graph auth)
+    teams_user_tenant = os.getenv("TEAMS_USER_TENANT_ID")
+    teams_user_client = os.getenv("TEAMS_USER_CLIENT_ID")
+    teams_user_enabled = os.getenv("TEAMS_USER_ENABLED", "").lower() in ("true", "1", "yes")
+    teams_user_disabled = os.getenv("TEAMS_USER_ENABLED", "").lower() in ("false", "0", "no")
+    if Platform.TEAMS_USER in config.platforms:
+        teams_cfg = config.platforms[Platform.TEAMS_USER]
+        if teams_user_disabled:
+            teams_cfg.enabled = False
+        elif teams_user_enabled:
+            teams_cfg.enabled = True
+    elif teams_user_enabled or (teams_user_tenant and teams_user_client):
+        config.platforms[Platform.TEAMS_USER] = PlatformConfig(enabled=teams_user_enabled)
+    if Platform.TEAMS_USER in config.platforms:
+        teams_cfg = config.platforms[Platform.TEAMS_USER]
+        if teams_user_tenant:
+            teams_cfg.extra["tenant_id"] = teams_user_tenant
+        if teams_user_client:
+            teams_cfg.extra["client_id"] = teams_user_client
+        if os.getenv("TEAMS_USER_ID"):
+            teams_cfg.extra["user_id"] = os.getenv("TEAMS_USER_ID")
+        if os.getenv("TEAMS_USER_CACHE_PATH"):
+            teams_cfg.extra["cache_path"] = os.getenv("TEAMS_USER_CACHE_PATH")
+        if os.getenv("TEAMS_USER_POLL_INTERVAL"):
+            teams_cfg.extra["poll_interval"] = os.getenv("TEAMS_USER_POLL_INTERVAL")
+    teams_user_home = os.getenv("TEAMS_USER_HOME_CHANNEL")
+    if teams_user_home and Platform.TEAMS_USER in config.platforms:
+        config.platforms[Platform.TEAMS_USER].home_channel = HomeChannel(
+            platform=Platform.TEAMS_USER,
+            chat_id=teams_user_home,
+            name=os.getenv("TEAMS_USER_HOME_CHANNEL_NAME", "Home"),
+            thread_id=os.getenv("TEAMS_USER_HOME_CHANNEL_THREAD_ID") or None,
         )
     
     # Signal

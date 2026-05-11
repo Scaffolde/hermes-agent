@@ -601,7 +601,11 @@ class TestGetTextAuxiliaryClient:
     def test_custom_endpoint_uses_codex_wrapper_when_runtime_requests_responses_api(self):
         with patch("agent.auxiliary_client._resolve_custom_runtime",
                    return_value=("https://api.openai.com/v1", "sk-test", "codex_responses")), \
+             patch("agent.auxiliary_client._read_main_provider", return_value="auto"), \
              patch("agent.auxiliary_client._read_main_model", return_value="gpt-5.3-codex"), \
+             patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)), \
+             patch("agent.auxiliary_client._try_nous", return_value=(None, None)), \
+             patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)), \
              patch("agent.auxiliary_client.OpenAI") as mock_openai:
             client, model = get_text_auxiliary_client()
 
@@ -1037,6 +1041,56 @@ class TestCallLlmPaymentFallback:
             )
         # Fallback client should have been used
         assert fallback_client.chat.completions.create.called
+
+    def test_openrouter_affordable_max_tokens_retries_lower_cap(self, monkeypatch):
+        """OpenRouter 402 can be resolved by lowering max_tokens to the affordable cap."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+
+        client = MagicMock()
+        err = self._make_402_error("This request requires more credits, or fewer max_tokens. You requested up to 7191 tokens, but can only afford 6275.")
+        ok_response = MagicMock(choices=[MagicMock(message=MagicMock(content="compressed"))])
+        client.chat.completions.create.side_effect = [err, ok_response]
+
+        with patch("agent.auxiliary_client._get_cached_client", return_value=(client, "google/gemini-3-flash-preview")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("auto", "google/gemini-3-flash-preview", None, None, None)):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+                max_tokens=7191,
+            )
+
+        assert result is ok_response
+        assert client.chat.completions.create.call_count == 2
+        retry_kwargs = client.chat.completions.create.call_args.kwargs
+        assert retry_kwargs["max_tokens"] == int(6275 * 0.95)
+
+    def test_fallback_openrouter_affordable_max_tokens_retries_lower_cap(self, monkeypatch):
+        """If auto falls back to OpenRouter and OpenRouter returns affordable-token 402, retry lower."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+
+        primary_client = MagicMock()
+        conn_err = ConnectionError("Connection error.")
+        primary_client.chat.completions.create.side_effect = conn_err
+
+        fallback_client = MagicMock()
+        affordable_err = self._make_402_error("You requested up to 7191 tokens, but can only afford 6275")
+        ok_response = MagicMock(choices=[MagicMock(message=MagicMock(content="fallback compressed"))])
+        fallback_client.chat.completions.create.side_effect = [affordable_err, ok_response]
+
+        with patch("agent.auxiliary_client._get_cached_client", return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("auto", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._try_payment_fallback", return_value=(fallback_client, "google/gemini-3-flash-preview", "openrouter")):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+                max_tokens=7191,
+            )
+
+        assert result is ok_response
+        assert primary_client.chat.completions.create.call_count == 1
+        assert fallback_client.chat.completions.create.call_count == 2
+        retry_kwargs = fallback_client.chat.completions.create.call_args.kwargs
+        assert retry_kwargs["max_tokens"] == int(6275 * 0.95)
 
 # ---------------------------------------------------------------------------
 # Gate: _resolve_api_key_provider must skip anthropic when not configured

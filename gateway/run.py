@@ -5197,6 +5197,13 @@ class GatewayRunner:
                 return None
             return SlackAdapter(config)
 
+        elif platform == Platform.TEAMS_USER:
+            from gateway.platforms.teams_user import TeamsUserAdapter, check_teams_user_requirements
+            if not check_teams_user_requirements():
+                logger.warning("TeamsUser: msal/httpx dependencies not installed. Run: pip install 'hermes-agent[teams-user]'")
+                return None
+            return TeamsUserAdapter(config)
+
         elif platform == Platform.SIGNAL:
             from gateway.platforms.signal import SignalAdapter, check_signal_requirements
             if not check_signal_requirements():

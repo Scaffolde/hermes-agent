@@ -43,6 +43,7 @@ Payment / credit exhaustion fallback:
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path  # noqa: F401 — used by test mocks
@@ -719,7 +720,10 @@ class _CodexCompletionsAdapter:
 
         def _check_cancelled() -> None:
             if deadline is not None and time.monotonic() >= deadline:
-                timed_out.set()
+                # The polling path can notice the deadline before the timer
+                # thread runs. Close/evict synchronously too so timeout handling
+                # is deterministic under fast tests and real streams alike.
+                _close_client_on_timeout()
                 raise TimeoutError(_timeout_message())
             try:
                 from tools.interrupt import is_interrupted
@@ -4049,6 +4053,61 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
     return response
 
 
+def _affordable_max_tokens_from_error(exc: Exception) -> Optional[int]:
+    """Extract OpenRouter's per-key affordable max_tokens hint.
+
+    OpenRouter can return HTTP 402 even when the account is not fully out of
+    funds if the requested output cap is larger than the key's remaining spend
+    allowance, e.g. ``requested up to 7191 tokens, but can only afford 6275``.
+    In that case a smaller ``max_tokens`` request is likely to succeed and is
+    much better than dropping compression context.
+    """
+    match = re.search(r"can only afford\s+([0-9][0-9,]*)", str(exc), re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        afford = int(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    return afford if afford > 0 else None
+
+
+def _retry_with_affordable_max_tokens(
+    client: Any,
+    kwargs: Dict[str, Any],
+    exc: Exception,
+    task: str = None,
+) -> Optional[Any]:
+    """Retry once with OpenRouter's affordable max_tokens cap if available."""
+    afford = _affordable_max_tokens_from_error(exc)
+    if not afford:
+        return None
+
+    requested = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
+    if not isinstance(requested, int) or requested <= afford:
+        return None
+
+    # Leave a small buffer for providers that round token/cost estimates. Keep
+    # the floor useful for summaries; below that, provider fallback is better
+    # than a very low-quality tiny summary.
+    capped = max(256, int(afford * 0.95))
+    if capped >= requested:
+        return None
+
+    retry_kwargs = dict(kwargs)
+    if "max_tokens" in retry_kwargs:
+        retry_kwargs["max_tokens"] = capped
+    if "max_completion_tokens" in retry_kwargs:
+        retry_kwargs["max_completion_tokens"] = capped
+    logger.info(
+        "Auxiliary %s: provider allowed only %d output tokens; retrying with max_tokens=%d",
+        task or "call",
+        afford,
+        capped,
+    )
+    return _validate_llm_response(client.chat.completions.create(**retry_kwargs), task)
+
+
 def call_llm(
     task: str = None,
     *,
@@ -4208,6 +4267,10 @@ def call_llm(
                 kwargs = retry_kwargs
 
         err_str = str(first_err)
+        affordable_retry = _retry_with_affordable_max_tokens(client, kwargs, first_err, task)
+        if affordable_retry is not None:
+            return affordable_retry
+
         # ZAI vision models (glm-4v-flash etc.) return error code 1210
         # ("API 调用参数有误") when max_tokens is passed on multimodal
         # calls.  The error message does NOT contain "max_tokens" so the
@@ -4370,8 +4433,15 @@ def call_llm(
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
-                return _validate_llm_response(
-                    fb_client.chat.completions.create(**fb_kwargs), task)
+                try:
+                    return _validate_llm_response(
+                        fb_client.chat.completions.create(**fb_kwargs), task)
+                except Exception as fb_err:
+                    affordable_retry = _retry_with_affordable_max_tokens(
+                        fb_client, fb_kwargs, fb_err, task)
+                    if affordable_retry is not None:
+                        return affordable_retry
+                    raise
         # Connection/timeout errors leave the cached client poisoned (closed
         # httpx transport, half-read stream, dead async loop).  Drop it from
         # the cache regardless of whether we found a fallback above so the
