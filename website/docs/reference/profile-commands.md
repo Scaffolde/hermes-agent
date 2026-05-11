@@ -25,6 +25,9 @@ Top-level command for managing profiles. Running `hermes profile` without a subc
 | `rename` | Rename a profile. |
 | `export` | Export a profile to a tar.gz archive. |
 | `import` | Import a profile from a tar.gz archive. |
+| `install` | Install a profile distribution from a git URL or local directory. See [Profile Distributions](../user-guide/profile-distributions.md). |
+| `update` | Re-pull a distribution-managed profile and re-apply its bundle. |
+| `info` | Show distribution metadata for a profile (origin URL, commit, last update). |
 
 ## `hermes profile list`
 
@@ -245,6 +248,10 @@ hermes profile import ./work-2026-03-29.tar.gz --name work-restored
 
 ## Distribution commands
 
+:::tip
+**New to distributions?** Start with the [Profile Distributions user guide](../user-guide/profile-distributions.md) — it covers the why, when, and how with full examples. The sections below are a dry CLI reference for when you know what you want.
+:::
+
 Distributions turn a profile into a shareable, versioned artifact published
 as a **git repository**. A recipient installs the distribution with a single
 command and can update it in place later without touching their local
@@ -430,7 +437,7 @@ Generates shell completion scripts. Includes completions for profile names and p
 
 | Argument | Description |
 |----------|-------------|
-| `<shell>` | Shell to generate completions for: `bash` or `zsh`. |
+| `<shell>` | Shell to generate completions for: `bash`, `zsh`, or `fish`. |
 
 **Examples:**
 
@@ -438,6 +445,7 @@ Generates shell completion scripts. Includes completions for profile names and p
 # Install completions
 hermes completion bash >> ~/.bashrc
 hermes completion zsh >> ~/.zshrc
+hermes completion fish > ~/.config/fish/completions/hermes.fish
 
 # Reload shell
 source ~/.bashrc
