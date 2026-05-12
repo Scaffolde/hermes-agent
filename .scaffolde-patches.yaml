@@ -21,3 +21,43 @@ patches:
     path: .scaffolde-patches.yaml
     contains:
       - "patches:"
+
+  - description: Slack gateway — user-token bridge + mentioned-thread bookkeeping
+    path: gateway/platforms/slack.py
+    contains:
+      - SLACK_USER_TOKEN
+      - MENTIONED_THREADS_MAX
+
+  - description: WhatsApp gateway — stale-session and port-reclaim hardening
+    path: gateway/platforms/whatsapp.py
+    contains:
+      - _close_stale_session
+      - _cancel_stale_poll
+      - _kill_port_process
+
+  - description: Chat-completions transport — NVIDIA DeepSeek V4 Pro slow-stream path
+    path: agent/transports/chat_completions.py
+    contains:
+      - is_nvidia_deepseek_v4_pro
+
+  - description: hermes doctor — runtime-gated tool availability split
+    path: hermes_cli/doctor.py
+    contains:
+      - _split_runtime_gated_tool_availability
+      - _tool_unavailable_reason
+
+  - description: hermes CLI — NVIDIA model-name normalization (fork-new module)
+    path: hermes_cli/model_normalize.py
+    contains:
+      - _normalize_for_nvidia
+
+  - description: hermes CLI — dashboard health probe (fork-new module)
+    path: hermes_cli/dashboard_health.py
+    contains:
+      - class DashboardProbeResult
+      - def probe_dashboard
+
+  - description: Obsidian memory provider plugin (fork-new module)
+    path: plugins/memory/obsidian/__init__.py
+    contains:
+      - class ObsidianMemoryProvider
