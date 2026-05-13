@@ -524,7 +524,11 @@ class SlackAdapter(BasePlatformAdapter):
         # Keep the generic default plus any installer-provided names from
         # slack.extra.user_token_env/user_token_env_vars.
         env_var_names = [str(v).strip() for v in user_token_env_vars if str(v).strip()]
-        env_var_names.append("SLACK_USER_TOKEN")
+        # Support both the generic user-token env var and Gary/Scaffolde's
+        # first-class Scaff Olde account token by default.  A configured
+        # user_token_env_vars list should extend these defaults, not be required
+        # for the common Scaffolde install path.
+        env_var_names.extend(["SLACK_USER_TOKEN", "SLACK_SCAFF_OLDE_USER_TOKEN"])
         raw_user_tokens = []
         for env_name in dict.fromkeys(env_var_names):
             raw_value = os.getenv(env_name)
@@ -2147,7 +2151,7 @@ class SlackAdapter(BasePlatformAdapter):
                     if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
                         ext = ".jpg"
                     # Slack private URLs require the bot token as auth header
-                    cached = await self._download_slack_file(url, ext, team_id=team_id)
+                    cached = await self._download_slack_file(url, ext, team_id=team_id, channel_id=channel_id)
                     media_urls.append(cached)
                     media_types.append(mimetype)
                 except Exception as e:  # pragma: no cover - defensive logging
@@ -2162,7 +2166,7 @@ class SlackAdapter(BasePlatformAdapter):
                     ext = "." + mimetype.split("/")[-1].split(";")[0]
                     if ext not in (".ogg", ".mp3", ".wav", ".webm", ".m4a"):
                         ext = ".ogg"
-                    cached = await self._download_slack_file(url, ext, audio=True, team_id=team_id)
+                    cached = await self._download_slack_file(url, ext, audio=True, team_id=team_id, channel_id=channel_id)
                     media_urls.append(cached)
                     media_types.append(mimetype)
                 except Exception as e:  # pragma: no cover - defensive logging
@@ -2197,7 +2201,7 @@ class SlackAdapter(BasePlatformAdapter):
                         continue
 
                     # Download and cache
-                    raw_bytes = await self._download_slack_file_bytes(url, team_id=team_id)
+                    raw_bytes = await self._download_slack_file_bytes(url, team_id=team_id, channel_id=channel_id)
                     cached_path = cache_document_from_bytes(
                         raw_bytes, original_filename or f"document{ext}"
                     )
@@ -2954,18 +2958,41 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
-    async def _download_slack_file(self, url: str, ext: str, audio: bool = False, team_id: str = "") -> str:
-        """Download a Slack file using the bot token for auth, with retry."""
+    def _select_slack_file_download_token(self, *, team_id: str = "", channel_id: str = "") -> str:
+        """Return the Slack token that can read files for a channel.
+
+        First-class user DMs may carry files only visible to the user token, even
+        when the event reaches Hermes through the app/socket transport.  Prefer
+        the same client that would send/respond in that DM/thread, then fall back
+        to the workspace bot token.
+        """
+        selected_client = None
+        if channel_id:
+            try:
+                selected_client = self._get_client(channel_id)
+            except Exception:
+                selected_client = None
+        selected_token = getattr(selected_client, "token", None) if selected_client is not None else None
+        if selected_token:
+            return selected_token
+        if team_id and team_id in self._team_clients:
+            team_token = getattr(self._team_clients[team_id], "token", None)
+            if team_token:
+                return team_token
+        return self.config.token
+
+    async def _download_slack_file(self, url: str, ext: str, audio: bool = False, team_id: str = "", channel_id: str = "") -> str:
+        """Download a Slack file using the channel-appropriate token for auth, with retry."""
         import httpx
 
-        bot_token = self._team_clients[team_id].token if team_id and team_id in self._team_clients else self.config.token
+        slack_token = self._select_slack_file_download_token(team_id=team_id, channel_id=channel_id)
 
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             for attempt in range(3):
                 try:
                     response = await client.get(
                         url,
-                        headers={"Authorization": f"Bearer {bot_token}"},
+                        headers={"Authorization": f"Bearer {slack_token}"},
                     )
                     response.raise_for_status()
 
@@ -2997,18 +3024,18 @@ class SlackAdapter(BasePlatformAdapter):
                         continue
                     raise
 
-    async def _download_slack_file_bytes(self, url: str, team_id: str = "") -> bytes:
+    async def _download_slack_file_bytes(self, url: str, team_id: str = "", channel_id: str = "") -> bytes:
         """Download a Slack file and return raw bytes, with retry."""
         import httpx
 
-        bot_token = self._team_clients[team_id].token if team_id and team_id in self._team_clients else self.config.token
+        slack_token = self._select_slack_file_download_token(team_id=team_id, channel_id=channel_id)
 
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             for attempt in range(3):
                 try:
                     response = await client.get(
                         url,
-                        headers={"Authorization": f"Bearer {bot_token}"},
+                        headers={"Authorization": f"Bearer {slack_token}"},
                     )
                     response.raise_for_status()
                     ct = response.headers.get("content-type", "")

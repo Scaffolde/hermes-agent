@@ -92,6 +92,43 @@ def _redirect_cache(tmp_path, monkeypatch):
     )
 
 
+class TestSlackFileDownloadTokenSelection:
+    def test_dm_prefers_first_class_user_token(self, adapter):
+        bot_client = MagicMock()
+        bot_client.token = "xoxb-bot"
+        user_client = MagicMock()
+        user_client.token = "xoxp-user"
+        adapter._team_clients["T123"] = bot_client
+        adapter._team_user_clients["T123"] = user_client
+        adapter._channel_team["D123"] = "T123"
+
+        token = adapter._select_slack_file_download_token(team_id="T123", channel_id="D123")
+
+        assert token == "xoxp-user"
+
+    def test_public_channel_uses_bot_token(self, adapter):
+        bot_client = MagicMock()
+        bot_client.token = "xoxb-bot"
+        user_client = MagicMock()
+        user_client.token = "xoxp-user"
+        adapter._team_clients["T123"] = bot_client
+        adapter._team_user_clients["T123"] = user_client
+        adapter._channel_team["C123"] = "T123"
+
+        token = adapter._select_slack_file_download_token(team_id="T123", channel_id="C123")
+
+        assert token == "xoxb-bot"
+
+    def test_unknown_dm_with_single_user_token_uses_user_token(self, adapter):
+        user_client = MagicMock()
+        user_client.token = "xoxp-user"
+        adapter._team_user_clients["T123"] = user_client
+
+        token = adapter._select_slack_file_download_token(channel_id="D123")
+
+        assert token == "xoxp-user"
+
+
 # ---------------------------------------------------------------------------
 # TestSlashCommandSessionIsolation
 # ---------------------------------------------------------------------------
