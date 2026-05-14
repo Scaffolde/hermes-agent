@@ -94,56 +94,7 @@ jobs:
         id: verify
         run: |
           set -euo pipefail
-          if [ ! -f "${PATCHES_MANIFEST}" ]; then
-            {
-              echo "## Hermes upstream sync — patches manifest missing"
-              echo ""
-              echo "\`${PATCHES_MANIFEST}\` is not present in the merged tree."
-              echo "It either never existed on this fork or the upstream merge removed it."
-              echo "Refusing to push the sync branch."
-            } >> "$GITHUB_STEP_SUMMARY"
-            printf '::error title=Patches manifest missing::%s not found after merge\n' "${PATCHES_MANIFEST}"
-            exit 1
-          fi
-          python3 - <<'PY'
-          import os, sys, yaml
-          manifest_path = os.environ["PATCHES_MANIFEST"]
-          with open(manifest_path, encoding="utf-8") as fh:
-              manifest = yaml.safe_load(fh) or {}
-          entries = manifest.get("patches", []) or []
-          failures = []
-          checked_markers = 0
-          for entry in entries:
-              path = entry.get("path")
-              needles = entry.get("contains") or []
-              if not path:
-                  failures.append(f"manifest entry missing 'path': {entry!r}")
-                  continue
-              if not os.path.exists(path):
-                  failures.append(f"{path}: file missing after merge")
-                  continue
-              with open(path, encoding="utf-8", errors="replace") as fh:
-                  content = fh.read()
-              for needle in needles:
-                  checked_markers += 1
-                  if needle not in content:
-                      failures.append(f"{path}: missing marker {needle!r}")
-          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-          if failures:
-              report = ["## Hermes upstream sync — patch survival check FAILED", ""]
-              report.append(f"{len(failures)} marker(s) missing after merging upstream:")
-              report.append("")
-              for f in failures:
-                  report.append(f"- {f}")
-              report.append("")
-              report.append("Refusing to push the sync branch. Investigate locally before retrying.")
-              if summary_path:
-                  with open(summary_path, "a", encoding="utf-8") as fh:
-                      fh.write("\n".join(report) + "\n")
-              print("\n".join(report))
-              sys.exit(1)
-          print(f"All {checked_markers} marker(s) across {len(entries)} file(s) in {manifest_path} survived the merge.")
-          PY
+          python3 scripts/check-scaffolde-patches.py "${PATCHES_MANIFEST}"
 
       - name: Push sync branch
         if: steps.merge.outputs.result == 'merged'
@@ -219,17 +170,31 @@ jobs:
           EOF
           )"
 
-          gh label create "${TRACKING_LABEL}" \
-            --description "Upstream sync workflow conflict that needs human resolution" \
-            --color B60205 \
-            --force >/dev/null 2>&1 || true
-
-          EXISTING="$(gh issue list --label "${TRACKING_LABEL}" --state open --json number --jq '.[0].number // empty')"
-          if [ -n "${EXISTING}" ]; then
-            gh issue edit "${EXISTING}" --title "${TITLE}" --body "${BODY}"
-            gh issue comment "${EXISTING}" --body "Sync run ${{ github.run_id }} hit the same conflict. Latest upstream: \`${UPSTREAM_SHA}\`. Conflicts: \`${CONFLICTS:-unknown}\`."
+          if ! gh issue list --state open --limit 1 >/tmp/upstream-sync-issue-probe.out 2>/tmp/upstream-sync-issue-probe.err; then
+            cat /tmp/upstream-sync-issue-probe.err >&2 || true
+            printf '::warning title=Conflict issue skipped::GitHub Issues are unavailable for this repository; emitting workflow summary only.\n'
+            {
+              printf '## Upstream sync conflict\n\n'
+              printf '%s\n' "${BODY}"
+            } >> "${GITHUB_STEP_SUMMARY}"
           else
-            gh issue create --title "${TITLE}" --body "${BODY}" --label "${TRACKING_LABEL}"
+            LABEL_ARG=()
+            if gh label create "${TRACKING_LABEL}" \
+              --description "Upstream sync workflow conflict that needs human resolution" \
+              --color B60205 \
+              --force >/dev/null 2>&1; then
+              LABEL_ARG=(--label "${TRACKING_LABEL}")
+            else
+              printf '::warning title=Conflict label skipped::Could not create label %s; issue will be created without it.\n' "${TRACKING_LABEL}"
+            fi
+
+            EXISTING="$(gh issue list --label "${TRACKING_LABEL}" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+            if [ -n "${EXISTING}" ]; then
+              gh issue edit "${EXISTING}" --title "${TITLE}" --body "${BODY}"
+              gh issue comment "${EXISTING}" --body "Sync run ${{ github.run_id }} hit the same conflict. Latest upstream: \`${UPSTREAM_SHA}\`. Conflicts: \`${CONFLICTS:-unknown}\`."
+            else
+              gh issue create --title "${TITLE}" --body "${BODY}" "${LABEL_ARG[@]}"
+            fi
           fi
 
           printf '::error title=Hermes upstream sync conflict::Manual resolution required. Conflicts: %s\n' "${CONFLICTS:-unknown}"

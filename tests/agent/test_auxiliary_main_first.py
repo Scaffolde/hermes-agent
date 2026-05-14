@@ -136,6 +136,48 @@ class TestResolveAutoMainFirst:
 
         assert client is chain_client
 
+    def test_configured_auto_provider_chain_controls_fallback_order(self):
+        """auxiliary.auto_provider_chain lets auto prefer subscriptions/free lanes before paid aggregators."""
+        chain_client = MagicMock()
+
+        def fake_resolve(provider, model=None, **kwargs):
+            if provider == "anthropic":
+                return None, None
+            if provider == "gemini":
+                return chain_client, model or "gemini-3-flash-preview"
+            raise AssertionError(f"unexpected provider {provider}")
+
+        with patch(
+            "agent.auxiliary_client._read_main_provider", return_value="",
+        ), patch(
+            "agent.auxiliary_client._read_main_model", return_value="",
+        ), patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "auxiliary": {
+                    "auto_provider_chain": [
+                        {"provider": "anthropic", "model": "claude-sonnet-4.6"},
+                        {"provider": "gemini", "model": "gemini-3-flash-preview"},
+                        "openrouter",
+                        "nous",
+                    ]
+                }
+            },
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=fake_resolve,
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._try_openrouter",
+            side_effect=AssertionError("openrouter should not be reached"),
+        ):
+            from agent.auxiliary_client import _resolve_auto
+
+            client, model = _resolve_auto()
+
+        assert client is chain_client
+        assert model == "gemini-3-flash-preview"
+        assert [call.args[0] for call in mock_resolve.call_args_list] == ["anthropic", "gemini"]
+
     def test_runtime_override_wins_over_config(self, monkeypatch):
         """main_runtime kwarg overrides config-read main provider/model."""
         with patch(

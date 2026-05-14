@@ -22,11 +22,24 @@ jobs:
 
       - name: Check for unmapped contributor emails
         run: |
-          # Get the merge base between this PR and main
+          # Get the merge base between this PR and main.
           MERGE_BASE=$(git merge-base origin/main HEAD)
 
-          # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          # Fork-sync PRs may merge commits from NousResearch/hermes-agent.
+          # Those upstream-authored commits should not be treated as new local
+          # fork contributors, otherwise every upstream sync can fail on
+          # unrelated AUTHOR_MAP drift.  If the upstream remote is reachable,
+          # exclude commits already present there and check only fork-local
+          # commits in this PR.
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git 2>/dev/null || true
+          git fetch upstream main --quiet || true
+          EXCLUDE_UPSTREAM=()
+          if git rev-parse --verify upstream/main >/dev/null 2>&1; then
+            EXCLUDE_UPSTREAM=(--not upstream/main)
+          fi
+
+          # Find any new author emails in this PR's fork-local commits.
+          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD "${EXCLUDE_UPSTREAM[@]}" --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."
@@ -38,7 +51,7 @@ jobs:
           while IFS= read -r email; do
             # Skip teknium and bot emails
             case "$email" in
-              *teknium*|*noreply@github.com*|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*)
+              *teknium*|*noreply@github.com*|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*|pai@scaffolde.ai)
                 continue ;;
             esac
 

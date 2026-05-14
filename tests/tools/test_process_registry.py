@@ -108,6 +108,7 @@ class TestGetAndPoll:
 # =========================================================================
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only: uses setsid/fcntl")
+@pytest.mark.live_system_guard_bypass
 class TestOrphanedPipeReconciliation:
     """Regression tests for issue #17327.
 
@@ -647,7 +648,8 @@ class TestCheckpoint:
             "pid": 999999999,  # almost certainly not running
             "task_id": "t1",
         }]))
-        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+             patch.object(registry, "_is_host_pid_alive", return_value=False):
             recovered = registry.recover_from_checkpoint()
             assert recovered == 0
 
@@ -754,6 +756,7 @@ class TestCheckpoint:
             data = json.loads(checkpoint.read_text())
             assert data == []
 
+    @pytest.mark.live_system_guard_bypass
     def test_detached_recovered_process_eventually_exits(self, registry, tmp_path):
         proc = _spawn_python_sleep(0.4)
         checkpoint = tmp_path / "procs.json"
@@ -828,7 +831,7 @@ class TestKillProcess:
             def terminate(self):
                 terminate_calls.append(("terminate", self.pid))
 
-        import psutil as _psutil
+        _psutil = pytest.importorskip("psutil")
 
         try:
             # Post-#21561: liveness probe routes through

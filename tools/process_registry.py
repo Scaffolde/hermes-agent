@@ -580,15 +580,16 @@ class ProcessRegistry:
             self._write_checkpoint()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
-            # descendants spawned via setsid) before re-raising so they do not
-            # leak as untracked background processes.
+            # descendants) before re-raising so they do not leak as untracked
+            # background processes.  Use the existing psutil-backed helper
+            # instead of raw POSIX-only process-group APIs so the Windows
+            # footgun guard can keep this path portable.
             try:
-                if not _IS_WINDOWS:
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError, OSError):
-                        proc.kill()
-                else:
+                self._terminate_host_pid(proc.pid)
+            except Exception:
+                pass
+            try:
+                if proc.poll() is None:
                     proc.kill()
             except Exception:
                 pass
@@ -1237,7 +1238,7 @@ class ProcessRegistry:
         killed = 0
         for session in targets:
             result = self.kill_process(session.id)
-            if result.get("status") in ("killed", "already_exited"):
+            if result.get("status") in {"killed", "already_exited"}:
                 killed += 1
         return killed
 
@@ -1446,7 +1447,7 @@ def _handle_process(args, **kw):
 
     if action == "list":
         return json.dumps({"processes": process_registry.list_sessions(task_id=task_id)}, ensure_ascii=False)
-    elif action in ("poll", "log", "wait", "kill", "write", "submit", "close"):
+    elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
         if action == "poll":

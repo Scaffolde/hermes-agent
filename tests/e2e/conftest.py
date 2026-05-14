@@ -22,7 +22,9 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
-E2E_MESSAGE_SETTLE_DELAY = 0.3
+E2E_MESSAGE_SETTLE_TIMEOUT = 2.0
+# Backwards-compatible import for adapter tests.
+E2E_MESSAGE_SETTLE_DELAY = E2E_MESSAGE_SETTLE_TIMEOUT
 
 # Platform library mocks
 
@@ -213,6 +215,9 @@ def make_runner(platform: Platform, session_entry: SessionEntry = None) -> "Gate
     runner._provider_routing = {}
     runner._fallback_model = None
     runner._show_reasoning = False
+    runner._read_user_config = lambda: {
+        "approvals": {"destructive_slash_confirm": False}
+    }
 
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
@@ -221,6 +226,9 @@ def make_runner(platform: Platform, session_entry: SessionEntry = None) -> "Gate
     runner._send_voice_reply = AsyncMock()
     runner._capture_gateway_honcho_if_configured = lambda *a, **kw: None
     runner._emit_gateway_run_progress = AsyncMock()
+
+    # Disable destructive slash confirm gate so /new executes immediately
+    runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": False}}
 
     runner.pairing_store = MagicMock()
     runner.pairing_store._is_rate_limited = MagicMock(return_value=False)
@@ -262,7 +270,9 @@ async def send_and_capture(adapter, text: str, platform: Platform, **event_kwarg
     event = make_event(platform, text, **event_kwargs)
     adapter.send.reset_mock()
     await adapter.handle_message(event)
-    await asyncio.sleep(0.3)
+    deadline = asyncio.get_running_loop().time() + E2E_MESSAGE_SETTLE_TIMEOUT
+    while not adapter.send.called and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
     return adapter.send
 
 
