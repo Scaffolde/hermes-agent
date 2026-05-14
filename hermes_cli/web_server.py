@@ -3787,6 +3787,8 @@ def _discover_dashboard_plugins() -> list:
                 name = data.get("name", child.name)
                 if name in seen_names:
                     continue
+                entry = data.get("entry", "dist/index.js")
+                css = data.get("css")
                 seen_names.add(name)
                 # Tab options: ``path`` + ``position`` for a new tab, optional
                 # ``override`` to replace a built-in route, and ``hidden`` to
@@ -3817,8 +3819,8 @@ def _discover_dashboard_plugins() -> list:
                     "version": data.get("version", "0.0.0"),
                     "tab": tab_info,
                     "slots": slots,
-                    "entry": data.get("entry", "dist/index.js"),
-                    "css": data.get("css"),
+                    "entry": entry,
+                    "css": css,
                     "has_api": bool(data.get("api")),
                     "source": source,
                     "_dir": str(child / "dashboard"),

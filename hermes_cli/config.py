@@ -951,6 +951,10 @@ DEFAULT_CONFIG = {
     # Web dashboard settings
     "dashboard": {
         "theme": "default",  # Dashboard visual theme: "default", "midnight", "ember", "mono", "cyberpunk", "rose"
+        # Expose the in-browser Chat tab by default. Equivalent to starting
+        # the dashboard with `hermes dashboard --tui` or setting
+        # HERMES_DASHBOARD_TUI=1; the CLI flag/env still override this.
+        "embedded_chat": False,
     },
 
     # Privacy settings
@@ -1358,6 +1362,15 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # Automatically run the auxiliary triage specifier before each
+        # dispatcher tick. This matches the dashboard copy: tasks parked in
+        # Triage are raw ideas, and a specifier fleshes them out into concrete
+        # specs before workers pick them up. Disable if you want manual-only
+        # triage via `hermes kanban specify` / the dashboard Specify button.
+        "auto_specify_triage": True,
+        # Bound each tick so a large triage backlog does not monopolize the
+        # gateway or provider quota.
+        "auto_specify_max_per_tick": 3,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

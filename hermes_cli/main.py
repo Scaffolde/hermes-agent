@@ -9100,7 +9100,18 @@ def cmd_dashboard(args):
 
     from hermes_cli.web_server import start_server
 
-    embedded_chat = args.tui or os.environ.get("HERMES_DASHBOARD_TUI") == "1"
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        dashboard_cfg_chat = bool(
+            cfg_get(load_config(), "dashboard", "embedded_chat", default=False)
+        )
+    except Exception:
+        dashboard_cfg_chat = False
+    embedded_chat = (
+        args.tui
+        or os.environ.get("HERMES_DASHBOARD_TUI") == "1"
+        or dashboard_cfg_chat
+    )
     start_server(
         host=args.host,
         port=args.port,

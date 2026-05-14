@@ -60,6 +60,7 @@ jobs:
             tests/hermes_cli/test_update_gateway_restart.py \
             -q --tb=short
         env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
@@ -94,6 +95,7 @@ jobs:
           source .venv/bin/activate
           python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
         env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
@@ -120,8 +122,9 @@ jobs:
       - name: Run e2e tests
         run: |
           source .venv/bin/activate
-          python -m pytest tests/e2e/ -v --tb=short
+          python -m pytest tests/e2e/ -v --tb=short -n 0
         env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""

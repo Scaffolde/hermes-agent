@@ -40,11 +40,23 @@ patches:
     contains:
       - is_nvidia_deepseek_v4_pro
 
-  - description: hermes doctor — runtime-gated tool availability split
+  - description: hermes doctor — runtime-gated tool availability split + Gemini native key probe
     path: hermes_cli/doctor.py
     contains:
       - _split_runtime_gated_tool_availability
       - _tool_unavailable_reason
+      - generativelanguage.googleapis.com
+
+  - description: auxiliary clients — configurable auto provider fallback chain
+    path: agent/auxiliary_client.py
+    contains:
+      - _DEFAULT_AUTO_PROVIDER_CHAIN
+      - auxiliary.auto_provider_chain
+
+  - description: WhatsApp bridge — link-preview-js dependency without legacy url shim
+    path: scripts/whatsapp-bridge/package.json
+    contains:
+      - '"link-preview-js": "^4.0.3"'
 
   - description: hermes CLI — NVIDIA model-name normalization (fork-new module)
     path: hermes_cli/model_normalize.py

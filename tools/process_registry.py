@@ -580,18 +580,17 @@ class ProcessRegistry:
             self._write_checkpoint()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
-            # descendants spawned via setsid) before re-raising so they do not
-            # leak as untracked background processes.
+            # descendants) before re-raising so they do not leak as untracked
+            # background processes.  Use the existing psutil-backed helper
+            # instead of raw POSIX-only process-group APIs so the Windows
+            # footgun guard can keep this path portable.
             try:
-                if not _IS_WINDOWS:
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError, OSError):
-                        proc.kill()
-                else:
-                    proc.kill()
+                self._terminate_host_pid(proc.pid)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             try:
                 proc.wait(timeout=5)
             except Exception:

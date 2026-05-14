@@ -1436,6 +1436,14 @@ def run_doctor(args):
                 "Authorization": f"Bearer {key}",
                 "User-Agent": _HERMES_USER_AGENT,
             }
+            if "generativelanguage.googleapis.com" in url:
+                # Gemini's native API authenticates model-list requests with
+                # ``?key=...`` rather than an Authorization bearer token.  The
+                # generic API-key probe previously reported valid Gemini keys as
+                # 401 invalid.
+                headers.pop("Authorization", None)
+                sep = "&" if "?" in url else "?"
+                url = f"{url}{sep}key={key}"
             if base_url_host_matches(base, "api.kimi.com"):
                 headers["User-Agent"] = "claude-code/0.1.0"
             r = httpx.get(url, headers=headers, timeout=10)

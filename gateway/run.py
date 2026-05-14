@@ -4529,6 +4529,14 @@ class GatewayRunner:
             )
             failure_limit = _kb.DEFAULT_FAILURE_LIMIT
 
+        auto_specify_triage = bool(kanban_cfg.get("auto_specify_triage", True))
+        try:
+            auto_specify_max_per_tick = int(kanban_cfg.get("auto_specify_max_per_tick", 3) or 3)
+        except (TypeError, ValueError):
+            auto_specify_max_per_tick = 3
+        if auto_specify_max_per_tick < 1:
+            auto_specify_max_per_tick = 1
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -4552,6 +4560,31 @@ class GatewayRunner:
             """
             conn = None
             try:
+                if auto_specify_triage:
+                    try:
+                        from hermes_cli import kanban_specify as _ks
+                        triage_ids = _ks.list_triage_ids(board=slug)[:auto_specify_max_per_tick]
+                        for task_id in triage_ids:
+                            outcome = _ks.specify_task(
+                                task_id,
+                                author="gateway-specifier",
+                                board=slug,
+                            )
+                            if outcome.ok:
+                                logger.info(
+                                    "kanban specifier [%s]: specified %s",
+                                    slug,
+                                    task_id,
+                                )
+                            else:
+                                logger.warning(
+                                    "kanban specifier [%s]: skipped %s: %s",
+                                    slug,
+                                    task_id,
+                                    outcome.reason,
+                                )
+                    except Exception:
+                        logger.exception("kanban specifier: tick failed on board %s", slug)
                 conn = _kb.connect(board=slug)
                 # `connect()` runs the schema + idempotent migration on
                 # first open per process; the previous explicit

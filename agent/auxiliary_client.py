@@ -1795,6 +1795,13 @@ _AUTO_PROVIDER_LABELS = {
     "_resolve_api_key_provider": "api-key",
 }
 
+_DEFAULT_AUTO_PROVIDER_CHAIN = [
+    "openrouter",
+    "nous",
+    "local/custom",
+    "api-key",
+]
+
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode")
 
 
@@ -1813,25 +1820,93 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     return normalized
 
 
+def _configured_auto_provider_chain() -> List[Any]:
+    """Read the optional auxiliary auto fallback order from config.yaml.
+
+    ``auxiliary.auto_provider_chain`` is intentionally simple: a list of provider
+    ids, or dicts with ``provider`` plus optional ``model`` / ``base_url`` /
+    ``api_key`` / ``api_mode``.  When unset, preserve Hermes' historical chain.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        return list(_DEFAULT_AUTO_PROVIDER_CHAIN)
+
+    aux_cfg = cfg.get("auxiliary") if isinstance(cfg, dict) else None
+    raw_chain = aux_cfg.get("auto_provider_chain") if isinstance(aux_cfg, dict) else None
+    if not isinstance(raw_chain, list) or not raw_chain:
+        return list(_DEFAULT_AUTO_PROVIDER_CHAIN)
+    return list(raw_chain)
+
+
+def _chain_entry_from_config(entry: Any) -> Optional[tuple]:
+    """Convert one auto-provider-chain config entry to ``(label, try_fn)``."""
+    model = base_url = api_key = api_mode = None
+    provider = entry
+    if isinstance(entry, dict):
+        provider = entry.get("provider") or entry.get("name")
+        model = entry.get("model")
+        base_url = entry.get("base_url")
+        api_key = entry.get("api_key")
+        api_mode = entry.get("api_mode")
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+
+    raw_provider = provider.strip().lower()
+    normalized = _normalize_aux_provider(raw_provider)
+    if normalized in {"auto", "main"}:
+        return None
+    if normalized in {"custom", "local", "local/custom"}:
+        return "local/custom", _try_custom_endpoint
+    if normalized == "api-key":
+        return "api-key", _resolve_api_key_provider
+    if normalized == "openrouter":
+        return "openrouter", _try_openrouter
+    if normalized == "nous":
+        return "nous", _try_nous
+
+    label = raw_provider
+
+    def _try_configured_provider(
+        _provider=raw_provider,
+        _model=model,
+        _base_url=base_url,
+        _api_key=api_key,
+        _api_mode=api_mode,
+    ):
+        return resolve_provider_client(
+            _provider,
+            model=str(_model).strip() if isinstance(_model, str) and _model.strip() else None,
+            explicit_base_url=str(_base_url).strip() if isinstance(_base_url, str) and _base_url.strip() else None,
+            explicit_api_key=str(_api_key).strip() if isinstance(_api_key, str) and _api_key.strip() else None,
+            api_mode=str(_api_mode).strip() if isinstance(_api_mode, str) and _api_mode.strip() else None,
+        )
+
+    return label, _try_configured_provider
+
+
 def _get_provider_chain() -> List[tuple]:
     """Return the ordered provider detection chain.
 
-    Built at call time (not module level) so that test patches
-    on the ``_try_*`` functions are picked up correctly.
+    Built at call time (not module level) so test patches and config edits are
+    picked up.  By default this preserves Hermes' historical OpenRouter → Nous →
+    custom → API-key order.  Users can override it with
+    ``auxiliary.auto_provider_chain`` for a straightforward subscription/free/
+    paid fallback policy without pinning each auxiliary task away from ``auto``.
 
-    NOTE: ``openai-codex`` is deliberately NOT in this chain.  The
-    ChatGPT-account Codex endpoint only accepts a shifting, undocumented
-    allow-list of model IDs, so falling back to it with a guessed model
-    fails more often than not.  Codex is used only when the user's main
-    provider *is* openai-codex (see Step 1 of ``_resolve_auto``) or when
-    a caller explicitly requests it with a model.
+    NOTE: ``openai-codex`` is deliberately not in the default fallback chain.
+    The ChatGPT-account Codex endpoint only accepts a shifting, undocumented
+    allow-list of model IDs. Codex is used when it is the user's main provider
+    (Step 1 of ``_resolve_auto``) or when explicitly listed with a model.
     """
-    return [
-        ("openrouter", _try_openrouter),
-        ("nous", _try_nous),
-        ("local/custom", _try_custom_endpoint),
-        ("api-key", _resolve_api_key_provider),
-    ]
+    chain: List[tuple] = []
+    for raw_entry in _configured_auto_provider_chain():
+        entry = _chain_entry_from_config(raw_entry)
+        if entry is not None:
+            chain.append(entry)
+    return chain
 
 
 # ── Auxiliary "recently 402'd" unhealthy-provider cache ────────────────────

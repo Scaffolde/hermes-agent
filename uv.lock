@@ -2015,6 +2015,7 @@ all = [
     { name = "mcp" },
     { name = "mistralai" },
     { name = "modal" },
+    { name = "msal" },
     { name = "numpy" },
     { name = "ptyprocess", marker = "sys_platform != 'win32'" },
     { name = "pytest" },
@@ -2092,6 +2093,7 @@ mcp = [
 messaging = [
     { name = "aiohttp" },
     { name = "discord-py", extra = ["voice"] },
+    { name = "msal" },
     { name = "python-telegram-bot", extra = ["webhooks"] },
     { name = "qrcode" },
     { name = "slack-bolt" },
@@ -2121,6 +2123,9 @@ slack = [
 sms = [
     { name = "aiohttp" },
 ]
+teams-user = [
+    { name = "msal" },
+]
 termux = [
     { name = "agent-client-protocol" },
     { name = "honcho-ai" },
@@ -2146,6 +2151,7 @@ termux-all = [
     { name = "lark-oapi" },
     { name = "mcp" },
     { name = "mistralai" },
+    { name = "msal" },
     { name = "ptyprocess", marker = "sys_platform != 'win32'" },
     { name = "python-telegram-bot", extra = ["webhooks"] },
     { name = "pywinpty", marker = "sys_platform == 'win32'" },
@@ -2261,6 +2267,8 @@ requires-dist = [
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.2.0,<2" },
     { name = "mistralai", marker = "extra == 'mistral'", specifier = ">=2.3.0,<3" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.0.0,<2" },
+    { name = "msal", marker = "extra == 'messaging'", specifier = ">=1.31.0,<2" },
+    { name = "msal", marker = "extra == 'teams-user'", specifier = ">=1.31.0,<2" },
     { name = "numpy", marker = "extra == 'voice'", specifier = ">=1.24.0,<3" },
     { name = "openai", specifier = ">=2.21.0,<3" },
     { name = "parallel-web", specifier = ">=0.4.2,<1" },
@@ -2302,7 +2310,7 @@ requires-dist = [
     { name = "yc-bench", marker = "python_full_version >= '3.12' and extra == 'yc-bench'", git = "https://github.com/collinear-ai/yc-bench.git?rev=bfb0c88062450f46341bd9a5298903fc2e952a5c" },
     { name = "youtube-transcript-api", marker = "extra == 'youtube'", specifier = ">=1.2.0" },
 ]
-provides-extras = ["modal", "daytona", "vercel", "hindsight", "dev", "messaging", "cron", "slack", "matrix", "cli", "tts-premium", "voice", "pty", "honcho", "mcp", "homeassistant", "sms", "computer-use", "acp", "mistral", "bedrock", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "rl", "yc-bench", "all"]
+provides-extras = ["modal", "daytona", "vercel", "hindsight", "dev", "messaging", "cron", "slack", "teams-user", "matrix", "cli", "tts-premium", "voice", "pty", "honcho", "mcp", "homeassistant", "sms", "computer-use", "acp", "mistral", "bedrock", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "rl", "yc-bench", "all"]
 
 [[package]]
 name = "hf-transfer"
@@ -3168,6 +3176,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e0/47/dd32fa426cc72114383ac549964eecb20ecfd886d1e5ccf5340b55b02f57/mpmath-1.3.0.tar.gz", hash = "sha256:7a28eb2a9774d00c7bc92411c19a89209d5da7c4c9a9e227be8330a23a25b91f", size = 508106, upload-time = "2023-03-07T16:47:11.061Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/43/e3/7d92a15f894aa0c9c4b49b8ee9ac9850d6e63b03c9c32c0367a13ae62209/mpmath-1.3.0-py3-none-any.whl", hash = "sha256:a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c", size = 536198, upload-time = "2023-03-07T16:47:09.197Z" },
+]
+
+[[package]]
+name = "msal"
+version = "1.36.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "pyjwt", extra = ["crypto"] },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/de/cb/b02b0f748ac668922364ccb3c3bff5b71628a05f5adfec2ba2a5c3031483/msal-1.36.0.tar.gz", hash = "sha256:3f6a4af2b036b476a4215111c4297b4e6e236ed186cd804faefba23e4990978b", size = 174217, upload-time = "2026-04-09T10:20:33.525Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2a/d3/414d1f0a5f6f4fe5313c2b002c54e78a3332970feb3f5fed14237aa17064/msal-1.36.0-py3-none-any.whl", hash = "sha256:36ecac30e2ff4322d956029aabce3c82301c29f0acb1ad89b94edcabb0e58ec4", size = 121547, upload-time = "2026-04-09T10:20:32.336Z" },
 ]
 
 [[package]]
