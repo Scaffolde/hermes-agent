@@ -1471,11 +1471,56 @@ def _count_list(obj: object, *path: str) -> int | None:
     return len(cur) if isinstance(cur, list) else None
 
 
-def _tool_summary(name: str, result: str, duration_s: float | None) -> str | None:
+def _tool_result_data(result: str) -> object | None:
     try:
-        data = json.loads(result)
+        return json.loads(result)
     except Exception:
-        data = None
+        return None
+
+
+def _tool_result_error(name: str, result: str) -> str | None:
+    """Return a compact user-visible error for failed tool results.
+
+    The agent/backend already logs non-zero terminal exits, but the TUI only
+    renders a failed tool trail when the gateway emits payload.error. Keep this
+    local and conservative so failed shell commands, approval blocks, and common
+    {ok/success:false} tool contracts do not appear as green checkmarks.
+    """
+    data = _tool_result_data(result)
+    if not isinstance(data, dict):
+        return None
+
+    raw_error = data.get("error")
+    status = data.get("status")
+    exit_code = data.get("exit_code", data.get("returncode"))
+
+    if name == "terminal" and exit_code not in (None, 0):
+        if raw_error:
+            return str(raw_error)
+        output = str(data.get("output") or "").strip()
+        if output:
+            first_line = output.splitlines()[0].strip()
+            if first_line:
+                return f"exit {exit_code}: {first_line[:160]}"
+        return f"exit {exit_code}"
+
+    if raw_error:
+        return str(raw_error)
+
+    if status in {"blocked", "error", "approval_required"}:
+        return str(status)
+
+    if data.get("success") is False:
+        return "success=false"
+
+    if data.get("ok") is False:
+        return "ok=false"
+
+    return None
+
+
+def _tool_summary(name: str, result: str, duration_s: float | None) -> str | None:
+    data = _tool_result_data(result)
 
     dur = _fmt_tool_duration(duration_s)
     suffix = f" in {dur}" if dur else ""
@@ -1535,6 +1580,9 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary
+    error = _tool_result_error(name, result)
+    if error:
+        payload["error"] = error
     if name == "todo":
         try:
             data = json.loads(result)

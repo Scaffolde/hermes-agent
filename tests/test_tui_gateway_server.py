@@ -594,6 +594,48 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     assert captured["history_calls"] == [("tip", False), ("tip", True)]
 
 
+def test_tool_complete_marks_terminal_nonzero_exit_as_error(monkeypatch):
+    emits = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
+    server._sessions["sid-tool-error"] = {"tool_progress_mode": "all"}
+
+    try:
+        server._on_tool_complete(
+            "sid-tool-error",
+            "tool-1",
+            "terminal",
+            {},
+            json.dumps({"output": "bad thing happened\nmore", "exit_code": 2, "error": None}),
+        )
+    finally:
+        server._sessions.pop("sid-tool-error", None)
+
+    assert emits
+    event, sid, payload = emits[-1]
+    assert event == "tool.complete"
+    assert sid == "sid-tool-error"
+    assert payload["error"] == "exit 2: bad thing happened"
+
+
+def test_tool_complete_marks_blocked_result_as_error(monkeypatch):
+    emits = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
+    server._sessions["sid-tool-blocked"] = {"tool_progress_mode": "all"}
+
+    try:
+        server._on_tool_complete(
+            "sid-tool-blocked",
+            "tool-1",
+            "terminal",
+            {},
+            json.dumps({"output": "", "exit_code": -1, "error": "BLOCKED: denied", "status": "blocked"}),
+        )
+    finally:
+        server._sessions.pop("sid-tool-blocked", None)
+
+    assert emits[-1][2]["error"] == "BLOCKED: denied"
+
+
 def test_status_callback_emits_kind_and_text():
     with patch("tui_gateway.server._emit") as emit:
         cb = server._agent_cbs("sid")["status_callback"]
