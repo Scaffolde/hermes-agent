@@ -247,6 +247,7 @@ class ChatCompletionsTransport(ProviderTransport):
             params.get("is_nvidia_nim", False)
             and nvidia_model == "deepseek-ai/deepseek-v4-pro"
         )
+        is_qwen = params.get("is_qwen_portal", False)
 
         # Temperature
         fixed_temp = params.get("fixed_temperature")
@@ -291,6 +292,11 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs.update(max_tokens_fn(max_tokens))
         elif anthropic_max_out is not None:
             api_kwargs["max_tokens"] = anthropic_max_out
+        elif is_nvidia_nim and max_tokens_fn:
+            # NVIDIA NIM chat models document 16k output budgets on the
+            # OpenAI-compatible route; keep the fork's explicit default so
+            # provider refactors don't silently omit max_tokens.
+            api_kwargs.update(max_tokens_fn(16384))
 
         # Kimi: top-level reasoning_effort (unless thinking disabled)
         if is_kimi:
