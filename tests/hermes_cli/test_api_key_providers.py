@@ -31,6 +31,7 @@ class TestProviderRegistry:
 
     @pytest.mark.parametrize("provider_id,name,auth_type", [
         ("copilot-acp", "GitHub Copilot ACP", "external_process"),
+        ("google-antigravity-cli", "Google Antigravity CLI", "external_process"),
         ("copilot", "GitHub Copilot", "api_key"),
         ("huggingface", "Hugging Face", "api_key"),
         ("zai", "Z.AI / GLM", "api_key"),
@@ -114,6 +115,7 @@ class TestProviderRegistry:
     def test_base_urls(self):
         assert PROVIDER_REGISTRY["copilot"].inference_base_url == "https://api.githubcopilot.com"
         assert PROVIDER_REGISTRY["copilot-acp"].inference_base_url == "acp://copilot"
+        assert PROVIDER_REGISTRY["google-antigravity-cli"].inference_base_url == "antigravity-cli://agy"
         assert PROVIDER_REGISTRY["zai"].inference_base_url == "https://api.z.ai/api/paas/v4"
         assert PROVIDER_REGISTRY["kimi-coding"].inference_base_url == "https://api.moonshot.ai/v1"
         assert PROVIDER_REGISTRY["stepfun"].inference_base_url == STEPFUN_STEP_PLAN_INTL_BASE_URL
@@ -148,6 +150,8 @@ PROVIDER_ENV_VARS = (
     "NOUS_API_KEY", "GITHUB_TOKEN", "GH_TOKEN",
     "OPENAI_BASE_URL", "HERMES_COPILOT_ACP_COMMAND", "COPILOT_CLI_PATH",
     "HERMES_COPILOT_ACP_ARGS", "COPILOT_ACP_BASE_URL",
+    "HERMES_ANTIGRAVITY_CLI_COMMAND", "ANTIGRAVITY_CLI_PATH", "AGY_CLI_PATH",
+    "HERMES_ANTIGRAVITY_CLI_ARGS", "ANTIGRAVITY_CLI_BASE_URL",
 )
 
 
@@ -229,6 +233,11 @@ class TestResolveProvider:
     def test_alias_github_copilot_acp(self):
         assert resolve_provider("github-copilot-acp") == "copilot-acp"
         assert resolve_provider("copilot-acp-agent") == "copilot-acp"
+
+    def test_alias_google_antigravity_cli(self):
+        assert resolve_provider("agy") == "google-antigravity-cli"
+        assert resolve_provider("antigravity") == "google-antigravity-cli"
+        assert resolve_provider("google-agy") == "google-antigravity-cli"
 
     def test_explicit_huggingface(self):
         assert resolve_provider("huggingface") == "huggingface"
@@ -382,6 +391,27 @@ class TestApiKeyProviderStatus:
         assert status["configured"] is True
         assert status["provider"] == "copilot-acp"
 
+    def test_antigravity_status_detects_local_cli(self, monkeypatch):
+        monkeypatch.setenv("HERMES_ANTIGRAVITY_CLI_ARGS", "--sandbox")
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/opt/bin/{command}")
+
+        status = get_external_process_provider_status("google-antigravity-cli")
+
+        assert status["configured"] is True
+        assert status["logged_in"] is True
+        assert status["command"] == "agy"
+        assert status["resolved_command"] == "/opt/bin/agy"
+        assert status["args"] == ["--sandbox"]
+        assert status["base_url"] == "antigravity-cli://agy"
+
+    def test_get_auth_status_dispatches_to_antigravity_external_process(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/opt/bin/{command}")
+
+        status = get_auth_status("google-antigravity-cli")
+
+        assert status["configured"] is True
+        assert status["provider"] == "google-antigravity-cli"
+
     def test_non_api_key_provider(self):
         status = get_api_key_provider_status("nous")
         assert status["configured"] is False
@@ -479,6 +509,27 @@ class TestResolveApiKeyProviderCredentials:
         assert creds["command"] == "/usr/local/bin/copilot"
         assert creds["args"] == ["--acp", "--stdio"]
         assert creds["source"] == "process"
+
+    def test_resolve_antigravity_with_local_cli(self, monkeypatch):
+        monkeypatch.setenv("HERMES_ANTIGRAVITY_CLI_ARGS", "--sandbox")
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/usr/local/bin/{command}")
+
+        creds = resolve_external_process_provider_credentials("google-antigravity-cli")
+
+        assert creds["provider"] == "google-antigravity-cli"
+        assert creds["api_key"] == "google-antigravity-cli"
+        assert creds["base_url"] == "antigravity-cli://agy"
+        assert creds["command"] == "/usr/local/bin/agy"
+        assert creds["args"] == ["--sandbox"]
+        assert creds["source"] == "process"
+
+    def test_resolve_antigravity_missing_cli_raises(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: None)
+
+        with pytest.raises(AuthError) as exc:
+            resolve_external_process_provider_credentials("google-antigravity-cli")
+
+        assert exc.value.code == "missing_antigravity_cli"
 
     def test_resolve_kimi_with_key(self, monkeypatch):
         monkeypatch.setenv("KIMI_API_KEY", "kimi-secret-key")

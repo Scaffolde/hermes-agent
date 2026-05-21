@@ -492,3 +492,72 @@ class TestCustomProviderAliasCollision:
         assert isinstance(client, OpenAI)
         assert "override.example.com" in str(client.base_url)
         assert client.api_key == "override-key"
+
+
+class TestGoogleAntigravityAuxiliaryProvider:
+    def test_resolve_provider_client_returns_antigravity_client(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, {
+            "model": {"provider": "openai-codex", "default": "gpt-5.5"},
+        })
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_external_process_provider_credentials",
+            lambda provider: {
+                "provider": provider,
+                "api_key": "google-antigravity-cli",
+                "base_url": "antigravity-cli://agy",
+                "command": "/bin/agy",
+                "args": [],
+                "source": "process",
+            },
+        )
+
+        from agent.auxiliary_client import resolve_provider_client
+        from agent.google_antigravity_cli_adapter import (
+            AsyncGoogleAntigravityCLIClient,
+            GoogleAntigravityCLIClient,
+        )
+
+        sync_client, sync_model = resolve_provider_client("google-antigravity-cli")
+        assert isinstance(sync_client, GoogleAntigravityCLIClient)
+        assert sync_model == "antigravity-cli"
+        assert sync_client.command == "/bin/agy"
+
+        async_client, async_model = resolve_provider_client("google-antigravity-cli", async_mode=True)
+        assert isinstance(async_client, AsyncGoogleAntigravityCLIClient)
+        assert async_model == "antigravity-cli"
+
+    def test_compression_task_can_route_to_antigravity(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, {
+            "model": {"provider": "openai-codex", "default": "gpt-5.5"},
+            "auxiliary": {
+                "compression": {
+                    "provider": "google-antigravity-cli",
+                    "model": "antigravity-cli",
+                },
+            },
+        })
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_external_process_provider_credentials",
+            lambda provider: {
+                "provider": provider,
+                "api_key": "google-antigravity-cli",
+                "base_url": "antigravity-cli://agy",
+                "command": "/bin/agy",
+                "args": [],
+                "source": "process",
+            },
+        )
+
+        from agent.auxiliary_client import get_async_text_auxiliary_client, get_text_auxiliary_client
+        from agent.google_antigravity_cli_adapter import (
+            AsyncGoogleAntigravityCLIClient,
+            GoogleAntigravityCLIClient,
+        )
+
+        sync_client, sync_model = get_text_auxiliary_client("compression")
+        assert isinstance(sync_client, GoogleAntigravityCLIClient)
+        assert sync_model == "antigravity-cli"
+
+        async_client, async_model = get_async_text_auxiliary_client("compression")
+        assert isinstance(async_client, AsyncGoogleAntigravityCLIClient)
+        assert async_model == "antigravity-cli"
