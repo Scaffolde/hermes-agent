@@ -3018,6 +3018,15 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
             return sync_client, model
     except ImportError:
         pass
+    try:
+        from agent.google_antigravity_cli_adapter import (
+            GoogleAntigravityCLIClient,
+            AsyncGoogleAntigravityCLIClient,
+        )
+        if isinstance(sync_client, GoogleAntigravityCLIClient):
+            return AsyncGoogleAntigravityCLIClient(sync_client), model
+    except ImportError:
+        pass
 
     async_kwargs = {
         "api_key": sync_client.api_key,
@@ -3619,6 +3628,27 @@ def resolve_provider_client(
                 base_url=base_url,
                 command=command,
                 args=args,
+            )
+            logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
+        if provider == "google-antigravity-cli":
+            api_key = str(creds.get("api_key", "")).strip() or "google-antigravity-cli"
+            base_url = str(creds.get("base_url", "")).strip() or "antigravity-cli://agy"
+            command = str(creds.get("command", "")).strip() or "agy"
+            args = list(creds.get("args") or [])
+            # `agy` currently exposes no model-selection flag. Do not inherit
+            # the main Hermes model here; that would falsely claim a GPT/Claude
+            # model handled Antigravity output.
+            final_model = model or "antigravity-cli"
+            from agent.google_antigravity_cli_adapter import GoogleAntigravityCLIClient
+
+            client = GoogleAntigravityCLIClient(
+                api_key=api_key,
+                base_url=base_url,
+                command=command,
+                args=args,
+                model=final_model,
             )
             logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode

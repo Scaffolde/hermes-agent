@@ -106,6 +106,7 @@ MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_ANTIGRAVITY_CLI_BASE_URL = "antigravity-cli://agy"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
@@ -236,6 +237,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
+    "google-antigravity-cli": ProviderConfig(
+        id="google-antigravity-cli",
+        name="Google Antigravity CLI",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_ANTIGRAVITY_CLI_BASE_URL,
+        base_url_env_var="ANTIGRAVITY_CLI_BASE_URL",
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -1425,6 +1433,8 @@ def resolve_provider(
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth", "google-gemini-cli": "google-gemini-cli", "gemini-cli": "google-gemini-cli", "gemini-oauth": "google-gemini-cli",
+        "antigravity": "google-antigravity-cli", "agy": "google-antigravity-cli",
+        "google-agy": "google-antigravity-cli", "google-antigravity": "google-antigravity-cli",
         "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
         "mimo": "xiaomi", "xiaomi-mimo": "xiaomi",
         "tencent": "tencent-tokenhub", "tokenhub": "tencent-tokenhub",
@@ -5607,33 +5617,58 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _external_process_defaults(provider_id: str) -> tuple[str, list[str], str]:
+    """Return (command, args, api_key sentinel) for subprocess providers."""
+    if provider_id == "copilot-acp":
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+        return command, args, "copilot-acp"
+    if provider_id == "google-antigravity-cli":
+        command = (
+            os.getenv("HERMES_ANTIGRAVITY_CLI_COMMAND", "").strip()
+            or os.getenv("ANTIGRAVITY_CLI_PATH", "").strip()
+            or os.getenv("AGY_CLI_PATH", "").strip()
+            or "agy"
+        )
+        raw_args = os.getenv("HERMES_ANTIGRAVITY_CLI_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else []
+        return command, args, "google-antigravity-cli"
+    return provider_id, [], provider_id
+
+
+def _external_process_can_use_base_url(provider_id: str, base_url: str) -> bool:
+    if provider_id == "copilot-acp":
+        return base_url.startswith("acp+tcp://")
+    return False
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    command, args, _api_key = _external_process_defaults(provider_id)
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
 
     resolved_command = shutil.which(command) if command else None
+    configured = bool(resolved_command or _external_process_can_use_base_url(provider_id, base_url))
     return {
-        "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "configured": configured,
         "provider": provider_id,
         "name": pconfig.name,
         "command": command,
         "args": args,
         "resolved_command": resolved_command,
         "base_url": base_url,
-        "logged_in": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "logged_in": configured,
     }
 
 
@@ -5656,12 +5691,12 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_gemini_oauth_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
+    pconfig = PROVIDER_REGISTRY.get(target)
+    if pconfig and pconfig.auth_type == "external_process":
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
     # API-key providers
-    pconfig = PROVIDER_REGISTRY.get(target)
     if pconfig and pconfig.auth_type == "api_key":
         return get_api_key_provider_status(target)
     # AWS SDK providers (Bedrock) — check via boto3 credential chain
@@ -5805,20 +5840,20 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             provider=provider_id,
             code="invalid_provider",
         )
-
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    command, args, api_key = _external_process_defaults(provider_id)
     resolved_command = shutil.which(command) if command else None
-    if not resolved_command and not base_url.startswith("acp+tcp://"):
+    if not resolved_command and not _external_process_can_use_base_url(provider_id, base_url):
+        if provider_id == "google-antigravity-cli":
+            raise AuthError(
+                f"Could not find the Antigravity CLI command '{command}'. "
+                "Install Google Antigravity CLI or set HERMES_ANTIGRAVITY_CLI_COMMAND/ANTIGRAVITY_CLI_PATH/AGY_CLI_PATH.",
+                provider=provider_id,
+                code="missing_antigravity_cli",
+            )
         raise AuthError(
             f"Could not find the Copilot CLI command '{command}'. "
             "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
@@ -5828,7 +5863,7 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": api_key,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,
