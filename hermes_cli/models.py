@@ -249,6 +249,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemini-3-flash-preview",
         "gemini-3.5-flash",
     ],
+    "google-antigravity-cli": [
+        "antigravity-cli",
+    ],
     "zai": [
         "glm-5.1",
         "glm-5",
@@ -919,6 +922,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
     ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
     ProviderEntry("google-gemini-cli", "Google Gemini (OAuth)",   "Google Gemini via OAuth + Code Assist (Code Assist OAuth flow)"),
+    ProviderEntry("google-antigravity-cli", "Google Antigravity CLI", "Google Antigravity via local `agy -p` process (text-only; no API key)"),
     ProviderEntry("deepseek",       "DeepSeek",                 "DeepSeek (V3, R1, coder, direct API)"),
     ProviderEntry("xai",            "xAI",                      "xAI Grok (Direct API)"),
     ProviderEntry("zai",            "Z.AI / GLM",               "Z.AI / GLM (Zhipu direct API)"),
@@ -1112,6 +1116,10 @@ _PROVIDER_ALIASES = {
     "qwen-portal": "qwen-oauth",
     "gemini-cli": "google-gemini-cli",
     "gemini-oauth": "google-gemini-cli",
+    "antigravity": "google-antigravity-cli",
+    "agy": "google-antigravity-cli",
+    "google-agy": "google-antigravity-cli",
+    "google-antigravity": "google-antigravity-cli",
     "hf": "huggingface",
     "hugging-face": "huggingface",
     "huggingface-hub": "huggingface",
