@@ -180,6 +180,106 @@ _PRIVDROP_CAP_ARGS = [
 ]
 
 
+def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], list[str]]:
+    """Build the docker mount/env/host args needed to route a sandbox through
+    the iron-proxy egress firewall.
+
+    Returns ``(volume_args, env_overrides, host_args)``:
+
+    * ``volume_args`` — read-only bind mount of the CA cert into the container
+      (extends docker's ``-v`` argv list)
+    * ``env_overrides`` — env vars to set on container creation: ``HTTPS_PROXY``,
+      ``HTTP_PROXY``, ``NO_PROXY`` (loopback only), Python/Node/curl CA-bundle
+      paths, and one ``HERMES_PROXY_TOKEN_<NAME>`` per minted mapping
+    * ``host_args`` — extra ``--add-host`` flags so the container can reach the
+      host-side proxy (Linux needs ``host.docker.internal:host-gateway``;
+      Docker Desktop populates this automatically on macOS/Windows)
+
+    Returns three empty containers when the proxy is disabled, not yet set up,
+    or not currently running.  If ``proxy.enforce_on_docker`` is true and the
+    proxy is enabled-but-not-running, raises ``RuntimeError`` so the docker
+    backend refuses to start the sandbox.
+    """
+
+    try:
+        from hermes_cli.config import load_config
+        from agent.proxy_sources import iron_proxy as ip
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Egress proxy plumbing unavailable: %s", exc)
+        return ([], {}, [])
+
+    cfg = load_config()
+    proxy_cfg = cfg.get("proxy") or {}
+    if not proxy_cfg.get("enabled"):
+        return ([], {}, [])
+
+    status = ip.get_status()
+    enforce = bool(proxy_cfg.get("enforce_on_docker", True))
+
+    if not status.configured:
+        msg = (
+            "proxy.enabled is true but iron-proxy is not configured. "
+            "Run `hermes egress setup` to mint tokens and write proxy.yaml."
+        )
+        if enforce:
+            raise RuntimeError(msg)
+        logger.warning("%s — continuing without proxy (enforce_on_docker=false).", msg)
+        return ([], {}, [])
+
+    if not (status.pid and status.listening):
+        msg = (
+            f"iron-proxy is enabled but not running on port {status.tunnel_port}. "
+            "Start it with `hermes egress start`."
+        )
+        if enforce:
+            raise RuntimeError(msg)
+        logger.warning("%s — continuing without proxy (enforce_on_docker=false).", msg)
+        return ([], {}, [])
+
+    if status.ca_cert_path is None or not status.ca_cert_path.exists():
+        # configured says ca exists; defensive double-check
+        return ([], {}, [])
+
+    container_ca = "/etc/ssl/certs/hermes-egress-ca.crt"
+    volume_args = ["-v", f"{status.ca_cert_path}:{container_ca}:ro"]
+
+    proxy_url = f"http://host.docker.internal:{status.tunnel_port}"
+    env_overrides: dict[str, str] = {
+        # HTTPS_PROXY / HTTP_PROXY are respected by curl, requests, urllib,
+        # httpx, node fetch, go default transport, etc.  Lowercase variants
+        # are also set because some tools only look at one casing.
+        "HTTPS_PROXY": proxy_url,
+        "https_proxy": proxy_url,
+        "HTTP_PROXY": proxy_url,
+        "http_proxy": proxy_url,
+        # Loopback-only NO_PROXY so localhost dev servers inside the sandbox
+        # (test fixtures, local LLMs) don't get sent through the proxy.
+        "NO_PROXY": "127.0.0.1,localhost,::1",
+        "no_proxy": "127.0.0.1,localhost,::1",
+        # CA bundle locations for the major language runtimes.  iron-proxy
+        # presents a leaf cert signed by our CA on every MITM'd connection.
+        "REQUESTS_CA_BUNDLE": container_ca,   # Python `requests`
+        "SSL_CERT_FILE": container_ca,         # Python ssl module / OpenSSL
+        "CURL_CA_BUNDLE": container_ca,        # curl
+        "NODE_EXTRA_CA_CERTS": container_ca,   # Node.js
+        # For the agent inside the sandbox to identify itself as proxy-aware.
+        "HERMES_EGRESS_PROXY": "1",
+    }
+
+    # Surface the per-provider proxy tokens.  The sandbox can swap these into
+    # its provider config (or its env, if it reads the standard names) and the
+    # proxy translates them to the real secrets on egress.
+    for m in ip.load_mappings():
+        env_overrides[f"HERMES_PROXY_TOKEN_{m.real_env_name}"] = m.proxy_token
+
+    # On Linux, host.docker.internal isn't populated by default — Docker Desktop
+    # adds it on macOS/Windows; on Linux we need an explicit --add-host with
+    # host-gateway.  On Desktop this is a no-op (harmless duplicate).
+    host_args: list[str] = ["--add-host", "host.docker.internal:host-gateway"]
+
+    return (volume_args, env_overrides, host_args)
+
+
 def _build_security_args(run_as_host_user: bool) -> list[str]:
     """Return the security/cap/tmpfs args tailored to the privilege mode."""
     if run_as_host_user:
@@ -453,11 +553,28 @@ class DockerEnvironment(BaseEnvironment):
         except Exception as e:
             logger.debug("Docker: could not load credential file mounts: %s", e)
 
+        # Egress credential-injection proxy (iron-proxy) — when configured,
+        # mount the CA cert into the sandbox and set HTTPS_PROXY + CA-bundle
+        # env vars so outbound traffic routes through the host-side proxy.
+        # The sandbox receives PROXY tokens instead of real API keys.
+        egress_volume_args, egress_env_overrides, egress_host_args = (
+            _egress_proxy_args_for_docker()
+        )
+        volume_args.extend(egress_volume_args)
+        # egress env overrides are merged in further below alongside the
+        # other env_args computation.
+
         # Explicit environment variables (docker_env config) — set at container
         # creation so they're available to all processes (including entrypoint).
+        # Egress proxy env vars (HTTPS_PROXY, CA-bundle paths, proxy tokens)
+        # are merged here so they're visible to the container's entrypoint as
+        # well as any subsequent execs.  Existing self._env entries win, so
+        # users can still override the proxy explicitly via docker_env config.
+        merged_env = dict(egress_env_overrides)
+        merged_env.update(self._env)
         env_args = []
-        for key in sorted(self._env):
-            env_args.extend(["-e", f"{key}={self._env[key]}"])
+        for key in sorted(merged_env):
+            env_args.extend(["-e", f"{key}={merged_env[key]}"])
 
         # Optional: run the container as the host user so files written into
         # bind-mounted dirs (/workspace, /root, docker_volumes entries) are
@@ -494,6 +611,7 @@ class DockerEnvironment(BaseEnvironment):
             + user_args
             + writable_args
             + resource_args
+            + egress_host_args
             + volume_args
             + env_args
             + validated_extra
