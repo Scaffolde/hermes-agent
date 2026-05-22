@@ -32,6 +32,7 @@ _SLACK_TARGET_RE = re.compile(r"^\s*([CGDU][A-Z0-9]{8,})\s*$")
 _SLACK_THREAD_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,}):([^\s:]+)\s*$")
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
 _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
+_WHATSAPP_JID_TARGET_RE = re.compile(r"^\s*([+]?\d+(?::\d+)?@(?:s\.whatsapp\.net|lid|g\.us))\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
 _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
 # Platforms that address recipients by phone number and accept E.164 format
@@ -190,7 +191,16 @@ def _handle_send(args):
             from gateway.channel_directory import resolve_channel_name
             resolved = resolve_channel_name(platform_name, target_ref)
             if resolved:
-                chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
+                parsed_chat_id, parsed_thread_id, parsed_explicit = _parse_target_ref(platform_name, resolved)
+                if parsed_chat_id or parsed_explicit:
+                    chat_id, thread_id = parsed_chat_id, parsed_thread_id
+                else:
+                    # The channel directory stores already-trusted platform IDs.
+                    # Some platforms use opaque IDs that are not parseable by
+                    # the generic target grammar (for example WhatsApp JIDs in
+                    # older runtimes). Preserve the resolved ID instead of
+                    # falling through to the home channel.
+                    chat_id, thread_id = resolved, None
             else:
                 return json.dumps({
                     "error": f"Could not resolve '{target_ref}' on {platform_name}. "
@@ -383,6 +393,10 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if target_ref.strip().isdigit():
             return f"group:{target_ref.strip()}", None, True
         return None, None, False
+    if platform_name == "whatsapp":
+        match = _WHATSAPP_JID_TARGET_RE.fullmatch(target_ref)
+        if match:
+            return match.group(1), None, True
     if platform_name in _PHONE_PLATFORMS:
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:

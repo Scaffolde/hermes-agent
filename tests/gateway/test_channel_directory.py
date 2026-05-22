@@ -173,6 +173,24 @@ class TestResolveChannelName:
             assert resolve_channel_name("telegram", "Dev Group (group)") == "456"
             assert resolve_channel_name("telegram", "Coaching Chat / topic 17585 (group)") == "-1001:17585"
 
+    def test_duplicate_display_names_are_not_resolved_by_bare_name(self, tmp_path):
+        platforms = {
+            "whatsapp": [
+                {"id": "111@lid", "name": "Alex", "type": "dm"},
+                {
+                    "id": "222@lid",
+                    "name": "Alex",
+                    "type": "dm",
+                    "source_group_id": "120@g.us",
+                    "source_group_name": "Team",
+                },
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            assert resolve_channel_name("whatsapp", "Alex") is None
+            assert resolve_channel_name("whatsapp", "Alex (dm)") == "111@lid"
+            assert resolve_channel_name("whatsapp", "Alex @ Team [222@lid] (dm)") == "222@lid"
+
 
 class TestBuildFromSessions:
     def _write_sessions(self, tmp_path, sessions_data):
@@ -266,6 +284,47 @@ class TestBuildFromSessions:
         assert "Coaching Chat" in names
         assert "Coaching Chat / topic 17585" in names
         assert "Coaching Chat / topic 17587" in names
+
+    def test_whatsapp_group_participants_are_named_sendable_contacts(self, tmp_path):
+        self._write_sessions(tmp_path, {
+            "group_alex": {
+                "origin": {
+                    "platform": "whatsapp",
+                    "chat_id": "120363424327019837@g.us",
+                    "chat_name": "Scaffolde Group",
+                    "chat_type": "group",
+                    "user_id": "181565497843965@lid",
+                    "user_name": "Alex",
+                },
+                "chat_type": "group",
+            },
+            "group_jps": {
+                "origin": {
+                    "platform": "whatsapp",
+                    "chat_id": "120363424327019837@g.us",
+                    "chat_name": "Scaffolde Group",
+                    "chat_type": "group",
+                    "user_id": "228677262553294@lid",
+                    "user_name": "JPS",
+                },
+                "chat_type": "group",
+            },
+        })
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            entries = _build_from_sessions("whatsapp")
+
+        by_name = {entry["name"]: entry for entry in entries}
+        assert by_name["Scaffolde Group"]["id"] == "120363424327019837@g.us"
+        assert by_name["Alex"]["id"] == "181565497843965@lid"
+        assert by_name["Alex"]["type"] == "dm"
+        assert by_name["JPS"]["id"] == "228677262553294@lid"
+
+        cache_file = _write_directory(tmp_path, {"whatsapp": entries})
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            assert resolve_channel_name("whatsapp", "Alex") == "181565497843965@lid"
+            assert resolve_channel_name("whatsapp", "JPS") == "228677262553294@lid"
+            assert resolve_channel_name("whatsapp", "JPS @ Scaffolde Group [228677262553294@lid] (dm)") == "228677262553294@lid"
 
 
 class TestFormatDirectoryForDisplay:
