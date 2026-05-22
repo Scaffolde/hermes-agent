@@ -47,6 +47,7 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "FIRECRAWL_GATEWAY_URL",
         "TOOL_GATEWAY_DOMAIN",
         "TOOL_GATEWAY_USER_TOKEN",
+        "XAI_API_KEY",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -85,6 +86,7 @@ class TestBundledPluginsRegister:
             "parallel",
             "searxng",
             "tavily",
+            "xai",
         ]
 
     @pytest.mark.parametrize(
@@ -100,6 +102,7 @@ class TestBundledPluginsRegister:
             # disabled in the migration (fell through to a legacy inline
             # path); the follow-up commit enabled it natively.
             ("firecrawl", True, True, True),
+            ("xai", True, False, False),
         ],
     )
     def test_capability_flags_match_spec(
@@ -120,7 +123,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl"],
+        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
     )
     def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
         _ensure_plugins_loaded()
@@ -133,7 +136,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl"],
+        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
     )
     def test_each_plugin_has_setup_schema(self, plugin_name: str) -> None:
         """``get_setup_schema()`` returns a dict the picker can consume."""
