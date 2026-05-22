@@ -269,6 +269,79 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_resolved_whatsapp_dm_label_preserves_lid_jid(self):
+        whatsapp_cfg = SimpleNamespace(enabled=True, token="", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.WHATSAPP: whatsapp_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.channel_directory.resolve_channel_name", return_value="5819714277532@lid"), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "whatsapp:Gary (dm)",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.WHATSAPP,
+            whatsapp_cfg,
+            "5819714277532@lid",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_resolved_whatsapp_group_label_preserves_group_jid(self):
+        whatsapp_cfg = SimpleNamespace(enabled=True, token="", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.WHATSAPP: whatsapp_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.channel_directory.resolve_channel_name", return_value="120363407931538023@g.us"), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "whatsapp:120363407931538023 (group)",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.WHATSAPP,
+            whatsapp_cfg,
+            "120363407931538023@g.us",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_parse_whatsapp_jid_targets_as_explicit(self):
+        assert _parse_target_ref("whatsapp", "5819714277532@lid") == ("5819714277532@lid", None, True)
+        assert _parse_target_ref("whatsapp", "15551234567@s.whatsapp.net") == ("15551234567@s.whatsapp.net", None, True)
+        assert _parse_target_ref("whatsapp", "120363407931538023@g.us") == ("120363407931538023@g.us", None, True)
+
     def test_resolved_slack_thread_name_preserves_thread_id(self):
         slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})
         config = SimpleNamespace(
