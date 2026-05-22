@@ -26,6 +26,9 @@ def _normalize_channel_query(value: str) -> str:
 def _channel_target_name(platform_name: str, channel: Dict[str, Any]) -> str:
     """Return the human-facing target label shown to users for a channel entry."""
     name = channel["name"]
+    if platform_name == "whatsapp" and channel.get("source_group_id"):
+        group = channel.get("source_group_name") or channel.get("source_group_id")
+        return f"{name} @ {group} [{channel['id']}] ({channel.get('type', 'dm')})"
     if platform_name == "discord" and channel.get("guild"):
         return f"#{name}"
     if platform_name != "discord" and channel.get("type"):
@@ -225,15 +228,32 @@ def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
             if origin.get("platform") != platform_name:
                 continue
             entry_id = _session_entry_id(origin)
-            if not entry_id or entry_id in seen_ids:
-                continue
-            seen_ids.add(entry_id)
-            entries.append({
-                "id": entry_id,
-                "name": _session_entry_name(origin),
-                "type": session.get("chat_type", "dm"),
-                "thread_id": origin.get("thread_id"),
-            })
+            if entry_id and entry_id not in seen_ids:
+                seen_ids.add(entry_id)
+                entries.append({
+                    "id": entry_id,
+                    "name": _session_entry_name(origin),
+                    "type": origin.get("chat_type") or session.get("chat_type", "dm"),
+                    "thread_id": origin.get("thread_id"),
+                })
+
+            # WhatsApp groups expose the sender as ``user_id`` / ``user_name``.
+            # Treat each named participant we've seen as a sendable DM contact
+            # too, so targets like ``whatsapp:Alex`` can resolve from group-only
+            # history without requiring a separate direct-message session first.
+            if platform_name == "whatsapp" and (origin.get("chat_type") or session.get("chat_type")) == "group":
+                user_id = str(origin.get("user_id") or "").strip()
+                user_name = str(origin.get("user_name") or "").strip()
+                if user_id and user_name and user_id not in seen_ids:
+                    seen_ids.add(user_id)
+                    entries.append({
+                        "id": user_id,
+                        "name": user_name,
+                        "type": "dm",
+                        "thread_id": None,
+                        "source_group_id": origin.get("chat_id"),
+                        "source_group_name": origin.get("chat_name"),
+                    })
     except Exception as e:
         logger.debug("Channel directory: failed to read sessions for %s: %s", platform_name, e)
 
@@ -288,12 +308,20 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
 
     query = _normalize_channel_query(name)
 
-    # 1. Exact name match, including the display labels shown by send_message(action="list")
+    # 1. Exact name match, including the display labels shown by send_message(action="list").
+    # Return a name only when unambiguous; display/user names are not stable IDs
+    # and can collide, especially for WhatsApp group-derived contacts.
+    exact_matches = []
     for ch in channels:
         if _normalize_channel_query(ch["name"]) == query:
-            return ch["id"]
+            exact_matches.append(ch)
+            continue
         if _normalize_channel_query(_channel_target_name(platform_name, ch)) == query:
-            return ch["id"]
+            exact_matches.append(ch)
+    if len(exact_matches) == 1:
+        return exact_matches[0]["id"]
+    if len(exact_matches) > 1:
+        return None
 
     # 2. Guild-qualified match for Discord ("GuildName/channel")
     if "/" in query:
