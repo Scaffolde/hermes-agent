@@ -17,7 +17,6 @@ import io
 import os
 import tarfile
 from pathlib import Path
-from typing import Dict
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -99,12 +98,14 @@ def _sample_mapping(env_name: str = "OPENROUTER_API_KEY") -> ip.TokenMapping:
     )
 
 
-def test_build_proxy_config_shape():
+def test_build_proxy_config_shape(tmp_path):
     m = _sample_mapping()
+    ca_crt = tmp_path / "ca.crt"
+    ca_key = tmp_path / "ca.key"
     cfg = ip.build_proxy_config(
         mappings=[m],
-        ca_cert=Path("/tmp/ca.crt"),
-        ca_key=Path("/tmp/ca.key"),
+        ca_cert=ca_crt,
+        ca_key=ca_key,
     )
     # Top-level sections — note `dns` is required by iron-proxy even when
     # we only use the CONNECT tunnel.
@@ -127,21 +128,152 @@ def test_build_proxy_config_shape():
     rule_hosts = {r["host"] for r in rule["rules"]}
     assert rule_hosts == set(m.upstream_hosts)
     # TLS section names the CA paths
-    assert cfg["tls"]["ca_cert"] == "/tmp/ca.crt"
+    assert cfg["tls"]["ca_cert"] == str(ca_crt)
 
 
-def test_build_proxy_config_custom_allowed_hosts():
+def test_build_proxy_config_custom_allowed_hosts(tmp_path):
     m = _sample_mapping("OPENAI_API_KEY")
     cfg = ip.build_proxy_config(
         mappings=[m],
-        ca_cert=Path("/tmp/ca.crt"),
-        ca_key=Path("/tmp/ca.key"),
-        allowed_hosts=["only.example.com"],
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+        allowed_hosts=["custom-host.test"],
     )
     domains = cfg["transforms"][0]["config"]["domains"]
     # Custom allowed_hosts wins as the base; mapping's hosts get appended.
-    assert "only.example.com" in domains
+    assert "custom-host.test" in domains
     assert "openrouter.ai" in domains  # comes from the mapping
+
+
+# ---------------------------------------------------------------------------
+# Default SSRF deny list (regression: docs promise cloud metadata is denied)
+# ---------------------------------------------------------------------------
+
+
+def test_default_deny_cidrs_present_when_unspecified(tmp_path):
+    """build_proxy_config must emit the default deny list when the caller
+    passes nothing.  The IMDS subnet (169.254.0.0/16) MUST be in the result
+    or the docs claim that ``upstream_deny_cidrs`` refuses cloud metadata
+    is a lie."""
+
+    cfg = ip.build_proxy_config(
+        mappings=[_sample_mapping()],
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+    )
+    deny = cfg["proxy"]["upstream_deny_cidrs"]
+    assert "169.254.0.0/16" in deny  # IMDS
+    assert "127.0.0.0/8" in deny      # loopback v4
+    assert "::1/128" in deny           # loopback v6
+    assert "10.0.0.0/8" in deny        # RFC1918
+    assert "172.16.0.0/12" in deny     # RFC1918
+    assert "192.168.0.0/16" in deny    # RFC1918
+
+
+def test_explicit_empty_deny_cidrs_disables_default(tmp_path):
+    """Explicit ``[]`` opts out of the default deny list — needed by
+    hermetic tests that want to talk to a loopback upstream."""
+
+    cfg = ip.build_proxy_config(
+        mappings=[_sample_mapping()],
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+        upstream_deny_cidrs=[],
+    )
+    assert cfg["proxy"]["upstream_deny_cidrs"] == []
+
+
+def test_wizard_rendered_yaml_contains_deny_list(hermes_home, tmp_path):
+    """End-to-end: cmd_setup writes proxy.yaml; the rendered file must
+    contain the deny list because the wizard now passes the operator's
+    config-level setting (None → default) through to build_proxy_config."""
+
+    # Simulate the wizard's call shape (matches proxy_cli.cmd_setup).
+    state = ip._proxy_state_dir()
+    (state / "ca.crt").write_text("fake-ca")
+    (state / "ca.key").write_text("fake-key")
+    proxy_yaml = ip.build_proxy_config(
+        mappings=[_sample_mapping()],
+        ca_cert=state / "ca.crt",
+        ca_key=state / "ca.key",
+        # The wizard passes ``upstream_deny_cidrs`` from the config; when
+        # the operator hasn't set anything, that's None and we get the
+        # safe default below.
+        upstream_deny_cidrs=None,
+    )
+    out = ip.write_proxy_config(proxy_yaml)
+    text = out.read_text(encoding="utf-8")
+    assert "169.254.0.0/16" in text
+
+
+# ---------------------------------------------------------------------------
+# Bind policy (regression: must not bind 0.0.0.0)
+# ---------------------------------------------------------------------------
+
+
+def test_default_bind_is_loopback_not_zero_zero(tmp_path):
+    """``http_listen`` must NOT be ``0.0.0.0:PORT`` or ``:PORT`` (latter is
+    INADDR_ANY).  Loopback only by default; the docker bridge bind is
+    optional and added in addition, never instead."""
+
+    cfg = ip.build_proxy_config(
+        mappings=[_sample_mapping()],
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+        tunnel_port=12345,
+        http_listen=["127.0.0.1:12345"],  # explicit so test is deterministic
+    )
+    primary = cfg["proxy"]["http_listen"]
+    listens = cfg["proxy"]["http_listens"]
+    assert primary == "127.0.0.1:12345"
+    assert listens == ["127.0.0.1:12345"]
+    # Sentinel: confirm we didn't accidentally serialize a bare-port form
+    # like ":12345" anywhere in the listen list (that's INADDR_ANY).
+    for entry in listens:
+        assert not entry.startswith(":")
+        assert "0.0.0.0" not in entry
+
+
+def test_default_bind_includes_docker_bridge_on_linux(tmp_path, monkeypatch):
+    """When http_listen isn't passed AND we're on Linux AND a docker
+    bridge IP is detected, we should bind that bridge IP in addition to
+    loopback so containers reach the proxy via host-gateway."""
+
+    monkeypatch.setattr(ip.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(ip, "_detect_docker_bridge_ip", lambda: "172.17.0.1")
+    cfg = ip.build_proxy_config(
+        mappings=[_sample_mapping()],
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+        tunnel_port=9090,
+    )
+    assert "127.0.0.1:9090" in cfg["proxy"]["http_listens"]
+    assert "172.17.0.1:9090" in cfg["proxy"]["http_listens"]
+
+
+# ---------------------------------------------------------------------------
+# audit_log wiring (regression: parameter was accepted but never used)
+# ---------------------------------------------------------------------------
+
+
+def test_audit_log_path_lands_in_yaml(tmp_path):
+    cfg = ip.build_proxy_config(
+        mappings=[_sample_mapping()],
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+        audit_log=tmp_path / "audit.log",
+    )
+    assert cfg["log"]["audit_path"] == str(tmp_path / "audit.log")
+
+
+def test_audit_log_omitted_when_caller_passes_none(tmp_path):
+    cfg = ip.build_proxy_config(
+        mappings=[_sample_mapping()],
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+        audit_log=None,
+    )
+    assert "audit_path" not in cfg["log"]
 
 
 def test_write_and_load_mappings_roundtrip(hermes_home):
@@ -165,17 +297,111 @@ def test_load_mappings_handles_corrupt_json(hermes_home):
     assert ip.load_mappings() == []
 
 
-def test_write_proxy_config_serializes_yaml(hermes_home):
+def test_write_proxy_config_serializes_yaml(hermes_home, tmp_path):
+    ca_crt = tmp_path / "ca.crt"
+    ca_key = tmp_path / "ca.key"
     cfg = ip.build_proxy_config(
         mappings=[_sample_mapping()],
-        ca_cert=Path("/tmp/ca.crt"),
-        ca_key=Path("/tmp/ca.key"),
+        ca_cert=ca_crt,
+        ca_key=ca_key,
     )
     out = ip.write_proxy_config(cfg)
     assert out.exists()
     text = out.read_text(encoding="utf-8")
     assert "tunnel_listen" in text
-    assert "ca_cert: /tmp/ca.crt" in text
+    assert f"ca_cert: {ca_crt}" in text
+
+
+# ---------------------------------------------------------------------------
+# Token-preservation on re-setup (regression: clobbered live sandboxes)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_mappings_preserves_existing_tokens():
+    """Re-running setup must not invalidate tokens baked into already-
+    running sandboxes.  ``merge_mappings`` keeps the prior token for any
+    provider that's in both lists."""
+
+    existing = [
+        ip.TokenMapping(
+            proxy_token="hermes-proxy-original-12345",
+            real_env_name="OPENROUTER_API_KEY",
+            upstream_hosts=("openrouter.ai",),
+        ),
+    ]
+    discovered = ip.discover_provider_mappings(
+        available_env_names=["OPENROUTER_API_KEY", "OPENAI_API_KEY"]
+    )
+    merged = ip.merge_mappings(existing=existing, discovered=discovered)
+    by_name = {m.real_env_name: m for m in merged}
+    # Original token preserved.
+    assert by_name["OPENROUTER_API_KEY"].proxy_token == "hermes-proxy-original-12345"
+    # New provider got a fresh token.
+    assert by_name["OPENAI_API_KEY"].proxy_token != "hermes-proxy-original-12345"
+    # Both providers in the result.
+    assert set(by_name) == {"OPENROUTER_API_KEY", "OPENAI_API_KEY"}
+
+
+def test_merge_mappings_drops_providers_removed_from_env():
+    """When a provider is in `existing` but not in `discovered`, it must
+    be dropped from the result — the operator removed the env var."""
+
+    existing = [
+        ip.TokenMapping(
+            proxy_token="stale", real_env_name="OPENROUTER_API_KEY",
+            upstream_hosts=("openrouter.ai",),
+        ),
+    ]
+    discovered = ip.discover_provider_mappings(
+        available_env_names=["OPENAI_API_KEY"]
+    )
+    merged = ip.merge_mappings(existing=existing, discovered=discovered)
+    names = {m.real_env_name for m in merged}
+    assert names == {"OPENAI_API_KEY"}
+
+
+def test_merge_mappings_rotate_mints_fresh_tokens():
+    """``rotate=True`` rolls every token regardless of overlap.  The
+    --rotate-tokens flag uses this."""
+
+    existing = [
+        ip.TokenMapping(
+            proxy_token="hermes-proxy-original-12345",
+            real_env_name="OPENROUTER_API_KEY",
+            upstream_hosts=("openrouter.ai",),
+        ),
+    ]
+    discovered = ip.discover_provider_mappings(
+        available_env_names=["OPENROUTER_API_KEY"]
+    )
+    merged = ip.merge_mappings(existing=existing, discovered=discovered, rotate=True)
+    assert merged[0].proxy_token != "hermes-proxy-original-12345"
+
+
+# ---------------------------------------------------------------------------
+# Uncovered provider detection (regression: non-bearer providers bypass)
+# ---------------------------------------------------------------------------
+
+
+def test_uncovered_providers_detects_anthropic_aws(hermes_home, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+    uncovered = ip.discover_uncovered_providers()
+    assert "ANTHROPIC_API_KEY" in uncovered
+    assert "AWS_ACCESS_KEY_ID" in uncovered
+
+
+def test_uncovered_providers_explicit_names_empty():
+    assert ip.discover_uncovered_providers(available_env_names=[]) == []
+
+
+def test_uncovered_providers_skips_bearer_providers(hermes_home, monkeypatch):
+    """OPENROUTER_API_KEY etc. are bearer providers — they should NOT
+    appear in the uncovered list."""
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    uncovered = ip.discover_uncovered_providers()
+    assert "OPENROUTER_API_KEY" not in uncovered
 
 
 # ---------------------------------------------------------------------------
@@ -531,3 +757,315 @@ def test_platform_asset_name_rejects_windows(monkeypatch):
     monkeypatch.setattr("platform.machine", lambda: "AMD64")
     with pytest.raises(RuntimeError, match="does not ship native Windows"):
         ip._platform_asset_name()
+
+
+# ---------------------------------------------------------------------------
+# Subprocess env minimization (regression: host secrets leaked to proxy)
+# ---------------------------------------------------------------------------
+
+
+def test_subprocess_env_strips_unrelated_secrets(hermes_home, monkeypatch):
+    """``_build_proxy_subprocess_env`` must NOT carry every host secret
+    over to the proxy.  /proc/<pid>/environ on the proxy would otherwise
+    expose all of them to same-uid local processes."""
+
+    # Unrelated env vars that should NOT propagate.
+    monkeypatch.setenv("MY_PRIVATE_TOKEN", "should-not-leak")
+    monkeypatch.setenv("DATABASE_URL", "postgres://very-private")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-very-secret")
+    # Provider keys that ARE in load_mappings should propagate.
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-real")
+    ip.write_mappings([_sample_mapping("OPENROUTER_API_KEY")])
+
+    env = ip._build_proxy_subprocess_env()
+    assert "MY_PRIVATE_TOKEN" not in env
+    assert "DATABASE_URL" not in env
+    assert "SLACK_BOT_TOKEN" not in env
+    assert env.get("OPENROUTER_API_KEY") == "sk-or-real"
+
+
+def test_subprocess_env_strips_proxy_recursion_vars(hermes_home, monkeypatch):
+    """HTTPS_PROXY etc. in the parent env would otherwise recurse iron-proxy
+    through itself (or send its traffic through a corporate proxy)."""
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://corporate:3128")
+    monkeypatch.setenv("HTTP_PROXY", "http://corporate:3128")
+    monkeypatch.setenv("ALL_PROXY", "socks5://corporate:1080")
+    env = ip._build_proxy_subprocess_env()
+    assert "HTTPS_PROXY" not in env
+    assert "https_proxy" not in env
+    assert "HTTP_PROXY" not in env
+    assert "ALL_PROXY" not in env
+
+
+def test_subprocess_env_keeps_infrastructure_vars(hermes_home, monkeypatch):
+    """PATH / HOME / locale must propagate or the child can't even find
+    its libs."""
+
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
+    monkeypatch.setenv("HOME", "/home/test")
+    monkeypatch.setenv("LANG", "C.UTF-8")
+    env = ip._build_proxy_subprocess_env()
+    assert env.get("PATH") == "/usr/local/bin:/usr/bin"
+    assert env.get("HOME") == "/home/test"
+    assert env.get("LANG") == "C.UTF-8"
+
+
+# ---------------------------------------------------------------------------
+# CA generation TOCTOU (regression: 0o600 only set AFTER copy)
+# ---------------------------------------------------------------------------
+
+
+def test_ca_key_created_with_0o600(hermes_home, monkeypatch):
+    """The CA private key must NEVER exist on disk with default umask
+    permissions, even transiently.  Fix: open with explicit mode=0o600
+    so the very first byte is written under tight perms."""
+
+    # ensure_ca_cert shells out to openssl; mock the subprocess.run calls
+    # so we don't need openssl on the test host AND don't depend on its
+    # output format.
+    def fake_run(args, **kwargs):
+        # First call: genrsa → -out is at args[-2]
+        if args[1] == "genrsa":
+            out = args[-2]
+            Path(out).write_bytes(b"-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n")
+        elif args[1] == "req":
+            # Find -out path
+            i = args.index("-out")
+            Path(args[i + 1]).write_bytes(b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
+        result = MagicMock()
+        result.returncode = 0
+        return result
+
+    monkeypatch.setattr(ip.shutil, "which", lambda name: "/usr/bin/openssl" if name == "openssl" else None)
+    monkeypatch.setattr(ip.subprocess, "run", fake_run)
+
+    ca_crt, ca_key = ip.ensure_ca_cert()
+    assert ca_key.exists()
+    mode = ca_key.stat().st_mode & 0o777
+    assert mode == 0o600, f"CA key has perms {oct(mode)}, expected 0o600"
+
+
+# ---------------------------------------------------------------------------
+# Audit log permissions (regression: depended on umask)
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_audit_log_creates_with_0o600(hermes_home, tmp_path):
+    audit = tmp_path / "audit.log"
+    ip.ensure_audit_log(audit)
+    assert audit.exists()
+    mode = audit.stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_ensure_audit_log_tightens_existing_perms(hermes_home, tmp_path):
+    audit = tmp_path / "audit.log"
+    audit.write_text("preexisting content\n")
+    os.chmod(audit, 0o644)
+    ip.ensure_audit_log(audit)
+    mode = audit.stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+# ---------------------------------------------------------------------------
+# State dir hardening (regression: world-traversable on multi-user hosts)
+# ---------------------------------------------------------------------------
+
+
+def test_proxy_state_dir_is_0o700(hermes_home):
+    state = ip._proxy_state_dir()
+    mode = state.stat().st_mode & 0o777
+    assert mode == 0o700
+
+
+def test_proxy_state_dir_ro_does_not_create(hermes_home):
+    """_proxy_state_dir_ro is for read-only callers — it must NOT
+    materialize the dir.  Pure-status code paths shouldn't have the
+    side-effect of creating ~/.hermes/proxy/."""
+
+    # Sanity: rw path creates it.
+    rw = ip._proxy_state_dir()
+    assert rw.exists()
+    # Remove it and confirm the ro path doesn't recreate.
+    import shutil as _shutil
+    _shutil.rmtree(str(rw))
+    assert not rw.exists()
+    ro = ip._proxy_state_dir_ro()
+    assert not ro.exists()
+    # The path string is the same as the rw one.
+    assert ro == rw
+
+
+# ---------------------------------------------------------------------------
+# Mappings clobber refused when corrupt (regression: silent 403s)
+# ---------------------------------------------------------------------------
+
+
+def test_docker_egress_args_raises_on_empty_mappings(hermes_home, monkeypatch):
+    """If mappings.json is missing / corrupt / empty AND
+    enforce_on_docker is true, refuse to start the sandbox rather than
+    silently mounting an unusable proxy config."""
+
+    from tools.environments.docker import _egress_proxy_args_for_docker
+    from hermes_cli.config import load_config, save_config
+
+    state = ip._proxy_state_dir()
+    (state / "ca.crt").write_text("fake-ca")
+    (state / "ca.key").write_text("fake-key")
+    proxy_cfg = ip.build_proxy_config(
+        mappings=[_sample_mapping()],
+        ca_cert=state / "ca.crt", ca_key=state / "ca.key", tunnel_port=9090,
+    )
+    ip.write_proxy_config(proxy_cfg)
+    # Note: we deliberately do NOT write mappings.json — that's the
+    # bug-class this test guards against.
+
+    cfg = load_config()
+    cfg.setdefault("proxy", {})["enabled"] = True
+    cfg["proxy"]["enforce_on_docker"] = True
+    save_config(cfg)
+
+    (state / "iron-proxy.pid").write_text("99999")
+    monkeypatch.setattr(ip, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(ip, "_port_listening", lambda h, p: True)
+
+    with pytest.raises(RuntimeError, match="mappings.json is empty or"):
+        _egress_proxy_args_for_docker()
+
+
+# ---------------------------------------------------------------------------
+# CA missing → enforce_on_docker semantics (regression: silent fail-open)
+# ---------------------------------------------------------------------------
+
+
+def test_docker_egress_args_raises_when_ca_vanishes(hermes_home, monkeypatch):
+    """status.configured was True at check time but the CA file
+    disappeared between then and now (e.g. operator manually deleted
+    ~/.hermes/proxy/ca.crt).  enforce_on_docker=True must refuse."""
+
+    from tools.environments.docker import _egress_proxy_args_for_docker
+    from hermes_cli.config import load_config, save_config
+
+    state = ip._proxy_state_dir()
+    ca = state / "ca.crt"
+    ca.write_text("fake-ca")
+    (state / "ca.key").write_text("fake-key")
+    proxy_cfg = ip.build_proxy_config(
+        mappings=[_sample_mapping()],
+        ca_cert=ca, ca_key=state / "ca.key", tunnel_port=9090,
+    )
+    ip.write_proxy_config(proxy_cfg)
+    ip.write_mappings([_sample_mapping()])
+
+    cfg = load_config()
+    cfg.setdefault("proxy", {})["enabled"] = True
+    cfg["proxy"]["enforce_on_docker"] = True
+    save_config(cfg)
+
+    (state / "iron-proxy.pid").write_text("99999")
+    monkeypatch.setattr(ip, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(ip, "_port_listening", lambda h, p: True)
+
+    # Build a fake status: configured=True (because both path fields are
+    # set), but ca_cert_path.exists() is False — simulating the race
+    # where the CA file vanished between get_status() and the
+    # exists() recheck inside _egress_proxy_args_for_docker.
+    fake_status = ip.ProxyStatus(
+        binary_path=state / "fake-bin",  # truthy
+        config_path=state / "proxy.yaml",
+        ca_cert_path=state / "missing-ca.crt",  # points at nonexistent path
+        pid=99999,
+        listening=True,
+        tunnel_port=9090,
+    )
+    # ProxyStatus.configured returns True iff config_path AND ca_cert_path
+    # both exist.  We need configured=True but the second exists() check
+    # in docker.py to return False — force that by writing a placeholder
+    # config_path that exists and pointing ca_cert_path at a missing file.
+    (state / "proxy.yaml").write_text("# fake")
+    # ProxyStatus.configured: config_path.exists() and ca_cert_path.exists().
+    # Make ca_cert_path .exists() True for the configured check but the
+    # explicit .exists() recheck path in docker.py reads the same Path,
+    # which is missing — so we wrap.
+    class _CAStub:
+        """Path-like that toggles .exists() so configured=True but the
+        defensive recheck in docker.py returns False."""
+        _calls = 0
+        def __init__(self, real: Path):
+            self._real = real
+        def __str__(self):
+            return str(self._real)
+        @property
+        def parent(self):
+            return self._real.parent
+        def exists(self):
+            type(self)._calls += 1
+            # First call: configured property check → say yes.
+            # Second call: docker.py defensive recheck → say no.
+            return type(self)._calls == 1
+    fake_status.ca_cert_path = _CAStub(state / "missing-ca.crt")  # type: ignore[assignment]
+    monkeypatch.setattr(ip, "get_status", lambda: fake_status)
+
+    with pytest.raises(RuntimeError, match="CA cert vanished"):
+        _egress_proxy_args_for_docker()
+
+
+# ---------------------------------------------------------------------------
+# Docker env collision detection (regression: docker_env silently bypassed proxy)
+# ---------------------------------------------------------------------------
+
+
+def test_docker_env_collision_with_proxy_raises_when_enforce(hermes_home, monkeypatch):
+    """Setting docker_env: {HTTPS_PROXY: ''} in config.yaml with
+    enforce_on_docker=true must fail-loud rather than silently inverting
+    the egress isolation."""
+
+    from tools.environments.docker import DockerEnvironment
+    from hermes_cli.config import load_config, save_config
+
+    # Set up a fully-running proxy.
+    state = ip._proxy_state_dir()
+    ca = state / "ca.crt"
+    ca.write_text("fake-ca")
+    (state / "ca.key").write_text("fake-key")
+    proxy_cfg = ip.build_proxy_config(
+        mappings=[_sample_mapping()],
+        ca_cert=ca, ca_key=state / "ca.key", tunnel_port=9090,
+    )
+    ip.write_proxy_config(proxy_cfg)
+    ip.write_mappings([_sample_mapping()])
+    cfg = load_config()
+    cfg.setdefault("proxy", {})["enabled"] = True
+    cfg["proxy"]["enforce_on_docker"] = True
+    save_config(cfg)
+    (state / "iron-proxy.pid").write_text("99999")
+    monkeypatch.setattr(ip, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(ip, "_port_listening", lambda h, p: True)
+
+    # Mock the docker availability check so we never shell out.
+    monkeypatch.setattr(
+        "tools.environments.docker._ensure_docker_available", lambda: None,
+    )
+    # Mock find_docker so the resolved docker exe isn't probed.
+    monkeypatch.setattr(
+        "tools.environments.docker.find_docker", lambda: "/bin/true",
+    )
+    # Mock subprocess.run so we don't actually run `docker run`.  We
+    # only need the constructor to get past the env merge logic.
+    monkeypatch.setattr(
+        "tools.environments.docker.subprocess.run",
+        lambda *a, **k: MagicMock(stdout="abc123\n", returncode=0),
+    )
+    # init_session is the second outbound subprocess we don't care about.
+    monkeypatch.setattr(
+        "tools.environments.docker.DockerEnvironment.init_session",
+        lambda self: None,
+    )
+
+    # The collision: user sets HTTPS_PROXY to empty string in docker_env.
+    with pytest.raises(RuntimeError, match="overrides egress-proxy variables"):
+        DockerEnvironment(
+            image="busybox",
+            env={"HTTPS_PROXY": ""},  # the collision
+        )

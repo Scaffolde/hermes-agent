@@ -169,6 +169,6 @@ A request to a non-allowlisted host (e.g. `https://attacker.example.com/leak?key
 
 ## See also
 
-- Upstream project: <https://github.com/ironsh/iron-proxy>
-- Upstream docs: <https://docs.iron.sh/>
+- Upstream project: [github.com/ironsh/iron-proxy](https://github.com/ironsh/iron-proxy)
+- Upstream docs: [docs.iron.sh](https://docs.iron.sh/)
 - Bitwarden integration: [`hermes secrets bitwarden`](../secrets/bitwarden)

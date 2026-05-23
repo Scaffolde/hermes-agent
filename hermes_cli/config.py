@@ -1971,7 +1971,7 @@ DEFAULT_CONFIG = {
     # real API credentials at the egress boundary.  Compromising the sandbox
     # leaks tokens that only work from behind the proxy.
     #
-    # Configure with `hermes proxy setup`.  Disabled by default — the rest of
+    # Configure with `hermes egress setup`.  Disabled by default — the rest of
     # Hermes works exactly as before with `enabled: false`.
     "proxy": {
         # Master switch.  When false, iron-proxy is never started, no docker
@@ -1995,6 +1995,20 @@ DEFAULT_CONFIG = {
         # proxy is enabled but not running.  False = fall back to direct
         # outbound with real credentials in the sandbox (the legacy posture).
         "enforce_on_docker": True,
+        # When true, `hermes egress start` refuses to start if any provider
+        # env var is set that the proxy cannot strip (Anthropic native
+        # `x-api-key`, AWS Bedrock SigV4, Azure OpenAI, etc.).  These
+        # credentials would otherwise leak into the sandbox bypassing the
+        # proxy.  Defaults to false because the false-positive cost
+        # (operator has the env set but doesn't actually use that provider)
+        # is higher than the security cost of a warning.
+        "fail_on_uncovered_providers": False,
+        # SSRF deny list applied to outbound traffic.  Omit / leave empty
+        # to use the safe default: loopback, link-local (incl. cloud
+        # metadata IPs at 169.254.169.254), and RFC1918.  Set to an
+        # explicit ``[]`` to opt out entirely (only sensible in hermetic
+        # tests that need to reach a loopback upstream).
+        "upstream_deny_cidrs": None,
         # Extra allowed upstream hosts beyond the bundled defaults (which
         # cover OpenRouter, OpenAI, Anthropic, Google, xAI, Mistral, Groq,
         # Together, DeepSeek, Nous).  Wildcards (`*.foo.com`) are supported.

@@ -11275,7 +11275,9 @@ def main():
     _proxy_cli.register_cli(egress_parser)
 
     def _dispatch_egress(args):  # noqa: ANN001
-        sub = getattr(args, "proxy_command", None)
+        # The egress subparser uses dest='egress_command' to stay disjoint
+        # from the inbound OAuth ``hermes proxy`` subparser (dest='proxy_command').
+        sub = getattr(args, "egress_command", None)
         if sub is not None and hasattr(args, "func") and args.func is not _dispatch_egress:
             return args.func(args)
         egress_parser.print_help()
