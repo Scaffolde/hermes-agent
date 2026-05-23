@@ -1,0 +1,100 @@
+name: Upstream Sync PR
+
+on:
+  schedule:
+    # Every 4 hours, offset from top-of-hour GitHub Actions congestion.
+    - cron: '17 */4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync-pr
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: Create reviewed upstream sync PR
+    if: github.repository == 'pai-scaffolde/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # Use the repository GitHub App credentials instead of GITHUB_TOKEN so
+      # branch pushes/PR updates trigger the normal pull_request CI gates.
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@7bfa3a4717ef143a604ee0a99d859b8886a96d00 # v1.9.3
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout fork main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Create or update upstream sync PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BRANCH: automation/upstream-sync
+          UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
+        run: |
+          set -euo pipefail
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch origin main
+          git fetch upstream main
+
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            echo "Fork main already contains upstream/main; nothing to sync."
+            exit 0
+          fi
+
+          git checkout -B "$BRANCH" origin/main
+          git merge --no-ff --no-edit upstream/main
+
+          git push --force-with-lease origin "HEAD:$BRANCH"
+
+          cat > /tmp/upstream-sync-pr-body.md <<'EOF'
+          Automated upstream sync from NousResearch/hermes-agent into pai-scaffolde/hermes-agent.
+
+          Policy:
+          - This PR is review-gated.
+          - Do not auto-merge blindly.
+          - Existing CI/checks must pass before merging.
+          - If conflicts occur, resolve manually on this branch.
+
+          Source:
+          - upstream: NousResearch/hermes-agent main
+          - fork base: pai-scaffolde/hermes-agent main
+          EOF
+
+          PR_NUMBER="$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --head "$BRANCH" \
+            --base main \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr edit "$PR_NUMBER" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "chore: sync from NousResearch/hermes-agent upstream" \
+              --body-file /tmp/upstream-sync-pr-body.md
+          else
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore: sync from NousResearch/hermes-agent upstream" \
+              --body-file /tmp/upstream-sync-pr-body.md
+          fi
