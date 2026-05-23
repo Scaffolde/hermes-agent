@@ -80,6 +80,25 @@ def test_discover_provider_mappings_explicit_names(hermes_home):
     # Unknown providers (no entry in _BEARER_PROVIDERS) are skipped, not warned.
 
 
+def test_discover_provider_mappings_includes_google_ai_studio_keys(hermes_home):
+    ms = ip.discover_provider_mappings(
+        available_env_names=["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+    )
+    by_name = {m.real_env_name: m for m in ms}
+    assert set(by_name) == {"GEMINI_API_KEY", "GOOGLE_API_KEY"}
+    assert by_name["GEMINI_API_KEY"].upstream_hosts == ("generativelanguage.googleapis.com",)
+    assert by_name["GOOGLE_API_KEY"].upstream_hosts == ("generativelanguage.googleapis.com",)
+
+
+def test_google_ai_studio_keys_are_not_reported_as_uncovered(hermes_home):
+    uncovered = ip.discover_uncovered_providers(
+        available_env_names=["GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"]
+    )
+    assert "GEMINI_API_KEY" not in uncovered
+    assert "GOOGLE_API_KEY" not in uncovered
+    assert "ANTHROPIC_API_KEY" in uncovered
+
+
 def test_discover_provider_mappings_empty(hermes_home):
     ms = ip.discover_provider_mappings(available_env_names=[])
     assert ms == []
@@ -109,7 +128,7 @@ def test_build_proxy_config_shape(tmp_path):
     )
     # Top-level sections — note `dns` is required by iron-proxy even when
     # we only use the CONNECT tunnel.
-    assert set(cfg.keys()) >= {"dns", "proxy", "tls", "transforms", "log"}
+    assert set(cfg.keys()) >= {"dns", "proxy", "tls", "transforms", "log", "metrics"}
     # Transforms in expected order
     assert [t["name"] for t in cfg["transforms"]] == ["allowlist", "secrets"]
     # Allowlist uses `domains:` (iron-proxy schema), not `hosts:`
@@ -129,6 +148,27 @@ def test_build_proxy_config_shape(tmp_path):
     assert rule_hosts == set(m.upstream_hosts)
     # TLS section names the CA paths
     assert cfg["tls"]["ca_cert"] == str(ca_crt)
+
+
+def test_build_proxy_config_uses_x_goog_api_key_for_gemini(tmp_path):
+    m = ip.TokenMapping(
+        proxy_token=ip.mint_proxy_token("google"),
+        real_env_name="GOOGLE_API_KEY",
+        upstream_hosts=("generativelanguage.googleapis.com",),
+    )
+    cfg = ip.build_proxy_config(
+        mappings=[m],
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+    )
+    domains = cfg["transforms"][0]["config"]["domains"]
+    assert "generativelanguage.googleapis.com" in domains
+    rule = cfg["transforms"][1]["config"]["secrets"][0]
+    assert rule["source"] == {"type": "env", "var": "GOOGLE_API_KEY"}
+    assert rule["replace"]["proxy_value"] == m.proxy_token
+    assert rule["replace"]["match_headers"] == ["x-goog-api-key"]
+    assert rule["replace"]["match_query"] is True
+    assert rule["rules"] == [{"host": "generativelanguage.googleapis.com"}]
 
 
 def test_build_proxy_config_custom_allowed_hosts(tmp_path):
@@ -212,7 +252,7 @@ def test_wizard_rendered_yaml_contains_deny_list(hermes_home, tmp_path):
 
 
 def test_default_bind_is_loopback_not_zero_zero(tmp_path):
-    """``http_listen`` must NOT be ``0.0.0.0:PORT`` or ``:PORT`` (latter is
+    """``tunnel_listen`` must NOT be ``0.0.0.0:PORT`` or ``:PORT`` (latter is
     INADDR_ANY).  Loopback only by default; the docker bridge bind is
     optional and added in addition, never instead."""
 
@@ -223,21 +263,20 @@ def test_default_bind_is_loopback_not_zero_zero(tmp_path):
         tunnel_port=12345,
         http_listen=["127.0.0.1:12345"],  # explicit so test is deterministic
     )
-    primary = cfg["proxy"]["http_listen"]
-    listens = cfg["proxy"]["http_listens"]
+    primary = cfg["proxy"]["tunnel_listen"]
     assert primary == "127.0.0.1:12345"
-    assert listens == ["127.0.0.1:12345"]
+    assert cfg["proxy"]["http_listen"] == "127.0.0.1:0"
+    assert cfg["metrics"]["listen"] == "127.0.0.1:0"
+    assert "http_listens" not in cfg["proxy"]  # iron-proxy v0.39 rejects this field
     # Sentinel: confirm we didn't accidentally serialize a bare-port form
-    # like ":12345" anywhere in the listen list (that's INADDR_ANY).
-    for entry in listens:
-        assert not entry.startswith(":")
-        assert "0.0.0.0" not in entry
+    # like ":12345" (that's INADDR_ANY).
+    assert not primary.startswith(":")
+    assert "0.0.0.0" not in primary
 
 
 def test_default_bind_includes_docker_bridge_on_linux(tmp_path, monkeypatch):
-    """When http_listen isn't passed AND we're on Linux AND a docker
-    bridge IP is detected, we should bind that bridge IP in addition to
-    loopback so containers reach the proxy via host-gateway."""
+    """v0.39 config can only serialize one tunnel_listen; prefer the safe
+    loopback scalar over emitting unsupported multi-listen YAML."""
 
     monkeypatch.setattr(ip.platform, "system", lambda: "Linux")
     monkeypatch.setattr(ip, "_detect_docker_bridge_ip", lambda: "172.17.0.1")
@@ -247,23 +286,24 @@ def test_default_bind_includes_docker_bridge_on_linux(tmp_path, monkeypatch):
         ca_key=tmp_path / "ca.key",
         tunnel_port=9090,
     )
-    assert "127.0.0.1:9090" in cfg["proxy"]["http_listens"]
-    assert "172.17.0.1:9090" in cfg["proxy"]["http_listens"]
+    assert cfg["proxy"]["tunnel_listen"] == "127.0.0.1:9090"
+    assert cfg["proxy"]["http_listen"] == "127.0.0.1:0"
+    assert "http_listens" not in cfg["proxy"]
 
 
 # ---------------------------------------------------------------------------
-# audit_log wiring (regression: parameter was accepted but never used)
+# audit_log compatibility
 # ---------------------------------------------------------------------------
 
 
-def test_audit_log_path_lands_in_yaml(tmp_path):
+def test_audit_log_path_is_not_emitted_for_v039_yaml(tmp_path):
     cfg = ip.build_proxy_config(
         mappings=[_sample_mapping()],
         ca_cert=tmp_path / "ca.crt",
         ca_key=tmp_path / "ca.key",
         audit_log=tmp_path / "audit.log",
     )
-    assert cfg["log"]["audit_path"] == str(tmp_path / "audit.log")
+    assert "audit_path" not in cfg["log"]
 
 
 def test_audit_log_omitted_when_caller_passes_none(tmp_path):
