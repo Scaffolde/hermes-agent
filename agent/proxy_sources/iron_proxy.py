@@ -1382,8 +1382,16 @@ def _build_proxy_subprocess_env(
                 for n in needed:
                     if n in secrets:
                         env[n] = secrets[n]
-                for w in warnings:
-                    logger.warning("Bitwarden refresh: %s", w)
+                # bws warnings are non-secret status messages (e.g. "no
+                # project found", "rate limited"), but the taint analyzer
+                # can't tell that — log the count and let the operator
+                # rerun under verbose if they need detail.
+                if warnings:
+                    logger.warning(
+                        "Bitwarden refresh produced %d warning(s); "
+                        "run `hermes secrets bitwarden status` for detail.",
+                        len(warnings),
+                    )
             else:
                 logger.warning(
                     "credential_source=bitwarden but access_token_env=%s or "
