@@ -48,6 +48,27 @@ def test_init_creates_expected_tables(kanban_home):
     assert {"tasks", "task_links", "task_comments", "task_events"} <= names
 
 
+def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
+    """Kanban should classify TLS-looking page-0 clobbers before WAL setup."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    corrupt = home / "kanban.db"
+    corrupt.write_bytes(b"SQLit" + bytes.fromhex("17 03 03 00 13") + b"x" * 32)
+
+    with pytest.raises(sqlite3.DatabaseError) as exc_info:
+        kb.connect(board="default")
+
+    msg = str(exc_info.value)
+    assert "file is not a database" in msg
+    assert "TLS record header detected at byte offset 5" in msg
+    assert "53 51 4c 69 74 17 03 03 00 13" in msg
+
+
 def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     """Legacy DBs missing additive indexed columns must migrate cleanly.
 
@@ -271,6 +292,36 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         assert task.status == "ready"
         assert task.consecutive_failures == 0
         assert task.last_failure_error is None
+
+
+def test_recompute_ready_does_not_promote_gave_up_task(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="a")
+        assert kb.claim_task(conn, tid, claimer="host:1") is not None
+        blocked = kb._record_task_failure(
+            conn,
+            tid,
+            "worker exited before completing or blocking",
+            outcome="crashed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+        assert blocked is True
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+
+        promoted = kb.recompute_ready(conn)
+
+        assert promoted == 0
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 1
+        event_kinds = [event.kind for event in kb.list_events(conn, tid)]
+        assert "gave_up" in event_kinds
+        assert "promoted" not in event_kinds
 
 
 def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
@@ -1860,6 +1911,65 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+
+    def test_dispatcher_spawn_canonicalizes_tool_visible_gbrain_skill_aliases(
+        self, tmp_path, monkeypatch
+    ):
+        """Blocker regression: tool-visible gbrain skill aliases must not
+        be passed verbatim to worker ``--skills`` args.
+
+        The reproduced symptom was a profile-scoped worker crashing at CLI
+        startup with ``Unknown skill(s)`` when a kanban task carried gbrain
+        skill names as exposed by tools/skills_list.  The worker CLI accepts
+        the qualified skillpack form, so every alias in the dispatcher map
+        must be canonicalized before ``subprocess.Popen``.
+        """
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["cmd"] = cmd
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_skill_alias",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            skills=[
+                "gbrain-query",
+                "gbrain-brain-ops",
+                "gbrain-enrich",
+                "ContextSearch",
+            ],
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        cmd = captured["cmd"]
+        assert "gbrain-query" not in cmd
+        assert "gbrain-brain-ops" not in cmd
+        assert "gbrain-enrich" not in cmd
+        assert "gbrain:query" in cmd
+        assert "gbrain:brain-ops" in cmd
+        assert "gbrain:enrich" in cmd
+        assert "ContextSearch" in cmd
 
 
 # ---------------------------------------------------------------------------

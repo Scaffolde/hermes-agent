@@ -177,6 +177,151 @@ _GOSU_CAP_ARGS = [
 ]
 
 
+def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], list[str]]:
+    """Build the docker mount/env/host args needed to route a sandbox through
+    the iron-proxy egress firewall.
+
+    Returns ``(volume_args, env_overrides, host_args)``:
+
+    * ``volume_args`` — read-only bind mount of the CA cert into the container
+      (extends docker's ``-v`` argv list)
+    * ``env_overrides`` — env vars to set on container creation: ``HTTPS_PROXY``,
+      ``HTTP_PROXY``, ``NO_PROXY`` (loopback only), Python/Node/curl CA-bundle
+      paths, and one ``HERMES_PROXY_TOKEN_<NAME>`` per minted mapping
+    * ``host_args`` — extra ``--add-host`` flags so the container can reach the
+      host-side proxy (Linux needs ``host.docker.internal:host-gateway``;
+      Docker Desktop populates this automatically on macOS/Windows)
+
+    Returns three empty containers when the proxy is disabled, not yet set up,
+    or not currently running.  If ``proxy.enforce_on_docker`` is true and the
+    proxy is enabled-but-not-running, raises ``RuntimeError`` so the docker
+    backend refuses to start the sandbox.
+    """
+
+    # Narrow except: ImportError is the only legitimate failure here.
+    # Bare ``except Exception`` would hide AttributeError, SyntaxError in
+    # the config module, etc. and silently start the sandbox without
+    # proxy enforcement.  We let unexpected exceptions propagate so the
+    # docker backend visibly fails rather than degrading silently.
+    try:
+        from hermes_cli.config import load_config
+        from agent.proxy_sources import iron_proxy as ip
+    except ImportError as exc:
+        logger.debug("Egress proxy plumbing unavailable: %s", exc)
+        return ([], {}, [])
+
+    cfg = load_config()
+    proxy_cfg = cfg.get("proxy") or {}
+    if not proxy_cfg.get("enabled"):
+        return ([], {}, [])
+
+    status = ip.get_status()
+    enforce = bool(proxy_cfg.get("enforce_on_docker", True))
+
+    if not status.configured:
+        msg = (
+            "proxy.enabled is true but iron-proxy is not configured. "
+            "Run `hermes egress setup` to mint tokens and write proxy.yaml."
+        )
+        if enforce:
+            raise RuntimeError(msg)
+        logger.warning("%s — continuing without proxy (enforce_on_docker=false).", msg)
+        return ([], {}, [])
+
+    if not (status.pid and status.listening):
+        msg = (
+            f"iron-proxy is enabled but not running on port {status.tunnel_port}. "
+            "Start it with `hermes egress start`."
+        )
+        if enforce:
+            raise RuntimeError(msg)
+        logger.warning("%s — continuing without proxy (enforce_on_docker=false).", msg)
+        return ([], {}, [])
+
+    if status.ca_cert_path is None or not status.ca_cert_path.exists():
+        # status.configured was True a moment ago but the CA file has
+        # disappeared.  Treat this with the same enforce semantics as the
+        # other failure branches — silently dropping the CA mount would
+        # leave the sandbox with proxy env vars pointing at iron-proxy
+        # but no trust anchor, so every TLS handshake would 5xx; or
+        # worse, with enforce_on_docker=false we'd drop both the proxy
+        # vars AND any other isolation, opening the sandbox.
+        msg = (
+            f"iron-proxy CA cert vanished from {status.ca_cert_path}. "
+            "Re-run `hermes egress setup` to regenerate it."
+        )
+        if enforce:
+            raise RuntimeError(msg)
+        logger.warning("%s — continuing without proxy (enforce_on_docker=false).", msg)
+        return ([], {}, [])
+
+    # Corrupt or empty mappings.json is a silent failure mode that's
+    # indistinguishable from an upstream outage from inside the sandbox
+    # (every request returns 403).  Refuse to mount with empty mappings
+    # rather than ship a broken sandbox.
+    mappings = ip.load_mappings()
+    if not mappings:
+        msg = (
+            "iron-proxy is configured but mappings.json is empty or "
+            "corrupt.  Re-run `hermes egress setup` to mint provider "
+            "tokens before starting a sandbox."
+        )
+        if enforce:
+            raise RuntimeError(msg)
+        logger.warning("%s — continuing without proxy (enforce_on_docker=false).", msg)
+        return ([], {}, [])
+
+    container_ca = "/etc/ssl/certs/hermes-egress-ca.crt"
+    volume_args = ["-v", f"{status.ca_cert_path}:{container_ca}:ro"]
+
+    proxy_url = f"http://host.docker.internal:{status.tunnel_port}"
+    env_overrides: dict[str, str] = {
+        # HTTPS_PROXY / HTTP_PROXY are respected by curl, requests, urllib,
+        # httpx, node fetch, go default transport, etc.  Lowercase variants
+        # are also set because some tools only look at one casing.
+        "HTTPS_PROXY": proxy_url,
+        "https_proxy": proxy_url,
+        "HTTP_PROXY": proxy_url,
+        "http_proxy": proxy_url,
+        # Loopback-only NO_PROXY so localhost dev servers inside the sandbox
+        # (test fixtures, local LLMs) don't get sent through the proxy.
+        "NO_PROXY": "127.0.0.1,localhost,::1",
+        "no_proxy": "127.0.0.1,localhost,::1",
+        # CA bundle locations for the major language runtimes.  iron-proxy
+        # presents a leaf cert signed by our CA on every MITM'd connection.
+        #
+        # CRITICAL ASYMMETRY: Python (REQUESTS_CA_BUNDLE / SSL_CERT_FILE)
+        # and curl (CURL_CA_BUNDLE) REPLACE the system CA store.
+        # NODE_EXTRA_CA_CERTS ADDS to it.  A Node.js process that
+        # bypasses HTTPS_PROXY by using a raw socket would still see the
+        # system CA store and succeed where Python/curl fail validation.
+        # We additionally set NODE_OPTIONS=--use-openssl-ca to force Node
+        # through the OpenSSL store that SSL_CERT_FILE controls, narrowing
+        # the asymmetry.  Not a complete fix — see the docs caveat — but
+        # closes the easy case.
+        "REQUESTS_CA_BUNDLE": container_ca,   # Python `requests`
+        "SSL_CERT_FILE": container_ca,         # Python ssl module / OpenSSL
+        "CURL_CA_BUNDLE": container_ca,        # curl
+        "NODE_EXTRA_CA_CERTS": container_ca,   # Node.js: adds to system store
+        "NODE_OPTIONS": "--use-openssl-ca",    # Node.js: route through OpenSSL store
+        # For the agent inside the sandbox to identify itself as proxy-aware.
+        "HERMES_EGRESS_PROXY": "1",
+    }
+
+    # Surface the per-provider proxy tokens.  The sandbox can swap these into
+    # its provider config (or its env, if it reads the standard names) and the
+    # proxy translates them to the real secrets on egress.
+    for m in mappings:
+        env_overrides[f"HERMES_PROXY_TOKEN_{m.real_env_name}"] = m.proxy_token
+
+    # On Linux, host.docker.internal isn't populated by default — Docker Desktop
+    # adds it on macOS/Windows; on Linux we need an explicit --add-host with
+    # host-gateway.  On Desktop this is a no-op (harmless duplicate).
+    host_args: list[str] = ["--add-host", "host.docker.internal:host-gateway"]
+
+    return (volume_args, env_overrides, host_args)
+
+
 def _build_security_args(run_as_host_user: bool) -> list[str]:
     """Return the security/cap/tmpfs args tailored to the privilege mode."""
     if run_as_host_user:
@@ -450,11 +595,92 @@ class DockerEnvironment(BaseEnvironment):
         except Exception as e:
             logger.debug("Docker: could not load credential file mounts: %s", e)
 
+        # Egress credential-injection proxy (iron-proxy) — when configured,
+        # mount the CA cert into the sandbox and set HTTPS_PROXY + CA-bundle
+        # env vars so outbound traffic routes through the host-side proxy.
+        # The sandbox receives PROXY tokens instead of real API keys.
+        egress_volume_args, egress_env_overrides, egress_host_args = (
+            _egress_proxy_args_for_docker()
+        )
+        volume_args.extend(egress_volume_args)
+        # egress env overrides are merged in further below alongside the
+        # other env_args computation.
+
         # Explicit environment variables (docker_env config) — set at container
         # creation so they're available to all processes (including entrypoint).
+        # Egress proxy env vars (HTTPS_PROXY, CA-bundle paths, proxy tokens)
+        # are merged below.  Precedence policy:
+        #
+        # - When egress enforcement is on AND the user's docker_env tries
+        #   to override one of the proxy-control vars (HTTPS_PROXY,
+        #   SSL_CERT_FILE, etc.), fail-loud rather than silently inverting
+        #   the isolation.  The CA mount + tokens would still ship while
+        #   traffic leaves the sandbox direct with real credentials —
+        #   exactly what enforce_on_docker is meant to prevent.
+        # - When enforcement is off, the user's docker_env wins (current
+        #   behavior) but we log a warning naming both config sources.
+        # - When the user override is identical to the egress value, no-op.
+        if egress_env_overrides:
+            try:
+                from hermes_cli.config import load_config as _load_cfg_for_collision
+                _proxy_cfg = (_load_cfg_for_collision().get("proxy") or {})
+            except ImportError:
+                _proxy_cfg = {}
+            _enforce_egress = bool(_proxy_cfg.get("enforce_on_docker", True))
+            # Only the env vars that *control* the egress posture matter
+            # for collision detection — auxiliary informational vars like
+            # HERMES_EGRESS_PROXY can be safely overridden.
+            _critical = {
+                "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                "NO_PROXY", "no_proxy",
+                "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE",
+                "NODE_EXTRA_CA_CERTS",
+            }
+            _collisions = sorted(
+                k for k in _critical
+                if k in self._env
+                and k in egress_env_overrides
+                and self._env[k] != egress_env_overrides[k]
+            )
+            if _collisions:
+                _msg = (
+                    f"docker_env in config.yaml overrides egress-proxy "
+                    f"variables {_collisions}; enforce_on_docker is "
+                    f"{'enabled' if _enforce_egress else 'disabled'}."
+                )
+                if _enforce_egress:
+                    raise RuntimeError(
+                        f"{_msg}  Remove these keys from docker_env or "
+                        "disable enforce_on_docker to opt out of egress "
+                        "isolation."
+                    )
+                logger.warning(
+                    "%s  Falling back to docker_env values; sandbox traffic "
+                    "will NOT route through the proxy.", _msg,
+                )
+
+        # When enforce_on_docker is true, egress overrides win.  When
+        # false, docker_env wins (back-compat for users who deliberately
+        # opt out).  In both cases the collision check above has already
+        # surfaced any disagreement.
+        try:
+            from hermes_cli.config import load_config as _load_cfg_for_precedence
+            _enforce_egress_merge = bool(
+                (_load_cfg_for_precedence().get("proxy") or {})
+                .get("enforce_on_docker", True)
+            )
+        except ImportError:
+            _enforce_egress_merge = True
+
+        if _enforce_egress_merge and egress_env_overrides:
+            merged_env = dict(self._env)
+            merged_env.update(egress_env_overrides)
+        else:
+            merged_env = dict(egress_env_overrides)
+            merged_env.update(self._env)
         env_args = []
-        for key in sorted(self._env):
-            env_args.extend(["-e", f"{key}={self._env[key]}"])
+        for key in sorted(merged_env):
+            env_args.extend(["-e", f"{key}={merged_env[key]}"])
 
         # Optional: run the container as the host user so files written into
         # bind-mounted dirs (/workspace, /root, docker_volumes entries) are
@@ -491,6 +717,7 @@ class DockerEnvironment(BaseEnvironment):
             + user_args
             + writable_args
             + resource_args
+            + egress_host_args
             + volume_args
             + env_args
             + validated_extra

@@ -14,8 +14,8 @@ These tests pin down:
 * Worker / operator-initiated blocks are sticky and survive
   ``recompute_ready``.
 * Circuit-breaker blocks (``gave_up`` event, status flipped via
-  ``_record_task_failure``) still auto-recover — the original intent
-  of #40c1decb3 is preserved.
+  ``_record_task_failure``) are sticky too — the dispatcher must not
+  retry a known deterministic failure without explicit operator action.
 * An explicit ``kanban_unblock`` clears the sticky state.
 * The full block → promote → crash → ``gave_up`` loop is broken after
   this fix: subsequent ticks leave the task blocked.
@@ -132,11 +132,15 @@ def test_circuit_breaker_block_still_auto_promotes(kanban_home: Path) -> None:
         assert task.last_failure_error is None
 
 
-def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> None:
-    """The circuit-breaker emits ``gave_up`` (not ``blocked``).  Make
-    sure ``_has_sticky_block`` doesn't accidentally treat ``gave_up``
-    as sticky — otherwise we'd regress the safety net for genuinely
-    transient crashes."""
+def test_gave_up_event_is_a_sticky_circuit_breaker(kanban_home: Path) -> None:
+    """The circuit-breaker emits ``gave_up`` (not ``blocked``).
+
+    That event is intentionally sticky: once the dispatcher has given up,
+    a task must stay blocked until an operator/controller explicitly
+    unblocks or requeues it. Otherwise ``recompute_ready`` immediately
+    respawns the same deterministic failure and the circuit breaker never
+    actually breaks the loop.
+    """
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         child = kb.create_task(conn, title="child", parents=[parent])
@@ -155,8 +159,10 @@ def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> No
         conn.commit()
 
         promoted = kb.recompute_ready(conn)
-        assert promoted == 1
-        assert kb.get_task(conn, child).status == "ready"
+        assert promoted == 0
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "blocked"
 
 
 # ---------------------------------------------------------------------------

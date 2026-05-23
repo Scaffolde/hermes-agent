@@ -1648,6 +1648,15 @@ DEFAULT_CONFIG = {
         # the sweep on every CLI invocation).  Tracked via state_meta in
         # state.db itself, so it's shared across all processes.
         "min_interval_hours": 24,
+        # Legacy per-session JSON snapshot writer.  When true, the agent
+        # rewrites ``~/.hermes/sessions/session_{sid}.json`` on every turn
+        # boundary with the full message list.  state.db is canonical and
+        # has every field the snapshot stored (plus per-message timestamps
+        # and token counts), so this is off by default — the snapshots had
+        # no consumer outside their own overwrite guard and accumulated
+        # GBs of disk on heavy users.  Opt in only if you have an external
+        # tool that consumes the JSON files directly.
+        "write_json_snapshots": False,
     },
 
     # Contextual first-touch onboarding hints (see agent/onboarding.py).
@@ -1736,6 +1745,90 @@ DEFAULT_CONFIG = {
         # Number of automatic retries on 5xx / ReadTimeout / ConnectionError.
         # Each retry backs off (1.5x attempt seconds, capped at 5s).
         "retries": 2,
+    },
+
+    # =========================================================================
+    # External secret sources
+    # =========================================================================
+    # Pull credentials from external secret managers at process startup
+    # rather than storing them in ~/.hermes/.env.
+    "secrets": {
+        "bitwarden": {
+            # Master switch.  When false, BSM is never contacted and the
+            # bws binary is never auto-installed — same as not having
+            # this section at all.
+            "enabled": False,
+            # Name of the env var that holds the Bitwarden machine-account
+            # access token.  This is the one bootstrap secret; it lives
+            # in ~/.hermes/.env (or your shell) and never in config.yaml.
+            "access_token_env": "BWS_ACCESS_TOKEN",
+            # UUID of the BSM project to sync from.
+            "project_id": "",
+            # Seconds to cache fetched secrets in-process.  0 disables.
+            "cache_ttl_seconds": 300,
+            # When True, BSM values overwrite existing env vars.  Default
+            # True because the point of using BSM is centralized rotation —
+            # if .env had the final say, rotating in Bitwarden wouldn't
+            # take effect until you also cleared the matching .env line.
+            "override_existing": True,
+            # When True, the bws binary is auto-downloaded into
+            # ~/.hermes/bin/ on first use.  When False you must install
+            # bws yourself and have it on PATH.
+            "auto_install": True,
+        },
+    },
+
+    # =========================================================================
+    # Egress credential-injection proxy (iron-proxy)
+    # =========================================================================
+    # When enabled, outbound traffic from remote terminal sandboxes (Docker
+    # today; Modal/SSH in follow-ups) is routed through a managed iron-proxy
+    # subprocess.  The sandbox sees opaque proxy tokens; iron-proxy swaps in
+    # real API credentials at the egress boundary.  Compromising the sandbox
+    # leaks tokens that only work from behind the proxy.
+    #
+    # Configure with `hermes egress setup`.  Disabled by default — the rest of
+    # Hermes works exactly as before with `enabled: false`.
+    "proxy": {
+        # Master switch.  When false, iron-proxy is never started, no docker
+        # mounts are added, no binaries are auto-installed — feature is a
+        # complete no-op.
+        "enabled": False,
+        # Tunnel listener port.  Sandboxes get `HTTPS_PROXY=http://<host>:<port>`.
+        # 9090 is the default; collide-aware setup wizard can reassign.
+        "tunnel_port": 9090,
+        # Auto-download the pinned iron-proxy binary into ~/.hermes/bin/ on
+        # first use.  When false, you must place `iron-proxy` on PATH yourself.
+        "auto_install": True,
+        # Where iron-proxy looks up the real upstream secrets at egress time.
+        # "env"        — process env (default; what bitwarden integration
+        #                already populates if you use it)
+        # "bitwarden"  — refetch via `bws secret list` on each proxy restart;
+        #                rotation in the Bitwarden web app propagates without
+        #                touching .env (requires `secrets.bitwarden.enabled`).
+        "credential_source": "env",
+        # When true, the Docker backend refuses to start a sandbox if the
+        # proxy is enabled but not running.  False = fall back to direct
+        # outbound with real credentials in the sandbox (the legacy posture).
+        "enforce_on_docker": True,
+        # When true, `hermes egress start` refuses to start if any provider
+        # env var is set that the proxy cannot strip (Anthropic native
+        # `x-api-key`, AWS Bedrock SigV4, Azure OpenAI, etc.).  These
+        # credentials would otherwise leak into the sandbox bypassing the
+        # proxy.  Defaults to false because the false-positive cost
+        # (operator has the env set but doesn't actually use that provider)
+        # is higher than the security cost of a warning.
+        "fail_on_uncovered_providers": False,
+        # SSRF deny list applied to outbound traffic.  Omit / leave empty
+        # to use the safe default: loopback, link-local (incl. cloud
+        # metadata IPs at 169.254.169.254), and RFC1918.  Set to an
+        # explicit ``[]`` to opt out entirely (only sensible in hermetic
+        # tests that need to reach a loopback upstream).
+        "upstream_deny_cidrs": None,
+        # Extra allowed upstream hosts beyond the bundled defaults (which
+        # cover OpenRouter, OpenAI, Anthropic, Google, xAI, Mistral, Groq,
+        # Together, DeepSeek, Nous).  Wildcards (`*.foo.com`) are supported.
+        "extra_allowed_hosts": [],
     },
 
     # Config schema version - bump this when adding new required fields
@@ -3008,7 +3101,7 @@ def _normalize_custom_provider_entry(
         "api_mode", "transport", "model", "default_model", "models",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
-        "discover_models",
+        "discover_models", "extra_body",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
@@ -3102,6 +3195,10 @@ def _normalize_custom_provider_entry(
     discover_models = entry.get("discover_models")
     if isinstance(discover_models, bool):
         normalized["discover_models"] = discover_models
+
+    extra_body = entry.get("extra_body")
+    if isinstance(extra_body, dict):
+        normalized["extra_body"] = dict(extra_body)
 
     return normalized
 
@@ -3263,7 +3360,7 @@ _KNOWN_ROOT_KEYS = {
 # Valid fields inside a custom_providers list entry
 _VALID_CUSTOM_PROVIDER_FIELDS = {
     "name", "base_url", "api_key", "api_mode", "model", "models",
-    "context_length", "rate_limit_delay",
+    "context_length", "rate_limit_delay", "extra_body",
     # key_env is read at runtime by runtime_provider.py and auxiliary_client.py
     # — include it here so the set accurately describes the supported schema.
     "key_env",
