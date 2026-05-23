@@ -2196,10 +2196,9 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    """Return True when ``task_id`` must stay blocked until unblocked.
 
-    A ``blocked`` status can come from two very different sources:
+    A ``blocked`` status can come from several sources:
 
     * **Worker- or operator-initiated** — a worker called
       ``kanban_block(reason="review-required: ...")`` (or somebody ran
@@ -2209,28 +2208,28 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
       repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
+      ``"gave_up"`` and should also stop redispatch until a human or
+      controller explicitly unblocks/requeues it.  Otherwise a no-parent
+      task is immediately promoted by ``recompute_ready`` and the breaker
+      never actually breaks the loop.
 
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
+    The cheapest signal is the latest terminal blocking event.  If the
+    most recent ``"blocked"`` / ``"gave_up"`` / ``"unblocked"`` event is
+    ``"blocked"`` or ``"gave_up"``, ``recompute_ready`` must not
+    auto-promote the task.  A later ``"unblocked"`` clears the sticky
+    state.
 
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    Returns ``False`` when there is no such event at all (e.g. direct DB
+    manipulation of ``status='blocked'``) — preserving the legacy
+    auto-recover semantics for that path.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'gave_up', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in {"blocked", "gave_up"}
 
 
 def recompute_ready(conn: sqlite3.Connection) -> int:
@@ -2239,14 +2238,14 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
 
-    ``blocked`` tasks are also considered for promotion (so a task
-    blocked purely by a parent dependency unblocks itself when the
-    parent completes), *except* when the most recent block event was a
-    worker-initiated ``kanban_block`` — those stay blocked until an
-    explicit ``kanban_unblock`` (#28712).  Without that guard, a
-    ``review-required`` handoff would auto-respawn, the fresh worker
-    would find nothing to do, exit cleanly, get recorded as a protocol
-    violation, and the cycle would repeat indefinitely.
+    ``blocked`` tasks are also considered for promotion (so legacy tasks
+    blocked without a durable stop event can recover once parents are
+    done), *except* when the most recent stop event was a worker/operator
+    ``blocked`` event or a circuit-breaker ``gave_up`` event — those stay
+    blocked until an explicit ``kanban_unblock``.  Without that guard, a
+    review-required handoff or max-failure breaker can auto-respawn, the
+    fresh worker may hit the same deterministic failure, and the loop
+    repeats indefinitely.
     """
     promoted = 0
     with write_txn(conn):
@@ -2257,10 +2256,9 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
             task_id = row["id"]
             cur_status = row["status"]
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
+                # Worker/operator blocks and failure-breaker gave_up events
+                # are both deliberate stop states; only unblock_task emits
+                # the "unblocked" event that clears this predicate.
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -5622,6 +5620,29 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     return False
 
 
+_WORKER_SKILL_ALIASES: dict[str, str] = {
+    # Public/tool-facing aliases shown in the generated skills list. The
+    # CLI preloader resolves nested skillpacks by their qualified path form.
+    # If the aliases are passed through unchanged, `hermes ... chat -q` exits
+    # at startup with `Unknown skill(s)` and the dispatcher enters a crash
+    # loop before the worker can even comment or block.
+    "gbrain-query": "gbrain:query",
+    "gbrain-brain-ops": "gbrain:brain-ops",
+    "gbrain-enrich": "gbrain:enrich",
+}
+
+
+def _canonical_worker_skill_name(skill_name: str) -> str:
+    """Return the CLI-loadable skill identifier for a task skill.
+
+    Kanban tasks may be authored from tool/schema-visible names while worker
+    processes preload skills through the CLI. Keep the boundary canonical so a
+    naming alias cannot crash the worker process before the agent loop starts.
+    """
+    raw = str(skill_name or "").strip()
+    return _WORKER_SKILL_ALIASES.get(raw, raw)
+
+
 def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
     current_timeout: Optional[str],
@@ -5774,8 +5795,9 @@ def _default_spawn(
     # if a task author asks for it explicitly.
     if task.skills:
         for sk in task.skills:
-            if sk and sk != "kanban-worker":
-                cmd.extend(["--skills", sk])
+            canonical_sk = _canonical_worker_skill_name(sk)
+            if canonical_sk and canonical_sk != "kanban-worker":
+                cmd.extend(["--skills", canonical_sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
     cmd.extend([

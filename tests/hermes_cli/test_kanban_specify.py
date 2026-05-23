@@ -59,6 +59,14 @@ def _patch_aux_client(content: str, *, model: str = "test-model"):
     ), client
 
 
+def _patch_profile_resolution(*, active="default", existing=("default",)):
+    existing_set = set(existing)
+    return [
+        patch("hermes_cli.profiles.get_active_profile_name", return_value=active),
+        patch("hermes_cli.profiles.profile_exists", side_effect=lambda n: n in existing_set),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # JSON extraction helpers
 # ---------------------------------------------------------------------------
@@ -97,8 +105,18 @@ def test_specify_task_happy_path(kanban_home):
         "body": "**Goal**\nA concrete goal.",
     })
     p, _ = _patch_aux_client(content)
-    with p:
-        outcome = spec.specify_task(tid, author="ace")
+    patches = _patch_profile_resolution(existing=("default", "engineer"))
+    for profile_patch in patches:
+        profile_patch.start()
+    try:
+        with p, patch(
+            "hermes_cli.kanban_specify._load_config",
+            return_value={"kanban": {"default_assignee": "engineer"}},
+        ):
+            outcome = spec.specify_task(tid, author="ace")
+    finally:
+        for profile_patch in patches:
+            profile_patch.stop()
 
     assert outcome.ok is True
     assert outcome.task_id == tid
@@ -106,10 +124,67 @@ def test_specify_task_happy_path(kanban_home):
 
     with kb.connect() as conn:
         task = kb.get_task(conn, tid)
+    assert task is not None
     # Parent-free → recompute_ready promotes to ready.
     assert task.status == "ready"
     assert task.title == "Refined rough"
+    assert task.assignee == "engineer"
     assert "**Goal**" in (task.body or "")
+
+
+def test_specify_task_falls_back_to_active_profile_when_default_missing(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    content = jsonlib.dumps({
+        "title": "Refined rough",
+        "body": "**Goal**\nA concrete goal.",
+    })
+    p, _ = _patch_aux_client(content)
+    patches = _patch_profile_resolution(active="qa", existing=("default", "qa"))
+    for profile_patch in patches:
+        profile_patch.start()
+    try:
+        with p, patch(
+            "hermes_cli.kanban_specify._load_config",
+            return_value={"kanban": {"default_assignee": "ghost"}},
+        ):
+            outcome = spec.specify_task(tid, author="ace")
+    finally:
+        for profile_patch in patches:
+            profile_patch.stop()
+
+    assert outcome.ok is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.assignee == "qa"
+
+
+def test_specify_task_preserves_existing_assignee(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", assignee="researcher", triage=True)
+
+    content = jsonlib.dumps({"title": "Refined rough", "body": "body"})
+    p, _ = _patch_aux_client(content)
+    patches = _patch_profile_resolution(existing=("default", "engineer", "researcher"))
+    for profile_patch in patches:
+        profile_patch.start()
+    try:
+        with p, patch(
+            "hermes_cli.kanban_specify._load_config",
+            return_value={"kanban": {"default_assignee": "engineer"}},
+        ):
+            outcome = spec.specify_task(tid, author="ace")
+    finally:
+        for profile_patch in patches:
+            profile_patch.stop()
+
+    assert outcome.ok is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.assignee == "researcher"
 
 
 def test_specify_task_falls_back_to_body_only_on_bad_json(kanban_home):
