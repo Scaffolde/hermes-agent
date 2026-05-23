@@ -113,10 +113,10 @@ _DEFAULT_ALLOWED_HOSTS: Tuple[str, ...] = (
 )
 
 # Provider env-var name -> upstream host (or list of hosts) on which the
-# Authorization Bearer token should be swapped.  Only includes providers
-# whose API uses a plain "Authorization: Bearer <key>" header — providers
-# with custom auth (x-api-key, query params, signatures) get added as we
-# write per-provider rules.
+# sandbox-visible proxy token should be swapped for the real host-side
+# credential.  Most providers use ``Authorization: Bearer``; Google AI Studio
+# / Gemini uses ``x-goog-api-key``.  Providers with signatures/OAuth flows
+# stay in ``_NON_BEARER_PROVIDERS`` until we have an explicit transform rule.
 _BEARER_PROVIDERS: Dict[str, Tuple[str, ...]] = {
     "OPENROUTER_API_KEY": ("openrouter.ai", "*.openrouter.ai"),
     "OPENAI_API_KEY": ("api.openai.com",),
@@ -126,6 +126,16 @@ _BEARER_PROVIDERS: Dict[str, Tuple[str, ...]] = {
     "MISTRAL_API_KEY": ("api.mistral.ai",),
     "XAI_API_KEY": ("api.x.ai",),
     "NOUS_API_KEY": ("inference.nousresearch.com",),
+    # Google AI Studio / Gemini native API.  Hermes' native Gemini adapter sends
+    # the key in x-goog-api-key, not Authorization.  build_proxy_config special
+    # cases the header below so sandboxes receive only opaque proxy tokens.
+    "GEMINI_API_KEY": ("generativelanguage.googleapis.com",),
+    "GOOGLE_API_KEY": ("generativelanguage.googleapis.com",),
+}
+
+_PROVIDER_MATCH_HEADERS: Dict[str, Tuple[str, ...]] = {
+    "GEMINI_API_KEY": ("x-goog-api-key",),
+    "GOOGLE_API_KEY": ("x-goog-api-key",),
 }
 
 
@@ -148,9 +158,6 @@ _NON_BEARER_PROVIDERS: Tuple[str, ...] = (
     "AWS_SECRET_ACCESS_KEY",
     # GCP Vertex AI: OAuth bearer from gcloud SDK, not a static env key.
     "GOOGLE_APPLICATION_CREDENTIALS",
-    # Google AI Studio (Gemini): x-goog-api-key OR query param.
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEY",
 )
 
 
@@ -726,8 +733,8 @@ def build_proxy_config(
       CONNECT tunnel.  We point it at loopback so it doesn't conflict with
       anything else and disable the listener.
     * The ``proxy.tunnel_listen`` is what sandboxes hit via ``HTTPS_PROXY``.
-      ``http_listen`` / ``https_listen`` are present (loopback only) so the
-      proxy boots; sandboxes never route directly to them.
+      iron-proxy's ``http_listen`` is for DNS-routed MITM HTTP/HTTPS flows;
+      CONNECT/SOCKS clients need the dedicated tunnel listener.
     * ``allowlist`` transform takes ``domains:`` and ``cidrs:``, not ``hosts:``.
     * ``secrets`` transform takes ``secrets:`` (plural), each with a
       ``source``, a ``replace.proxy_value`` (the sandbox-visible token), and
@@ -742,11 +749,12 @@ def build_proxy_config(
 
     secrets_rules = []
     for m in mappings:
+        match_headers = list(_PROVIDER_MATCH_HEADERS.get(m.real_env_name, ("Authorization",)))
         secrets_rules.append({
             "source": {"type": "env", "var": m.real_env_name},
             "replace": {
                 "proxy_value": m.proxy_token,
-                "match_headers": ["Authorization"],
+                "match_headers": match_headers,
                 # The token is also accepted as a bearer query param in case
                 # the sandbox passes it that way.  Body matching is off — we
                 # don't want body inspection forced for every request.
@@ -765,19 +773,20 @@ def build_proxy_config(
     else:
         deny_cidrs = list(upstream_deny_cidrs)
 
-    # Listen addresses.  Single canonical "http_listen" for backward compat
-    # plus a "http_listens" list (iron-proxy v0.39 accepts both; v0.40+ is
-    # listen-list-only).  We always emit both forms so a binary version
-    # bump can't silently regress the bind policy.
+    # Listen address. iron-proxy v0.39 accepts one CONNECT/SOCKS5
+    # tunnel_listen scalar; it does not accept the later multi-listen shape.
+    # Use the first detected safe bind target so generated config actually
+    # boots against the pinned binary.  ``http_listen`` stays loopback/ephemeral
+    # because Hermes sandboxes use HTTPS_PROXY, not DNS interception.
     listens = list(http_listen) if http_listen else _default_http_listen(tunnel_port)
     primary_listen = listens[0] if listens else f"127.0.0.1:{tunnel_port}"
 
+    # iron-proxy v0.39 only accepts log.level. Keep audit_log as a reserved
+    # parameter because the CLI pre-creates the file and a future pinned binary
+    # may support audit_path, but do not emit unsupported YAML that prevents the
+    # current managed binary from booting.
+    _ = audit_log
     log_block: Dict = {"level": "info"}
-    if audit_log is not None:
-        # Wire the operator-requested audit-log path into the binary's log
-        # config.  iron-proxy reads ``log.audit_path``; setting it routes
-        # per-request records there (separately from server-level logs).
-        log_block["audit_path"] = str(audit_log)
 
     return {
         # DNS section is required by the binary's config parser, but we run
@@ -789,20 +798,13 @@ def build_proxy_config(
             "proxy_ip": "127.0.0.1",
         },
         "proxy": {
-            # http_listen is the HTTP-proxy listener that handles both plain
-            # HTTP forwards AND CONNECT tunnels for HTTPS.  Sandboxes set
-            # `HTTPS_PROXY=http://host:tunnel_port` and the same listener
-            # serves both protocols.  We bind loopback + the docker bridge
-            # gateway (Linux) — NOT 0.0.0.0.  LAN peers with a leaked
-            # sandbox token would otherwise be able to spend the operator's
-            # API quota against any allowlisted upstream.
-            "http_listen": primary_listen,
-            "http_listens": listens,
-            # The HTTPS-listener (direct TLS termination, no CONNECT) and
-            # the SOCKS5/CONNECT-only tunnel listener get loopback ephemeral
-            # ports — we don't expose them.
+            # Hermes sandboxes use standard HTTPS_PROXY / CONNECT semantics,
+            # which iron-proxy serves from tunnel_listen.  Keep the DNS-routed
+            # http/https MITM listeners on ephemeral loopback ports so they do
+            # not collide with the operator-facing tunnel port.
+            "http_listen": "127.0.0.1:0",
             "https_listen": "127.0.0.1:0",
-            "tunnel_listen": "127.0.0.1:0",
+            "tunnel_listen": primary_listen,
             "max_request_body_bytes": 16 * 1024 * 1024,
             "max_response_body_bytes": 0,
             "upstream_response_header_timeout": "120s",
@@ -827,6 +829,7 @@ def build_proxy_config(
             },
         ],
         "log": log_block,
+        "metrics": {"listen": "127.0.0.1:0"},
     }
 
 
@@ -1524,10 +1527,9 @@ def _read_tunnel_port_from_config() -> Optional[int]:
     except (OSError, yaml.YAMLError):
         return None
     # The CLI/Docker side calls this "the tunnel port" because that's how
-    # sandboxes use it (HTTPS_PROXY), but on the iron-proxy side it's the
-    # http_listen — the HTTP-proxy listener handles both plain HTTP and the
-    # CONNECT method for HTTPS upstreams.
-    listen = ((data or {}).get("proxy") or {}).get("http_listen") or ""
+    # sandboxes use it (HTTPS_PROXY).  On the iron-proxy side, standard
+    # HTTP CONNECT/SOCKS5 proxy traffic belongs on proxy.tunnel_listen.
+    listen = ((data or {}).get("proxy") or {}).get("tunnel_listen") or ""
     if not isinstance(listen, str) or ":" not in listen:
         return None
     try:
