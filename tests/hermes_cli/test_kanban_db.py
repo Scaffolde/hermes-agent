@@ -2047,6 +2047,15 @@ class TestSharedBoardPaths:
     def test_dispatcher_spawn_canonicalizes_tool_visible_gbrain_skill_aliases(
         self, tmp_path, monkeypatch
     ):
+        """Blocker regression: tool-visible gbrain skill aliases must not
+        be passed verbatim to worker ``--skills`` args.
+
+        The reproduced symptom was a profile-scoped worker crashing at CLI
+        startup with ``Unknown skill(s)`` when a kanban task carried gbrain
+        skill names as exposed by tools/skills_list.  The worker CLI accepts
+        the qualified skillpack form, so every alias in the dispatcher map
+        must be canonicalized before ``subprocess.Popen``.
+        """
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
         self._set_home(monkeypatch, tmp_path, default_home)
@@ -2076,15 +2085,22 @@ class TestSharedBoardPaths:
             claim_lock=None,
             claim_expires=None,
             tenant=None,
-            skills=["gbrain-query", "gbrain-brain-ops", "ContextSearch"],
+            skills=[
+                "gbrain-query",
+                "gbrain-brain-ops",
+                "gbrain-enrich",
+                "ContextSearch",
+            ],
         )
         kb._default_spawn(task, str(tmp_path / "ws"))
 
         cmd = captured["cmd"]
         assert "gbrain-query" not in cmd
         assert "gbrain-brain-ops" not in cmd
+        assert "gbrain-enrich" not in cmd
         assert "gbrain:query" in cmd
         assert "gbrain:brain-ops" in cmd
+        assert "gbrain:enrich" in cmd
         assert "ContextSearch" in cmd
 
 
