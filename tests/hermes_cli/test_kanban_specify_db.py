@@ -41,15 +41,35 @@ def test_specify_promotes_triage_to_todo(kanban_home):
             tid,
             title="Refined: rough idea",
             body="**Goal**\nDo the thing.",
+            assignee="engineer",
             author="specifier-bot",
         )
     assert ok is True
     with kb.connect() as conn:
         task = kb.get_task(conn, tid)
+    assert task is not None
     # No parents → recompute_ready should have flipped it past todo to ready.
     assert task.status == "ready"
     assert task.title == "Refined: rough idea"
+    assert task.assignee == "engineer"
     assert "**Goal**" in (task.body or "")
+
+
+def test_specify_preserves_existing_assignee_when_none_provided(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="rough idea", assignee="researcher")
+    with kb.connect() as conn:
+        ok = kb.specify_triage_task(
+            conn,
+            tid,
+            body="**Goal**\nDo the thing.",
+            author="specifier-bot",
+        )
+    assert ok is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.assignee == "researcher"
 
 
 def test_specify_with_open_parent_lands_in_todo_not_ready(kanban_home):
