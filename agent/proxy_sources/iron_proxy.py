@@ -118,6 +118,13 @@ _DEFAULT_ALLOWED_HOSTS: Tuple[str, ...] = (
 # / Gemini uses ``x-goog-api-key``.  Providers with signatures/OAuth flows
 # stay in ``_NON_BEARER_PROVIDERS`` until we have an explicit transform rule.
 _BEARER_PROVIDERS: Dict[str, Tuple[str, ...]] = {
+    # Anthropic native uses x-api-key instead of Authorization, but iron-proxy's
+    # secrets transform can still swap a sandbox token for the host-side key.
+    # Support both common env names: Hermes/Gary's live runtime uses
+    # ANTHROPIC_TOKEN, while Anthropic SDK examples usually use
+    # ANTHROPIC_API_KEY.
+    "ANTHROPIC_API_KEY": ("api.anthropic.com",),
+    "ANTHROPIC_TOKEN": ("api.anthropic.com",),
     "OPENROUTER_API_KEY": ("openrouter.ai", "*.openrouter.ai"),
     "OPENAI_API_KEY": ("api.openai.com",),
     "GROQ_API_KEY": ("api.groq.com",),
@@ -134,6 +141,8 @@ _BEARER_PROVIDERS: Dict[str, Tuple[str, ...]] = {
 }
 
 _PROVIDER_MATCH_HEADERS: Dict[str, Tuple[str, ...]] = {
+    "ANTHROPIC_API_KEY": ("x-api-key",),
+    "ANTHROPIC_TOKEN": ("Authorization",),
     "GEMINI_API_KEY": ("x-goog-api-key",),
     "GOOGLE_API_KEY": ("x-goog-api-key",),
 }
@@ -149,8 +158,6 @@ _PROVIDER_MATCH_HEADERS: Dict[str, Tuple[str, ...]] = {
 # Bare strings here are env-var names; the proxy doesn't try to wire them up,
 # only flags their presence so the operator knows isolation is incomplete.
 _NON_BEARER_PROVIDERS: Tuple[str, ...] = (
-    # Anthropic native uses x-api-key, not Authorization: Bearer.
-    "ANTHROPIC_API_KEY",
     # Azure OpenAI: api-key header + optional AAD bearer.
     "AZURE_OPENAI_API_KEY",
     # AWS Bedrock / SageMaker: SigV4-signed requests.
@@ -1327,6 +1334,49 @@ def start_proxy(
     return get_status()
 
 
+def _load_hermes_env_values(names: set[str]) -> Dict[str, str]:
+    """Return selected values from <HERMES_HOME>/.env without mutating os.environ.
+
+    The egress proxy intentionally forwards only mapped provider secrets into
+    the child process.  CLI commands may discover those mappings from Hermes'
+    .env file even when the current shell has not exported the variables, so
+    start-up needs the same narrow .env fallback to make the swap work.
+    """
+
+    if not names:
+        return {}
+    try:
+        from hermes_constants import get_hermes_home
+        env_path = get_hermes_home() / ".env"
+    except Exception:  # noqa: BLE001 - best-effort fallback only
+        return {}
+    if not env_path.exists():
+        return {}
+    values: Dict[str, str] = {}
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError:
+        lines = env_path.read_text(encoding="latin-1").splitlines()
+    except OSError:
+        return {}
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in names:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        if value:
+            values[key] = value
+    return values
+
+
 def _build_proxy_subprocess_env(
     *,
     extra_env: Optional[Dict[str, str]] = None,
@@ -1355,11 +1405,16 @@ def _build_proxy_subprocess_env(
 
     # The proxy reads the real upstream secrets from its OWN env, indexed
     # by ``m.real_env_name`` in the YAML config's ``secrets.source.var``
-    # field.  Forward those — but only those.
+    # field.  Forward those — but only those.  Hermes secrets commonly live
+    # in <HERMES_HOME>/.env rather than the operator's shell, so fall back to
+    # that file when the parent process did not export a mapped key.
     needed = {m.real_env_name for m in load_mappings()}
+    env_file_values = _load_hermes_env_values(needed)
     for name in needed:
         if name in parent:
             env[name] = parent[name]
+        elif name in env_file_values:
+            env[name] = env_file_values[name]
 
     # Optional Bitwarden refresh path.  Pulled lazily so the proxy module
     # doesn't hard-depend on the bitwarden module being importable in
