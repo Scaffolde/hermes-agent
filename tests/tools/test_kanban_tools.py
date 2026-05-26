@@ -337,6 +337,39 @@ def test_complete_metadata_round_trips_through_show(worker_env):
     assert shown["runs"][-1]["metadata"] == handoff
 
 
+def test_complete_rejects_code_change_when_summary_says_review_is_needed(worker_env):
+    """If a worker says a code change needs review, kanban_complete must not
+    fake-green the task; it should force the review-required block path.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": (
+            "This is a code change that warrants human review before being "
+            "considered fully shipped, but I will complete it anyway."
+        ),
+        "metadata": {"changed_files": ["docs/SCAFFOLDE-CONSTITUTION.md"]},
+    })
+
+    err = json.loads(out).get("error", "")
+    assert err
+    assert "review-required" in err
+    assert "kanban_comment" in err
+    assert "kanban_block" in err
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        run = kb.latest_run(conn, worker_env)
+        assert task is not None
+        assert run is not None
+        assert task.status == "running"
+        assert run.outcome is None
+    finally:
+        conn.close()
+
+
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
     from tools import kanban_tools as kt
 
