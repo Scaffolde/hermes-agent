@@ -92,11 +92,42 @@ def test_discover_provider_mappings_includes_google_ai_studio_keys(hermes_home):
 
 def test_google_ai_studio_keys_are_not_reported_as_uncovered(hermes_home):
     uncovered = ip.discover_uncovered_providers(
-        available_env_names=["GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"]
+        available_env_names=["GEMINI_API_KEY", "GOOGLE_API_KEY", "AZURE_OPENAI_API_KEY"]
     )
     assert "GEMINI_API_KEY" not in uncovered
     assert "GOOGLE_API_KEY" not in uncovered
-    assert "ANTHROPIC_API_KEY" in uncovered
+    assert "AZURE_OPENAI_API_KEY" in uncovered
+
+
+def test_discover_provider_mappings_includes_anthropic_x_api_key_names(hermes_home):
+    ms = ip.discover_provider_mappings(
+        available_env_names=["ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN"]
+    )
+    by_name = {m.real_env_name: m for m in ms}
+    assert set(by_name) == {"ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN"}
+    assert by_name["ANTHROPIC_API_KEY"].upstream_hosts == ("api.anthropic.com",)
+    assert by_name["ANTHROPIC_TOKEN"].upstream_hosts == ("api.anthropic.com",)
+
+
+def test_build_proxy_config_uses_x_api_key_for_anthropic(tmp_path):
+    m = ip.TokenMapping(
+        proxy_token=ip.mint_proxy_token("anthropic"),
+        real_env_name="ANTHROPIC_TOKEN",
+        upstream_hosts=("api.anthropic.com",),
+    )
+    cfg = ip.build_proxy_config(
+        mappings=[m],
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+    )
+    domains = cfg["transforms"][0]["config"]["domains"]
+    assert "api.anthropic.com" in domains
+    rule = cfg["transforms"][1]["config"]["secrets"][0]
+    assert rule["source"] == {"type": "env", "var": "ANTHROPIC_TOKEN"}
+    assert rule["replace"]["proxy_value"] == m.proxy_token
+    assert rule["replace"]["match_headers"] == ["Authorization"]
+    assert rule["replace"]["match_query"] is True
+    assert rule["rules"] == [{"host": "api.anthropic.com"}]
 
 
 def test_discover_provider_mappings_empty(hermes_home):
@@ -423,11 +454,13 @@ def test_merge_mappings_rotate_mints_fresh_tokens():
 # ---------------------------------------------------------------------------
 
 
-def test_uncovered_providers_detects_anthropic_aws(hermes_home, monkeypatch):
+def test_uncovered_providers_detects_aws_but_not_proxyable_anthropic(hermes_home, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-token-test")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
     uncovered = ip.discover_uncovered_providers()
-    assert "ANTHROPIC_API_KEY" in uncovered
+    assert "ANTHROPIC_API_KEY" not in uncovered
+    assert "ANTHROPIC_TOKEN" not in uncovered
     assert "AWS_ACCESS_KEY_ID" in uncovered
 
 
@@ -812,7 +845,7 @@ def test_subprocess_env_strips_unrelated_secrets(hermes_home, monkeypatch):
     # Unrelated env vars that should NOT propagate.
     monkeypatch.setenv("MY_PRIVATE_TOKEN", "should-not-leak")
     monkeypatch.setenv("DATABASE_URL", "postgres://very-private")
-    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-very-secret")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "***")
     # Provider keys that ARE in load_mappings should propagate.
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-real")
     ip.write_mappings([_sample_mapping("OPENROUTER_API_KEY")])
@@ -822,6 +855,25 @@ def test_subprocess_env_strips_unrelated_secrets(hermes_home, monkeypatch):
     assert "DATABASE_URL" not in env
     assert "SLACK_BOT_TOKEN" not in env
     assert env.get("OPENROUTER_API_KEY") == "sk-or-real"
+
+
+def test_subprocess_env_loads_mapped_secrets_from_hermes_env_file(hermes_home, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+    (hermes_home / ".env").write_text(
+        "ANTHROPIC_TOKEN=sk-ant-from-file\nUNRELATED_TOKEN=do-not-copy\n",
+        encoding="utf-8",
+    )
+    ip.write_mappings([
+        ip.TokenMapping(
+            proxy_token=ip.mint_proxy_token("anthropic"),
+            real_env_name="ANTHROPIC_TOKEN",
+            upstream_hosts=("api.anthropic.com",),
+        )
+    ])
+
+    env = ip._build_proxy_subprocess_env()
+    assert env.get("ANTHROPIC_TOKEN") == "sk-ant-from-file"
+    assert "UNRELATED_TOKEN" not in env
 
 
 def test_subprocess_env_strips_proxy_recursion_vars(hermes_home, monkeypatch):

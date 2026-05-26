@@ -161,6 +161,69 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
+def _completion_says_review_needed(summary: Any, result: Any) -> bool:
+    """Heuristic for workers that explicitly say the work still needs review."""
+    text = " ".join(str(v) for v in (summary, result) if v).lower()
+    if not text:
+        return False
+    review_cues = (
+        "review-required",
+        "review required",
+        "human review",
+        "needs review",
+        "need review",
+        "needs eyes",
+        "need eyes",
+        "pending review",
+        "requires review",
+        "require review",
+    )
+    if any(cue in text for cue in review_cues):
+        return True
+    return "review" in text and "warrant" in text
+
+
+def _metadata_declares_changed_files(metadata: Any) -> bool:
+    """Return True when completion metadata carries concrete file-change evidence."""
+    if not isinstance(metadata, dict):
+        return False
+    changed_files = metadata.get("changed_files")
+    if isinstance(changed_files, str):
+        return bool(changed_files.strip())
+    if isinstance(changed_files, (list, tuple)):
+        return any(str(path).strip() for path in changed_files)
+    return False
+
+
+def _enforce_review_required_completion_guard(
+    task_id: str,
+    *,
+    summary: Any,
+    result: Any,
+    metadata: Any,
+) -> Optional[str]:
+    """Prevent fake-green completion when a worker admits review is still needed.
+
+    This is intentionally narrower than "all changed_files require review" so
+    existing terminal/research handoffs keep working. It catches the dangerous
+    contradiction: a dispatcher-scoped worker reports changed files and says the
+    change warrants human review, then tries to call ``kanban_complete`` anyway.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None
+    if not _metadata_declares_changed_files(metadata):
+        return None
+    if not _completion_says_review_needed(summary, result):
+        return None
+    return tool_error(
+        "kanban_complete blocked: your summary/result says this code change "
+        "needs human review. Per the review-required policy, add the "
+        "structured handoff with kanban_comment first, then call "
+        "kanban_block(reason=\"review-required: <one-line summary>\"). "
+        "Your task is still in-flight (no state change)."
+    )
+
+
 def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
@@ -465,6 +528,14 @@ def _handle_complete(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    review_guard_err = _enforce_review_required_completion_guard(
+        tid,
+        summary=summary,
+        result=result,
+        metadata=metadata,
+    )
+    if review_guard_err:
+        return review_guard_err
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -873,10 +944,13 @@ KANBAN_COMPLETE_SCHEMA = {
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
         "tests_run, decisions, findings, etc). At least one of "
-        "``summary`` or ``result`` is required. If you created new "
-        "tasks via ``kanban_create`` during this run, list their ids "
-        "in ``created_cards`` — the kernel verifies them so phantom "
-        "references are caught before they leak into downstream "
+        "``summary`` or ``result`` is required. If your output is a "
+        "code change that still needs human review, do not call this "
+        "tool: add the structured handoff with ``kanban_comment`` and "
+        "then call ``kanban_block(reason=\"review-required: ...\")``. "
+        "If you created new tasks via ``kanban_create`` during this run, "
+        "list their ids in ``created_cards`` — the kernel verifies them "
+        "so phantom references are caught before they leak into downstream "
         "automation. If you produced deliverable files (charts, PDFs, "
         "spreadsheets, generated images), list their absolute paths "
         "in ``artifacts`` — the gateway notifier will upload them as "

@@ -1,6 +1,7 @@
 """Tests for gateway configuration management."""
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from gateway.config import (
@@ -360,6 +361,44 @@ class TestLoadGatewayConfig:
 
         assert config.platforms[Platform.API_SERVER].enabled is False
         assert Platform.API_SERVER not in config.get_connected_platforms()
+
+    def test_plugin_env_enable_respects_explicit_disabled_platform(self, monkeypatch):
+        """Installed plugins must not override per-profile shared-adapter disables."""
+        from gateway.platform_registry import platform_registry
+
+        fake_entry = SimpleNamespace(
+            name="discord",
+            check_fn=lambda: True,
+            env_enablement_fn=None,
+        )
+        monkeypatch.setattr(
+            platform_registry,
+            "plugin_entries",
+            lambda: [fake_entry],
+        )
+
+        config = GatewayConfig(
+            platforms={Platform.DISCORD: PlatformConfig(enabled=False)}
+        )
+        _apply_env_overrides(config)
+
+        assert config.platforms[Platform.DISCORD].enabled is False
+
+    def test_plugin_env_enable_respects_explicit_disabled_top_level_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  enabled: false\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.DISCORD].enabled is False
 
     def test_bridges_quoted_false_session_notify_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
