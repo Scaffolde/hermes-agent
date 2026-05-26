@@ -1822,6 +1822,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 logger.debug("check_fn for %s raised: %s", entry.name, e)
                 continue
             platform = Platform(entry.name)
+            if (
+                platform in config.platforms
+                and config.platforms[platform].enabled is False
+            ):
+                # Respect explicit YAML/profile disables.  Dependency checks for
+                # plugin platforms answer "can this adapter run?", not "should
+                # this profile claim the shared listener?"  Non-default Hermes
+                # profiles intentionally set shared messaging adapters false so
+                # Kanban/subtask workers do not collide with the default gateway.
+                continue
             existing_cfg = config.platforms.get(platform)
             # Seed candidate extras from ``env_enablement_fn`` so plugins
             # whose ``is_connected`` reads ``config.extra`` (e.g. Google
