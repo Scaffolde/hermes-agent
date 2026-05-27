@@ -3690,8 +3690,10 @@ def resolve_provider_client(
             args = list(creds.get("args") or [])
             # `agy` currently exposes no model-selection flag. Do not inherit
             # the main Hermes model here; that would falsely claim a GPT/Claude
-            # model handled Antigravity output.
-            final_model = model or "antigravity-cli"
+            # model handled Antigravity output.  Hardcoded because the universal
+            # fallback at the top of resolve_provider_client() pre-fills `model`
+            # with the user's main model.
+            final_model = "antigravity-cli"
             from agent.google_antigravity_cli_adapter import GoogleAntigravityCLIClient
 
             client = GoogleAntigravityCLIClient(
