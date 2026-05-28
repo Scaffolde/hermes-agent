@@ -133,7 +133,12 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "aiohttp==3.13.4",  # CVE-2026-34513/34518/34519/34520/34525
     ),
     "platform.matrix": (
-        "mautrix[encryption]==0.21.0",
+        # Keep the default Matrix backend plaintext-capable. The encryption
+        # extra pulls python-olm, whose sdists are not buildable on modern
+        # macOS without libolm/toolchain work; installing it unconditionally
+        # made `hermes update` fail during lazy backend refresh even when
+        # MATRIX_ENCRYPTION was not enabled.
+        "mautrix==0.21.0",
         "Markdown==3.10.2",
         "aiosqlite==0.22.1",
         "asyncpg==0.31.0",
