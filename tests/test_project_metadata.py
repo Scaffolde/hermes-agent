@@ -19,19 +19,25 @@ def _load_package_data():
 
 
 def test_matrix_extra_not_in_all():
-    """The [matrix] extra pulls `mautrix[encryption]` -> `python-olm`,
-    which has Linux-only wheels and no native build path on Windows or
-    modern macOS (archived libolm, C++ errors with Clang 21+).
+    """The Matrix E2EE stack pulls `mautrix[encryption]` -> `python-olm`,
+    which has Linux-only wheels and no native build path on Windows or modern
+    macOS (archived libolm, C++ errors with Clang 21+).
 
-    With matrix in [all], `uv sync --locked` on Windows tried to build
-    python-olm from sdist and failed on `make`. As of 2026-05-12 the
+    With encrypted Matrix deps in [all], `uv sync --locked` on Windows tried
+    to build python-olm from sdist and failed on `make`. As of 2026-05-12 the
     [matrix] extra is excluded from [all] entirely and routed through
     `tools/lazy_deps.py` (LAZY_DEPS["platform.matrix"]) — installs at
-    first use, where the user is expected to have a toolchain.
+    first use. As of 2026-05-28, that default Matrix install must remain
+    plaintext-capable and must not pull python-olm unless encryption is
+    explicitly enabled.
     """
     optional_dependencies = _load_optional_dependencies()
 
     assert "matrix" in optional_dependencies, "[matrix] extra must still exist for explicit `pip install hermes-agent[matrix]`"
+    assert all("mautrix[encryption]" not in dep for dep in optional_dependencies["matrix"]), (
+        "[matrix] must stay plaintext-capable. Do not pull python-olm via "
+        "mautrix[encryption] unless MATRIX_ENCRYPTION is explicitly enabled."
+    )
     # Must NOT appear in [all] in any form — neither unconditional nor
     # platform-gated. Lazy-install handles it.
     matrix_in_all = [
