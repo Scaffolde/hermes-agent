@@ -5424,7 +5424,13 @@ class GatewayRunner:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
-        disabled_corrupt_boards: dict[str, tuple[str, int | None, int | None]] = {}
+        # Avoid hot-looping corrupt-looking board DBs, but do not suppress
+        # same-fingerprint retries forever: transient WAL/open races can
+        # surface as "database disk image is malformed" for one tick.
+        CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
+        disabled_corrupt_boards: dict[
+            str, tuple[tuple[str, int | None, int | None], float]
+        ] = {}
 
         def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
             path = _kb.kanban_db_path(slug)
@@ -5439,6 +5445,9 @@ class GatewayRunner:
             return (resolved, stat.st_mtime_ns, stat.st_size)
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
+            corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
+            if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
+                return True
             if not isinstance(exc, sqlite3.DatabaseError):
                 return False
             msg = str(exc).lower()
@@ -5458,14 +5467,27 @@ class GatewayRunner:
             """
             conn = None
             fingerprint = _board_db_fingerprint(slug)
-            disabled_fingerprint = disabled_corrupt_boards.get(slug)
-            if disabled_fingerprint == fingerprint:
-                return None
-            if disabled_fingerprint is not None:
-                logger.info(
-                    "kanban dispatcher: board %s database changed; retrying dispatch",
-                    slug,
-                )
+            disabled_entry = disabled_corrupt_boards.get(slug)
+            if disabled_entry is not None:
+                disabled_fingerprint, disabled_at = disabled_entry
+                age = time.monotonic() - disabled_at
+                if (
+                    disabled_fingerprint == fingerprint
+                    and age < CORRUPT_BOARD_RETRY_AFTER_SECONDS
+                ):
+                    return None
+                if disabled_fingerprint == fingerprint:
+                    logger.info(
+                        "kanban dispatcher: board %s database fingerprint unchanged "
+                        "after %.0fs quarantine; retrying dispatch",
+                        slug,
+                        age,
+                    )
+                else:
+                    logger.info(
+                        "kanban dispatcher: board %s database changed; retrying dispatch",
+                        slug,
+                    )
                 disabled_corrupt_boards.pop(slug, None)
             try:
                 conn = _kb.connect(board=slug)
@@ -5485,20 +5507,32 @@ class GatewayRunner:
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = fingerprint
+                    disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
                     logger.error(
                         "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; disabling dispatch for this board "
-                        "until the file changes or the gateway restarts. Move "
-                        "or restore the file, then run `hermes kanban init` if "
-                        "you need a fresh board.",
+                        "SQLite database; pausing dispatch for this board until "
+                        "the file changes, the gateway restarts, or the "
+                        "quarantine timer expires. Move or restore the file, "
+                        "then run `hermes kanban init` if you need a fresh board.",
                         slug,
                         fingerprint[0],
                     )
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
-            except Exception:
+            except Exception as exc:
+                if _is_corrupt_board_db_error(exc):
+                    disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
+                    logger.error(
+                        "kanban dispatcher: board %s database %s is not a valid "
+                        "SQLite database; pausing dispatch for this board until "
+                        "the file changes, the gateway restarts, or the "
+                        "quarantine timer expires. Move or restore the file, "
+                        "then run `hermes kanban init` if you need a fresh board.",
+                        slug,
+                        fingerprint[0],
+                    )
+                    return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
             finally:
@@ -5657,6 +5691,19 @@ class GatewayRunner:
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
         while self._running:
+            try:
+                # Reap zombie children before per-board work so a board DB
+                # failure cannot block cleanup of unrelated workers.
+                pids = await asyncio.to_thread(_kb.reap_worker_zombies)
+                if pids:
+                    logger.info(
+                        "kanban dispatcher: reaped %d zombie worker(s), pids=%s",
+                        len(pids),
+                        pids,
+                    )
+            except Exception:
+                logger.exception("kanban dispatcher: zombie reaper failed")
+
             try:
                 if auto_decompose_enabled:
                     await asyncio.to_thread(_auto_decompose_tick)
@@ -7970,7 +8017,8 @@ class GatewayRunner:
                                 "🎤 I received your voice message but can't transcribe it — "
                                 "no speech-to-text provider is configured.\n\n"
                                 "To enable voice: install faster-whisper "
-                                "(`pip install faster-whisper` in the Hermes venv) "
+                                "(`uv pip install faster-whisper` in the Hermes venv; "
+                                "`pip install faster-whisper` also works if pip is on PATH) "
                                 "and set `stt.enabled: true` in config.yaml, "
                                 "then /restart the gateway."
                             )
@@ -11768,6 +11816,7 @@ class GatewayRunner:
                     session_id=task_id,
                     platform=platform_key,
                     user_id=source.user_id,
+                    user_id_alt=source.user_id_alt,
                     user_name=source.user_name,
                     chat_id=source.chat_id,
                     chat_name=source.chat_name,
@@ -15070,6 +15119,29 @@ class GatewayRunner:
             out["tools.registry_generation"] = getattr(registry, "_generation", None)
         except Exception:
             out["tools.registry_generation"] = None
+
+        # Honcho identity-mapping keys live in honcho.json, not user_config.
+        # HonchoSessionManager freezes the resolved peer_name / ai_peer /
+        # pin / aliases / prefix at construction; without busting here,
+        # mid-flight honcho.json edits go unread until the next unrelated
+        # cache eviction.
+        try:
+            from plugins.memory.honcho.client import HonchoClientConfig
+
+            hcfg = HonchoClientConfig.from_global_config()
+            out["honcho.peer_name"] = hcfg.peer_name
+            out["honcho.ai_peer"] = hcfg.ai_peer
+            out["honcho.pin_peer_name"] = bool(hcfg.pin_peer_name)
+            out["honcho.runtime_peer_prefix"] = hcfg.runtime_peer_prefix or ""
+            aliases = hcfg.user_peer_aliases or {}
+            out["honcho.user_peer_aliases"] = sorted(aliases.items()) if isinstance(aliases, dict) else []
+        except Exception:
+            out["honcho.peer_name"] = None
+            out["honcho.ai_peer"] = None
+            out["honcho.pin_peer_name"] = None
+            out["honcho.runtime_peer_prefix"] = None
+            out["honcho.user_peer_aliases"] = None
+
         return out
 
     @staticmethod
@@ -15079,6 +15151,8 @@ class GatewayRunner:
         enabled_toolsets: list,
         ephemeral_prompt: str,
         cache_keys: dict | None = None,
+        user_id: str | None = None,
+        user_id_alt: str | None = None,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -15092,6 +15166,20 @@ class GatewayRunner:
         the output of ``_extract_cache_busting_config(user_config)`` so
         edits to model.context_length / compression.* in config.yaml are
         picked up on the next gateway message without a manual restart.
+
+        ``user_id`` and ``user_id_alt`` are the runtime user identities
+        carried by the current message's gateway source.  They participate
+        in the cache key because the Honcho memory provider freezes them
+        into ``HonchoSessionManager`` at first-message init (see
+        ``plugins/memory/honcho/__init__.py::_do_session_init``).  Without
+        them in the signature, a shared-thread session_key (one in which
+        ``build_session_key`` intentionally omits the participant ID,
+        e.g. ``thread_sessions_per_user=False``) would reuse the cached
+        AIAgent across distinct users, causing the second user's messages
+        to be attributed to the first user's resolved Honcho peer.  This
+        broke #27371's per-user-peer contract in multi-user gateways.
+        Per-user agent rebuilds in shared threads trade prompt-cache
+        warmth for correct memory attribution.
         """
         import hashlib, json as _j
 
@@ -15116,6 +15204,8 @@ class GatewayRunner:
                 # cached agent and doesn't affect system prompt or tools.
                 ephemeral_prompt or "",
                 _cache_keys_sorted,
+                str(user_id or ""),
+                str(user_id_alt or ""),
             ],
             sort_keys=True,
             default=str,
@@ -16657,6 +16747,8 @@ class GatewayRunner:
                 enabled_toolsets,
                 combined_ephemeral,
                 cache_keys=self._extract_cache_busting_config(user_config),
+                user_id=getattr(source, "user_id", None),
+                user_id_alt=getattr(source, "user_id_alt", None),
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -16700,6 +16792,7 @@ class GatewayRunner:
                     session_id=session_id,
                     platform=platform_key,
                     user_id=source.user_id,
+                    user_id_alt=source.user_id_alt,
                     user_name=source.user_name,
                     chat_id=source.chat_id,
                     chat_name=source.chat_name,
@@ -18100,6 +18193,72 @@ class GatewayRunner:
         return response
 
 
+def _run_planned_stop_watcher(
+    stop_event: threading.Event,
+    runner,
+    loop: asyncio.AbstractEventLoop,
+    shutdown_handler,
+    *,
+    poll_interval: float = 0.5,
+) -> None:
+    """Poll for the planned-stop marker and trigger graceful shutdown.
+
+    On Windows, ``asyncio.add_signal_handler`` raises NotImplementedError
+    for SIGTERM/SIGINT, so the standard signal-driven shutdown path
+    never runs when ``hermes gateway stop`` signals the gateway. The
+    consequence is that the drain loop is skipped — in-flight agent
+    sessions are killed mid-turn and ``resume_pending`` is never set,
+    so the next gateway boot has no idea those sessions need to be
+    auto-resumed (issue #33778, v0.13.0 session-resume feature broken
+    on native Windows).
+
+    This watcher runs on every platform (cheap, defensive) and bridges
+    the gap on Windows by translating a filesystem marker into the
+    same shutdown-handler invocation a real SIGTERM would have produced
+    on POSIX. The CLI's ``hermes_cli.gateway_windows.stop()`` writes
+    the marker via ``write_planned_stop_marker(pid)`` and then waits
+    for the gateway PID to exit; this watcher is what makes that
+    exit happen cleanly.
+
+    On POSIX this is a no-op safety net — the signal handler always
+    races us to consuming the marker file because it fires synchronously
+    from the kernel's signal delivery.
+
+    Args:
+        stop_event: cleared by start_gateway() during normal shutdown
+            to tell the watcher to exit.
+        runner: the GatewayRunner instance; we check ``_running`` and
+            ``_draining`` to avoid triggering shutdown if the gateway
+            is already in one of those states.
+        loop: the asyncio event loop the shutdown handler must run on.
+        shutdown_handler: same callable that's wired to SIGTERM —
+            tolerates a ``None`` signal argument (planned stop case)
+            and consumes the marker via
+            ``consume_planned_stop_marker_for_self()``.
+        poll_interval: seconds between marker checks. 0.5s gives a
+            responsive shutdown without burning CPU.
+    """
+    from gateway.status import _get_planned_stop_marker_path
+    marker_path = _get_planned_stop_marker_path()
+    while not stop_event.is_set():
+        try:
+            if (
+                marker_path.exists()
+                and not getattr(runner, "_draining", False)
+                and getattr(runner, "_running", False)
+            ):
+                # Drive the same path as a real signal handler.
+                # Pass signal=None — the handler tolerates that and consumes
+                # the marker via consume_planned_stop_marker_for_self,
+                # which also validates target_pid + start_time match us.
+                loop.call_soon_threadsafe(shutdown_handler, None)
+                # Done — the handler will set _draining; we exit on next tick.
+                break
+        except Exception as _e:
+            logger.debug("Planned-stop watcher tick error: %s", _e)
+        stop_event.wait(poll_interval)
+
+
 def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
     """
     Background thread that ticks the cron scheduler at a regular interval.
@@ -18504,7 +18663,28 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 pass
     else:
         logger.info("Skipping signal handlers (not running in main thread).")
-    
+
+    # Windows fallback: asyncio.add_signal_handler raises NotImplementedError
+    # on Windows, so `hermes gateway stop`'s SIGTERM (which Python maps to
+    # TerminateProcess on Windows) never invokes shutdown_signal_handler.
+    # That means the drain loop never runs, mark_resume_pending never fires,
+    # and sessions are silently lost across restarts (issue #33778).
+    #
+    # The fix is a marker-polling thread: `hermes gateway stop` writes the
+    # planned-stop marker BEFORE killing, and this thread notices it and
+    # drives the same shutdown path the signal handler would have.  Runs
+    # on every platform (cheap, defensive) so non-signal-bearing
+    # environments (Windows native, sandboxed CI runners that mask
+    # SIGTERM) still get a clean drain.
+    _planned_stop_watcher_stop = threading.Event()
+    _planned_stop_watcher_thread = threading.Thread(
+        target=_run_planned_stop_watcher,
+        args=(_planned_stop_watcher_stop, runner, loop, shutdown_signal_handler),
+        daemon=True,
+        name="planned-stop-watcher",
+    )
+    _planned_stop_watcher_thread.start()
+
     # Claim the PID file BEFORE bringing up any platform adapters.
     # This closes the --replace race window: two concurrent `gateway run
     # --replace` invocations both pass the termination-wait above, but
@@ -18581,6 +18761,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Stop cron ticker cleanly
     cron_stop.set()
     cron_thread.join(timeout=5)
+
+    # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
+    _planned_stop_watcher_stop.set()
+    _planned_stop_watcher_thread.join(timeout=2)
 
     # Close MCP server connections
     try:
