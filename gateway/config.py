@@ -1843,6 +1843,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             # Teams, LINE, ntfy, Simplex) are unaffected; this only
             # restores Google Chat.
             seed_for_probe = None
+            if platform not in config.platforms:
+                config.platforms[platform] = PlatformConfig()
+            config.platforms[platform].enabled = True
+            # Seed extras from env if the plugin opted in.
             if entry.env_enablement_fn is not None:
                 try:
                     seed_for_probe = entry.env_enablement_fn()

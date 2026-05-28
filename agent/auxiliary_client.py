@@ -3694,6 +3694,8 @@ def resolve_provider_client(
             # fallback at the top of resolve_provider_client() pre-fills `model`
             # with the user's main model.
             final_model = "antigravity-cli"
+            # model handled Antigravity output.
+            final_model = model or "antigravity-cli"
             from agent.google_antigravity_cli_adapter import GoogleAntigravityCLIClient
 
             client = GoogleAntigravityCLIClient(
