@@ -2,7 +2,7 @@
 
 Connects to any Matrix homeserver (self-hosted or matrix.org) via the
 mautrix Python SDK.  Supports optional end-to-end encryption (E2EE)
-when installed with ``pip install "mautrix[encryption]"``.
+when the optional ``mautrix[encryption]`` / libolm stack is installed.
 
 Environment variables:
     MATRIX_HOMESERVER           Homeserver URL (e.g. https://matrix.example.org)
@@ -240,7 +240,7 @@ def _check_e2ee_deps() -> bool:
 def check_matrix_requirements() -> bool:
     """Return True if the Matrix adapter can be used.
 
-    Lazy-installs the full ``platform.matrix`` feature group via
+    Lazy-installs the plaintext-capable ``platform.matrix`` feature group via
     ``tools.lazy_deps.ensure_and_bind`` whenever any of the declared
     packages (mautrix, Markdown, aiosqlite, asyncpg, aiohttp-socks) is
     missing — not just mautrix itself.  Previously this short-circuited on
@@ -261,8 +261,9 @@ def check_matrix_requirements() -> bool:
 
     # Check whether any package in the platform.matrix feature group is
     # missing.  ``feature_missing`` is cheap (per-spec importlib.metadata
-    # lookups) and correctly handles ``mautrix[encryption]`` by stripping
-    # the extras marker before checking the bare package.
+    # lookups).  Do not install ``mautrix[encryption]`` here: that pulls
+    # python-olm and breaks `hermes update` refreshes on modern macOS for
+    # users who have not enabled MATRIX_ENCRYPTION.
     try:
         from tools.lazy_deps import feature_missing, ensure_and_bind
         missing = feature_missing("platform.matrix")
@@ -296,7 +297,7 @@ def check_matrix_requirements() -> bool:
         if not ensure_and_bind("platform.matrix", _import, globals(), prompt=False):
             logger.warning(
                 "Matrix: required packages not installed (%s). "
-                "Run: pip install 'mautrix[encryption]' asyncpg aiosqlite "
+                "Run: pip install mautrix asyncpg aiosqlite "
                 "Markdown aiohttp-socks",
                 ", ".join(missing) if missing else "platform.matrix",
             )
