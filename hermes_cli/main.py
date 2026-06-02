@@ -7800,13 +7800,16 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
-    # Fetch only the branch we compare against; prefer upstream as the canonical
-    # reference. A bare `git fetch <remote>` pulls every ref, and this repo has
-    # thousands of auto-generated branches, so scope the fetch to <branch>.
-    # Note: upstream/<branch> may not exist for non-main branches (a fork's
-    # bb/gui has no upstream counterpart), so when the caller picks a
-    # non-default branch we skip the upstream probe and use origin directly.
-    if branch == "main":
+    origin_url = _get_origin_url(git_cmd, PROJECT_ROOT)
+    is_fork = _is_fork(origin_url)
+
+    # Fetch only the branch we compare against. A bare `git fetch <remote>` pulls
+    # every ref, and this repo has thousands of auto-generated branches, so scope
+    # the fetch to <branch>. For maintained forks, --check should answer the same
+    # question `hermes update` will act on: is this install behind origin/<branch>?
+    # Upstream divergence is informational; it must not become a false local
+    # update nag or imply a Nous PR.
+    if branch == "main" and not is_fork:
         print("→ Fetching from upstream...")
         fetch_result = subprocess.run(
             git_cmd + ["fetch", "upstream", branch],
