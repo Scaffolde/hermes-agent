@@ -6419,13 +6419,17 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return
 
-    # If origin/main has commits not on upstream, don't trample
+    # If origin/main has fork-local commits not on upstream, don't trample them.
+    # This is a maintained-fork/local-patch workflow, not an instruction to open
+    # a PR against NousResearch. `hermes update` follows origin/main and leaves
+    # upstream reconciliation to the fork maintainer.
     if origin_ahead > 0:
         print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
+        print(f"ℹ Your fork has {origin_ahead} local commit(s) not on upstream.")
+        if upstream_ahead > 0:
+            print(f"  Upstream has {upstream_ahead} commit(s) not merged into this fork.")
+        print("  Leaving the fork/local patch stack intact; no upstream PR is required.")
+        print("  Hermes updates will continue to track origin/main for this install.")
         return
 
     # If upstream is not ahead, fork is up to date
