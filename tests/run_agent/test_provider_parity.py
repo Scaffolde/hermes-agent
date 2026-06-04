@@ -1013,9 +1013,10 @@ class TestAuxiliaryClientProviderPriority:
 
     def test_openrouter_always_wins(self, monkeypatch):
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-        from agent.auxiliary_client import get_text_auxiliary_client
+        from agent import auxiliary_client
+        auxiliary_client._reset_aux_unhealthy_cache()
         with patch("agent.auxiliary_client.OpenAI") as mock:
-            client, model = get_text_auxiliary_client()
+            client, model = auxiliary_client.get_text_auxiliary_client()
         assert model == "google/gemini-3-flash-preview"
         assert "openrouter" in str(mock.call_args.kwargs["base_url"]).lower()
 
