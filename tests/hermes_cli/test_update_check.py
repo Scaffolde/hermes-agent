@@ -18,20 +18,26 @@ def test_version_string_no_v_prefix():
 
 def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     """When cache is fresh, check_for_updates should return cached value without calling git."""
-    from hermes_cli.banner import check_for_updates
+    import hermes_cli.banner as banner
     from hermes_cli import __version__
 
-    # Create a fake git repo and fresh cache
+    # Create a fake git repo and fresh cache.  The cache-state helper is
+    # isolated here so this legacy cache test does not depend on the live
+    # checkout that imported banner.py.
     repo_dir = tmp_path / "hermes-agent"
-    repo_dir.mkdir()
+    (repo_dir / "hermes_cli").mkdir(parents=True)
+    (repo_dir / "hermes_cli" / "banner.py").touch()
     (repo_dir / ".git").mkdir()
 
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3, "ver": __version__}))
+    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3, "ver": __version__, "git": {}}))
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(banner, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(banner, "__file__", str(repo_dir / "hermes_cli" / "banner.py"))
+    monkeypatch.setattr(banner, "_local_git_cache_state", lambda _repo_dir: {})
     with patch("hermes_cli.banner.subprocess.run") as mock_run:
-        result = check_for_updates()
+        result = banner.check_for_updates()
 
     assert result == 3
     mock_run.assert_not_called()
@@ -76,10 +82,11 @@ def test_check_for_updates_invalidates_on_version_change(tmp_path, monkeypatch):
 
 def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
     """When cache is expired, check_for_updates should call git fetch."""
-    from hermes_cli.banner import check_for_updates
+    import hermes_cli.banner as banner
 
     repo_dir = tmp_path / "hermes-agent"
-    repo_dir.mkdir()
+    (repo_dir / "hermes_cli").mkdir(parents=True)
+    (repo_dir / "hermes_cli" / "banner.py").touch()
     (repo_dir / ".git").mkdir()
 
     # Write an expired cache (timestamp far in the past)
@@ -89,8 +96,11 @@ def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
     mock_result = MagicMock(returncode=0, stdout="5\n")
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(banner, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(banner, "__file__", str(repo_dir / "hermes_cli" / "banner.py"))
+    monkeypatch.setattr(banner, "_local_git_cache_state", lambda _repo_dir: {})
     with patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run:
-        result = check_for_updates()
+        result = banner.check_for_updates()
 
     assert result == 5
     assert mock_run.call_count == 3  # origin probe + git fetch + git rev-list
