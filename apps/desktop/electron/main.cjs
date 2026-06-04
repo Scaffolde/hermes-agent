@@ -9,6 +9,7 @@ const {
   nativeImage,
   nativeTheme,
   net: electronNet,
+  powerMonitor,
   protocol,
   safeStorage,
   session,
@@ -23,7 +24,7 @@ const net = require('node:net')
 const path = require('node:path')
 const { fileURLToPath, pathToFileURL } = require('node:url')
 const { execFileSync, spawn } = require('node:child_process')
-const { isWindowsBinaryPathInWsl, isWslEnvironment } = require('./bootstrap-platform.cjs')
+const { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } = require('./bootstrap-platform.cjs')
 const { runBootstrap } = require('./bootstrap-runner.cjs')
 const { canImportHermesCli, verifyHermesCli } = require('./backend-probes.cjs')
 const {
@@ -73,6 +74,26 @@ const IS_MAC = process.platform === 'darwin'
 const IS_WINDOWS = process.platform === 'win32'
 const IS_WSL = isWslEnvironment()
 const APP_ROOT = app.getAppPath()
+
+// Remote displays (SSH X11 forwarding, VNC, RDP) make Chromium's GPU
+// compositor flicker — accelerated layers can't be presented cleanly over the
+// wire, so the window flashes during scroll/streaming/animation. Local
+// Windows/macOS (and WSLg, which renders locally via vGPU) composite on the
+// GPU and never see it. Fall back to software rendering when a remote display
+// is detected; it's rock-steady over the wire and the CPU cost is negligible
+// next to the connection's latency. Must run before app `ready` — these
+// switches only apply pre-launch. Override with HERMES_DESKTOP_DISABLE_GPU
+// (1/true → always disable, 0/false → keep GPU on).
+const REMOTE_DISPLAY_REASON = detectRemoteDisplay()
+if (REMOTE_DISPLAY_REASON) {
+  app.disableHardwareAcceleration()
+  // Belt-and-suspenders for X11/VNC, where the Viz compositor can still glitch
+  // with only --disable-gpu: force compositing onto the CPU too.
+  app.commandLine.appendSwitch('disable-gpu-compositing')
+  console.log(
+    `[hermes] remote display detected (${REMOTE_DISPLAY_REASON}); disabling GPU hardware acceleration to prevent flicker`
+  )
+}
 const SOURCE_REPO_ROOT = path.resolve(APP_ROOT, '../..')
 
 // Build-time install stamp -- the git ref this .exe was built against.
@@ -445,6 +466,10 @@ let bootstrapFailure = null
 // Active first-launch install, so the renderer's Cancel button (and app quit)
 // can abort the in-flight install.sh/ps1 instead of leaving it running.
 let bootstrapAbortController = null
+// Set by the renderer's "Repair install" IPC. While true, resolution skips the
+// existing-install adopt branch (3b) so repair re-drives the installer instead
+// of re-adopting the install we're repairing. Cleared once a bootstrap runs.
+let forceBootstrapRepair = false
 let connectionConfigCache = null
 const hermesLog = []
 const previewWatchers = new Map()
@@ -698,7 +723,7 @@ function broadcastBootstrapEvent(ev) {
       error: ev.error ?? null
     }
   } else if (ev.type === 'log') {
-    bootstrapState.log.push({ ts: Date.now(), stage: ev.stage || null, line: ev.line })
+    bootstrapState.log.push({ ts: Date.now(), stage: ev.stage || null, line: ev.line, stream: ev.stream || 'stdout' })
     if (bootstrapState.log.length > BOOTSTRAP_LOG_RING_MAX) {
       bootstrapState.log.splice(0, bootstrapState.log.length - BOOTSTRAP_LOG_RING_MAX)
     }
@@ -1295,16 +1320,34 @@ async function applyUpdates(opts = {}) {
 
     emitUpdateProgress({ stage: 'restart', message: 'Handing off to the Hermes updater…', percent: 100 })
 
+    const updateRoot = resolveUpdateRoot()
+    const { branch: configuredBranch } = readDesktopUpdateConfig()
+    const branch = await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
+    const updaterArgs = ['--update', '--branch', branch]
+    const targetApp = IS_MAC ? runningAppBundle() : null
+    if (targetApp) {
+      updaterArgs.push('--target-app', targetApp)
+    }
+    const venvBin = path.join(updateRoot, 'venv', IS_WINDOWS ? 'Scripts' : 'bin')
+
     // Detached so the updater outlives this process — it needs us GONE before
     // `hermes update` will run (the venv shim is locked while we live).
-    const child = spawn(updater, ['--update'], {
+    const child = spawn(updater, updaterArgs, {
+      cwd: HERMES_HOME,
+      env: {
+        ...process.env,
+        HERMES_HOME,
+        PATH: [path.join(HERMES_HOME, 'node', 'bin'), venvBin, process.env.PATH]
+          .filter(Boolean)
+          .join(path.delimiter)
+      },
       detached: true,
       stdio: 'ignore',
       windowsHide: false
     })
     child.unref()
 
-    rememberLog(`[updates] launched updater: ${updater} --update; exiting desktop to release venv shim`)
+    rememberLog(`[updates] launched updater: ${updater} ${updaterArgs.join(' ')}; exiting desktop to release venv shim`)
 
     // Give the OS a beat to register the new process, then quit. The updater
     // rebuilds and relaunches us when it's done.
@@ -1386,6 +1429,18 @@ async function applyUpdatesPosixInApp(opts = {}) {
   const env = {
     HERMES_HOME,
     PATH: [extraPath, process.env.PATH].filter(Boolean).join(path.delimiter)
+  }
+
+  // `hermes update` reaps stale `hermes dashboard` backends (a code update
+  // leaves the running process serving old Python against the freshly-updated
+  // JS bundle). But OUR backend is one of those processes, and killing it
+  // mid-update produces the boot→kill→crash loop in #37532 — the desktop
+  // already restarts its own backend via the rebuild+relaunch below, so the
+  // reap must spare it. Hand the live backend's PID to the update process;
+  // _kill_stale_dashboard_processes reads HERMES_DESKTOP_CHILD_PID and excludes
+  // it while still reaping any genuinely-orphaned dashboards. (#37532)
+  if (hermesProcess && Number.isInteger(hermesProcess.pid)) {
+    env.HERMES_DESKTOP_CHILD_PID = String(hermesProcess.pid)
   }
 
   // Branch-pin so a non-main checkout doesn't get switched to main (and self-heal
@@ -1506,8 +1561,12 @@ function readJson(filePath) {
 // Marker schema (version 1):
 //   {
 //     schemaVersion: 1,
-//     pinnedCommit: "<40-char SHA>",       // what install.ps1 was driven against
+//     pinnedCommit: "<40-char SHA>" | null, // what install.ps1 was driven against;
+//                                           // may be null for adopted installs
 //     pinnedBranch: "<branch name>" | null,
+//     adopted: <bool>,                      // true when we adopted a pre-existing
+//                                           // install rather than bootstrapping it;
+//                                           // treated as authoritative even sans commit
 //     completedAt:  "<ISO 8601>",
 //     desktopVersion: "<app.getVersion()>"  // for forensics
 //   }
@@ -1515,11 +1574,25 @@ function readBootstrapMarker() {
   return readJson(BOOTSTRAP_COMPLETE_MARKER)
 }
 
+// Marker-independent: is the canonical install at ACTIVE_HERMES_ROOT actually
+// runnable right now? A complete CLI install (`install.sh --include-desktop`)
+// or a DMG launch over a prior CLI install satisfies this WITHOUT the desktop
+// ever having written the bootstrap marker -- so we must be able to recognise
+// "already installed" off the filesystem alone, not just the marker.
+function isActiveRuntimeUsable() {
+  return isHermesSourceRoot(ACTIVE_HERMES_ROOT) && fileExists(getVenvPython(VENV_ROOT))
+}
+
 function isBootstrapComplete() {
   const marker = readBootstrapMarker()
   if (!marker || typeof marker !== 'object') return false
   if (marker.schemaVersion !== BOOTSTRAP_MARKER_SCHEMA_VERSION) return false
-  if (typeof marker.pinnedCommit !== 'string' || marker.pinnedCommit.length < 7) return false
+  if (typeof marker.pinnedCommit !== 'string' || marker.pinnedCommit.length < 7) {
+    // Adopted markers (an existing install we detected and took ownership of,
+    // possibly without a resolvable commit) are still authoritative -- they
+    // attest a runnable install we deliberately decided to forward to.
+    if (marker.adopted !== true) return false
+  }
   // We DELIBERATELY do NOT verify that the checkout is currently at the
   // pinned commit -- users update via the in-app update path or `hermes
   // update`, which moves HEAD legitimately. The marker just attests "we
@@ -1527,7 +1600,22 @@ function isBootstrapComplete() {
   // a runnable venv: an interrupted or split-home install can leave the marker
   // + checkout without a venv, and trusting that spawns a dead backend
   // ("gateway offline") instead of re-running bootstrap to repair it.
-  return isHermesSourceRoot(ACTIVE_HERMES_ROOT) && fileExists(getVenvPython(VENV_ROOT))
+  return isActiveRuntimeUsable()
+}
+
+// HEAD commit of ACTIVE_HERMES_ROOT so an adopted marker carries the same
+// provenance a freshly-bootstrapped one would. null when git is unavailable or
+// the root isn't a checkout -- the marker stays valid via its `adopted` flag.
+function readActiveHeadCommit() {
+  try {
+    const sha = execFileSync(resolveGitBinary(), ['-C', ACTIVE_HERMES_ROOT, 'rev-parse', 'HEAD'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    }).trim()
+    return /^[0-9a-f]{7,40}$/i.test(sha) ? sha : null
+  } catch {
+    return null
+  }
 }
 
 function writeBootstrapMarker(payload) {
@@ -1536,6 +1624,7 @@ function writeBootstrapMarker(payload) {
     schemaVersion: BOOTSTRAP_MARKER_SCHEMA_VERSION,
     pinnedCommit: payload.pinnedCommit || null,
     pinnedBranch: payload.pinnedBranch || null,
+    adopted: Boolean(payload.adopted),
     completedAt: new Date().toISOString(),
     desktopVersion: app.getVersion()
   }
@@ -1690,6 +1779,24 @@ function resolveHermesBackend(dashboardArgs) {
   //    to spawning hermes. Updates flow through the in-app update path
   //    (applyUpdates -> git pull) or `hermes update` from the CLI.
   if (isBootstrapComplete()) {
+    return createActiveBackend(dashboardArgs)
+  }
+
+  // 3b. Existing-but-unmarked install at ACTIVE_HERMES_ROOT. The marker is
+  //     written only by OUR bootstrap, so a runtime from `install.sh
+  //     --include-desktop` (or a DMG launch over a prior CLI install) is
+  //     runnable yet markerless -- without this we'd fall to step 6 and re-run
+  //     the WHOLE install on top of a working one. ACTIVE_HERMES_ROOT is our
+  //     canonical location (unlike a random `hermes` on PATH), so adopt it:
+  //     stamp the marker once and forward straight to the app. Repair skips
+  //     this so a broken-but-present venv still gets rebuilt.
+  if (!forceBootstrapRepair && isActiveRuntimeUsable()) {
+    rememberLog(`[bootstrap] adopting existing install at ${ACTIVE_HERMES_ROOT}; skipping first-launch setup`)
+    try {
+      writeBootstrapMarker({ pinnedCommit: readActiveHeadCommit(), pinnedBranch: null, adopted: true })
+    } catch (err) {
+      rememberLog(`[bootstrap] could not stamp adopted marker: ${err.message}`)
+    }
     return createActiveBackend(dashboardArgs)
   }
 
@@ -1883,6 +1990,9 @@ async function ensureRuntime(backend) {
     }
 
     rememberLog('[bootstrap] bootstrap complete; marker written. Re-resolving backend.')
+    // A repair (if any) has now re-run, so clear the gate -- the re-resolution
+    // below SHOULD land on the fresh marker fast-path rather than skip it.
+    forceBootstrapRepair = false
     // Re-resolve now that the install exists. The new resolution lands in
     // step 3 (bootstrap-complete marker) and we recurse to wire venvPython.
     return ensureRuntime(resolveHermesBackend(backend.args))
@@ -2584,6 +2694,32 @@ function sendClosePreviewRequested() {
   webContents.send('hermes:close-preview-requested')
 }
 
+// Tell the renderer the machine just woke. Sleep silently drops the
+// renderer's WebSocket to the local backend; the renderer reconnects on this
+// signal so the chat composer doesn't stay stuck on "Starting Hermes...".
+function sendPowerResume() {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  const { webContents } = mainWindow
+  if (!webContents || webContents.isDestroyed()) return
+  webContents.send('hermes:power-resume')
+}
+
+let powerResumeRegistered = false
+
+function registerPowerResumeListeners() {
+  if (powerResumeRegistered) return
+  powerResumeRegistered = true
+  try {
+    // 'resume' covers sleep/wake; 'unlock-screen' covers lock/unlock without a
+    // full suspend. Either can drop an idle socket.
+    powerMonitor.on('resume', sendPowerResume)
+    powerMonitor.on('unlock-screen', sendPowerResume)
+  } catch {
+    // powerMonitor is unavailable before app 'ready' on some platforms; the
+    // caller registers after 'ready', so this should not normally throw.
+  }
+}
+
 function getAppIconPath() {
   return APP_ICON_PATHS.find(fileExists)
 }
@@ -2672,9 +2808,31 @@ function buildApplicationMenu() {
       { role: 'forceReload' },
       { role: 'toggleDevTools' },
       { type: 'separator' },
-      { role: 'resetZoom' },
-      { role: 'zoomIn' },
-      { role: 'zoomOut' },
+      {
+        label: 'Actual Size',
+        accelerator: 'CommandOrControl+0',
+        click: () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.setZoomLevel(0) }
+      },
+      {
+        label: 'Zoom In',
+        accelerator: 'CommandOrControl+Plus',
+        click: () => {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            const next = Math.min(mainWindow.webContents.getZoomLevel() + 0.1, 9)
+            mainWindow.webContents.setZoomLevel(next)
+          }
+        }
+      },
+      {
+        label: 'Zoom Out',
+        accelerator: 'CommandOrControl+-',
+        click: () => {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            const next = Math.max(mainWindow.webContents.getZoomLevel() - 0.1, -9)
+            mainWindow.webContents.setZoomLevel(next)
+          }
+        }
+      },
       { type: 'separator' },
       { role: 'togglefullscreen' }
     ]
@@ -2730,6 +2888,32 @@ function installPreviewShortcut(window) {
 
     event.preventDefault()
     sendClosePreviewRequested()
+  })
+}
+
+function installZoomShortcuts(window) {
+  // Override Ctrl/Cmd + +/-/0 with half the default zoom step (0.1 vs 0.2).
+  // The menu items handle this on macOS (where the menu is always present),
+  // but on Linux/Windows the menu is null and Chromium's default handler
+  // would use the full 0.2 step, so we intercept here for consistency.
+  const ZOOM_STEP = 0.1
+  window.webContents.on('before-input-event', (event, input) => {
+    const mod = IS_MAC ? input.meta : input.control
+    if (!mod || input.alt || input.shift) return
+
+    const key = input.key
+    if (key === '0') {
+      event.preventDefault()
+      window.webContents.setZoomLevel(0)
+    } else if (key === '=' || key === '+') {
+      event.preventDefault()
+      const next = Math.min(window.webContents.getZoomLevel() + ZOOM_STEP, 9)
+      window.webContents.setZoomLevel(next)
+    } else if (key === '-') {
+      event.preventDefault()
+      const next = Math.max(window.webContents.getZoomLevel() - ZOOM_STEP, -9)
+      window.webContents.setZoomLevel(next)
+    }
   })
 }
 
@@ -3319,6 +3503,7 @@ function createWindow() {
 
   installPreviewShortcut(mainWindow)
   installDevToolsShortcut(mainWindow)
+  installZoomShortcuts(mainWindow)
   installContextMenu(mainWindow)
   mainWindow.webContents.setWindowOpenHandler(details => {
     openExternalUrl(details.url)
@@ -3399,6 +3584,7 @@ ipcMain.handle('hermes:bootstrap:reset', async () => {
   // full backend flow (including a fresh runBootstrap pass).
   rememberLog('[bootstrap] reset requested by renderer; clearing latched failure')
   bootstrapFailure = null
+  forceBootstrapRepair = false
   connectionPromise = null
   bootstrapState = {
     active: false,
@@ -3426,6 +3612,9 @@ ipcMain.handle('hermes:bootstrap:repair', async () => {
     rememberLog(`[bootstrap] failed to remove marker during repair: ${error.message}`)
   }
   bootstrapFailure = null
+  // Force the next resolution past both the marker fast-path and the adopt
+  // branch so the installer actually re-runs (the whole point of repair).
+  forceBootstrapRepair = true
   resetHermesConnection()
   return { ok: true }
 })
@@ -3941,7 +4130,99 @@ ipcMain.handle('hermes:version', async () => ({
   hermesRoot: resolveUpdateRoot()
 }))
 
+// ---------------------------------------------------------------------------
+// macOS first-launch placement: move into /Applications and pin to the Dock
+// ---------------------------------------------------------------------------
+//
+// The DMG and CLI-built apps launch from wherever the user left them (a DMG
+// mount, ~/Downloads, ~/.hermes/...) -- which means Gatekeeper translocation,
+// no Dock tile, and "which icon do I click?" confusion. On first packaged
+// launch we relocate into /Applications (Electron relaunches from there) and,
+// once we're that canonical copy, pin to the Dock. Both macOS-only,
+// packaged-only, best-effort, run at most once.
+
+// Move the bundle into /Applications and relaunch. Returns true when a relaunch
+// is underway (caller must stop init). No-op in dev, off macOS, or already in
+// /Applications. `existsAndRunning` -> another copy owns the slot; don't fight
+// it. `exists` -> stale copy; replace it so there's exactly one current app.
+function maybeRelocateToApplications() {
+  if (!IS_MAC || !IS_PACKAGED || process.env.HERMES_DESKTOP_NO_AUTO_MOVE === '1') return false
+  try {
+    if (app.isInApplicationsFolder()) return false
+    const moved = app.moveToApplicationsFolder({ conflictHandler: type => type !== 'existsAndRunning' })
+    if (moved) rememberLog('[install] relocated into /Applications; relaunching')
+    return moved
+  } catch (err) {
+    rememberLog(`[install] move to /Applications skipped: ${err.message}`)
+    return false
+  }
+}
+
+const DOCK_PINNED_MARKER = 'dock-pinned.json'
+
+// Pin the /Applications copy to the Dock once. macOS has no Electron API for
+// this, so we append to com.apple.dock's persistent-apps and restart the Dock.
+// Guarded by a userData marker + membership check so we never duplicate the tile.
+function maybePinToDock() {
+  if (!IS_MAC || !IS_PACKAGED || process.env.HERMES_DESKTOP_NO_DOCK_PIN === '1') return
+  const marker = path.join(app.getPath('userData'), DOCK_PINNED_MARKER)
+  if (fileExists(marker)) return
+
+  let bundle
+  try {
+    if (!app.isInApplicationsFolder()) return // don't pin a soon-to-be-stale path
+    bundle = runningAppBundle()
+  } catch {
+    return
+  }
+  if (!bundle) return
+
+  // The Dock stores tiles as file-reference URLs (type 15), e.g.
+  // file:///Applications/Hermes.app/ -- NOT a raw POSIX path. A type-0/raw-path
+  // tile is silently dropped when the Dock rewrites persistent-apps on restart.
+  const url = pathToFileURL(bundle.endsWith('/') ? bundle : `${bundle}/`).href
+
+  const done = (note = {}) => {
+    try {
+      fs.writeFileSync(marker, JSON.stringify({ bundle, pinnedAt: new Date().toISOString(), ...note }) + '\n')
+    } catch {
+      // best-effort; we re-check next launch (membership guard dedupes)
+    }
+  }
+
+  try {
+    const apps = execFileSync('defaults', ['read', 'com.apple.dock', 'persistent-apps'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    })
+    if (apps.includes(url)) return done({ alreadyPresent: true })
+  } catch {
+    // persistent-apps may not exist yet; -array-add creates it
+  }
+
+  const tile =
+    '<dict><key>tile-data</key><dict><key>file-data</key><dict>' +
+    `<key>_CFURLString</key><string>${url}</string><key>_CFURLStringType</key><integer>15</integer>` +
+    '</dict></dict></dict>'
+  try {
+    execFileSync('defaults', ['write', 'com.apple.dock', 'persistent-apps', '-array-add', tile], { stdio: 'ignore' })
+    // Flush the write through cfprefsd before restarting the Dock, otherwise the
+    // Dock reloads stale prefs and our tile is lost in the race.
+    execFileSync('defaults', ['read', 'com.apple.dock', 'persistent-apps'], { stdio: 'ignore' })
+    execFileSync('killall', ['Dock'], { stdio: 'ignore' })
+    done()
+    rememberLog(`[install] pinned to Dock: ${url}`)
+  } catch (err) {
+    rememberLog(`[install] Dock pin skipped: ${err.message}`)
+  }
+}
+
 app.whenReady().then(() => {
+  // macOS: relocate into /Applications before anything else so setup + state
+  // land in the final location; on success this relaunches, so bail here.
+  if (maybeRelocateToApplications()) return
+  maybePinToDock()
+
   if (IS_MAC) {
     Menu.setApplicationMenu(buildApplicationMenu())
   } else {
@@ -3951,6 +4232,7 @@ app.whenReady().then(() => {
   registerMediaProtocol()
   ensureWslWindowsFonts()
   configureSpellChecker()
+  registerPowerResumeListeners()
   createWindow()
 
   app.on('activate', () => {

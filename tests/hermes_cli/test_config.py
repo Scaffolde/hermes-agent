@@ -9,6 +9,7 @@ import yaml
 
 from hermes_cli.config import (
     DEFAULT_CONFIG,
+    check_config_version,
     get_hermes_home,
     ensure_hermes_home,
     get_compatible_custom_providers,
@@ -486,6 +487,18 @@ class TestOptionalEnvVarsRegistry:
             all_vars.extend(vars_list)
         assert "TAVILY_API_KEY" in all_vars
 
+    def test_max_iterations_not_offered_as_env_var(self):
+        """HERMES_MAX_ITERATIONS must NOT be in OPTIONAL_ENV_VARS (issue #17534).
+
+        Offering it as an editable env var (dashboard, `hermes setup`) lets a
+        user write it to .env, recreating the stale ghost that shadows
+        config.yaml's agent.max_turns. The iteration budget is configured ONLY
+        via config.yaml; HERMES_MAX_ITERATIONS remains a read-only backward-compat
+        fallback in the gateway/CLI, never a promoted write target.
+        """
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+        assert "HERMES_MAX_ITERATIONS" not in OPTIONAL_ENV_VARS
+
 
 class TestConfigMigrationSecretPrompts:
     def test_required_secret_env_prompt_uses_masked_prompt(self, tmp_path, monkeypatch):
@@ -528,6 +541,28 @@ class TestConfigMigrationSecretPrompts:
         assert saved["prompt"] == "  Test API key: "
         assert saved["TEST_API_KEY"] == "secret"
         assert results["env_added"] == ["TEST_API_KEY"]
+
+
+class TestConfigVersionDetection:
+    def test_check_config_version_uses_raw_on_disk_version(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("model: {}\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            assert load_config()["_config_version"] == DEFAULT_CONFIG["_config_version"]
+            assert check_config_version() == (0, DEFAULT_CONFIG["_config_version"])
+
+    def test_check_config_version_treats_missing_file_as_current(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            latest = DEFAULT_CONFIG["_config_version"]
+            assert check_config_version() == (latest, latest)
+
+    def test_check_config_version_does_not_migrate_invalid_yaml(self, tmp_path):
+        (tmp_path / "config.yaml").write_text("model: [unterminated\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            latest = DEFAULT_CONFIG["_config_version"]
+            assert check_config_version() == (latest, latest)
 
 
 class TestAnthropicTokenMigration:
@@ -892,4 +927,3 @@ class TestEnvWriteDenylist:
         # But the write path still refuses to update it
         with pytest.raises(ValueError, match="denylist"):
             save_env_value("LD_PRELOAD", "/tmp/evil.so")
-

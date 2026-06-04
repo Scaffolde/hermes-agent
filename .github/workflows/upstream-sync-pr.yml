@@ -59,50 +59,22 @@ jobs:
           fi
 
           git checkout -B "$BRANCH" origin/main
-
-          # Patch-stack model: replay the fork's PAI commits on top of the new
-          # upstream instead of merging upstream in. A `--no-ff` merge re-introduces
-          # the pre-rebase copies of every PAI patch on each run, which is exactly
-          # what produced the duplicated-commit history this workflow used to create.
-          # Rebasing keeps `main` linear (upstream/main + the PAI patch series, no
-          # merge commits) and surfaces any conflict once, per patch.
-          if ! git rebase upstream/main; then
-            git rebase --abort || true
-            echo "::error::Rebasing PAI patches onto upstream/main hit conflicts."
-            echo "Resolve locally, then force-update main:"
-            echo "  git fetch upstream && git checkout main && git rebase upstream/main"
-            echo "  # resolve conflicts, then:"
-            echo "  git push --force-with-lease origin main"
-            echo "Left the existing $BRANCH untouched for manual resolution."
-            exit 1
-          fi
+          git merge --no-ff --no-edit upstream/main
 
           git push --force-with-lease origin "HEAD:$BRANCH"
 
           cat > /tmp/upstream-sync-pr-body.md <<'EOF'
           Automated upstream sync from NousResearch/hermes-agent into pai-scaffolde/hermes-agent.
 
-          This branch is `upstream/main` with the PAI patch series **rebased** on top —
-          a linear patch stack, no merge commits. Review the diff and let CI run here.
-
           Policy:
-          - This PR is review-gated. Do not auto-merge blindly.
-          - Existing CI/checks must pass before landing.
-          - **Land by fast-forwarding `main` to this branch — do NOT use the green
-            "Merge" button** (a merge commit reintroduces the dual-history problem).
-            From a clean checkout:
-            ```
-            git fetch origin
-            git checkout main
-            git reset --hard origin/automation/upstream-sync
-            git push --force-with-lease origin main
-            ```
-          - If the rebase conflicted, this PR was not updated; resolve locally per the
-            failed job log and force-update `main` directly.
+          - This PR is review-gated.
+          - Do not auto-merge blindly.
+          - Existing CI/checks must pass before merging.
+          - If conflicts occur, resolve manually on this branch.
 
           Source:
           - upstream: NousResearch/hermes-agent main
-          - fork base: pai-scaffolde/hermes-agent main (PAI patch stack)
+          - fork base: pai-scaffolde/hermes-agent main
           EOF
 
           PR_NUMBER="$(gh pr list \

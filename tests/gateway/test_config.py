@@ -516,6 +516,7 @@ class TestLoadGatewayConfig:
         assert telegram.token == "top-token"
         assert telegram.extra["reply_prefix"] == "top"
 
+
     def test_bridges_quoted_false_session_notify_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
