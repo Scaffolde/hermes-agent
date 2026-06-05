@@ -1948,12 +1948,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                         # default ``PlatformConfig()`` would fail the
                         # gate even with proper env vars set.
                         if existing_cfg is not None:
-                            probe_cfg = existing_cfg
-                            if not probe_cfg.enabled:
-                                probe_cfg = PlatformConfig(
-                                    enabled=True,
-                                    extra=dict(probe_cfg.extra or {}),
-                                )
+                            probe_cfg = PlatformConfig(
+                                enabled=True,
+                                extra=dict(existing_cfg.extra or {}),
+                            )
                         else:
                             probe_cfg = PlatformConfig(enabled=True)
                         if isinstance(seed_for_probe, dict) and seed_for_probe:
