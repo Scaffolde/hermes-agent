@@ -93,6 +93,27 @@ jobs:
           # merge commits) and surfaces any conflict once, per patch.
           if ! git rebase upstream/main; then
             git rebase --abort || true
+            {
+              echo "### Upstream sync needs manual rebase"
+              echo ""
+              echo "Rebasing the PAI patch stack onto upstream/main hit conflicts."
+              echo ""
+              echo "Resolve locally, then force-update main:"
+              echo ""
+              echo '```bash'
+              echo "git fetch upstream && git checkout main && git rebase upstream/main"
+              echo "# resolve conflicts, then:"
+              echo "git push --force-with-lease origin main"
+              echo '```'
+              echo ""
+              echo "The existing $BRANCH branch was left untouched."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            if [ "${GITHUB_EVENT_NAME:-}" = "schedule" ]; then
+              echo "::warning::Rebasing PAI patches onto upstream/main hit conflicts. Scheduled runs report this as manual sync required without failing repeatedly."
+              exit 0
+            fi
+
             echo "::error::Rebasing PAI patches onto upstream/main hit conflicts."
             echo "Resolve locally, then force-update main:"
             echo "  git fetch upstream && git checkout main && git rebase upstream/main"
