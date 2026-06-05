@@ -39,8 +39,10 @@ jobs:
   #   3. Job-level concurrency with cancel-in-progress: true ensures
   #      back-to-back pushes collapse to the newest; ref: main checkout
   #      always operates on the latest branch state.
-  #   4. Uses a GitHub App token (not GITHUB_TOKEN) so the fix commit
-  #      triggers downstream nix.yml verification.
+  #   4. Prefers a GitHub App token so the fix commit triggers downstream
+  #      nix.yml verification; falls back to GITHUB_TOKEN when the app secrets
+  #      are not configured so the maintenance workflow does not fail before
+  #      it can decide whether a fix is needed.
   auto-fix-main:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -49,8 +51,26 @@ jobs:
       group: auto-fix-main
       cancel-in-progress: true
     steps:
+      - name: Detect GitHub App credentials
+        id: app-auth
+        env:
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$APP_ID" ] && [ -n "$APP_PRIVATE_KEY" ]; then
+            echo "has_app_token=true" >> "$GITHUB_OUTPUT"
+            echo "token_source=github-app" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_app_token=false" >> "$GITHUB_OUTPUT"
+            echo "token_source=github-token" >> "$GITHUB_OUTPUT"
+            echo "::warning::APP_ID/APP_PRIVATE_KEY are not configured; falling back to GITHUB_TOKEN. Auto-fix pushes may not trigger downstream workflows automatically."
+          fi
+
       - name: Generate GitHub App token
         id: app-token
+        if: steps.app-auth.outputs.has_app_token == 'true'
         uses: actions/create-github-app-token@7bfa3a4717ef143a604ee0a99d859b8886a96d00  # v1.9.3
         with:
           app-id: ${{ secrets.APP_ID }}
@@ -59,7 +79,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           ref: main
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
 
       - uses: ./.github/actions/nix-setup
         with:
@@ -72,8 +92,14 @@ jobs:
       - name: Commit & push
         if: steps.apply.outputs.changed == 'true'
         shell: bash
+        env:
+          TOKEN_SOURCE: ${{ steps.app-auth.outputs.token_source }}
         run: |
           set -euo pipefail
+
+          if [ "$TOKEN_SOURCE" = "github-token" ]; then
+            echo "::notice::Using GITHUB_TOKEN fallback. Downstream nix.yml verification may need a manual rerun after this auto-fix push."
+          fi
 
           # Ensure only nix/lib.nix (home of the single npmDepsHash) was
           # modified — prevents accidental self-triggering if fix-lockfiles
