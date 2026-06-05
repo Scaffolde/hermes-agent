@@ -22,10 +22,30 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      # Use the repository GitHub App credentials instead of GITHUB_TOKEN so
-      # branch pushes/PR updates trigger the normal pull_request CI gates.
+      - name: Detect GitHub App credentials
+        id: app-auth
+        env:
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$APP_ID" ] && [ -n "$APP_PRIVATE_KEY" ]; then
+            echo "has_app_token=true" >> "$GITHUB_OUTPUT"
+            echo "token_source=github-app" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_app_token=false" >> "$GITHUB_OUTPUT"
+            echo "token_source=github-token" >> "$GITHUB_OUTPUT"
+            echo "::warning::APP_ID/APP_PRIVATE_KEY are not configured; falling back to GITHUB_TOKEN. Branch pushes/PR updates may not trigger every downstream workflow automatically."
+          fi
+
+      # Prefer repository GitHub App credentials so branch pushes/PR updates
+      # trigger the normal pull_request CI gates. When the app is not installed,
+      # keep the scheduled sync alive with GITHUB_TOKEN and make the weaker
+      # downstream-trigger behavior explicit in the logs.
       - name: Generate GitHub App token
         id: app-token
+        if: steps.app-auth.outputs.has_app_token == 'true'
         uses: actions/create-github-app-token@7bfa3a4717ef143a604ee0a99d859b8886a96d00 # v1.9.3
         with:
           app-id: ${{ secrets.APP_ID }}
@@ -36,15 +56,20 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
 
       - name: Create or update upstream sync PR
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           BRANCH: automation/upstream-sync
           UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
+          TOKEN_SOURCE: ${{ steps.app-auth.outputs.token_source }}
         run: |
           set -euo pipefail
+
+          if [ "$TOKEN_SOURCE" = "github-token" ]; then
+            echo "::notice::Using GITHUB_TOKEN fallback because APP_ID/APP_PRIVATE_KEY are absent. Reviewers may need to rerun PR checks manually."
+          fi
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -59,22 +84,53 @@ jobs:
           fi
 
           git checkout -B "$BRANCH" origin/main
-          git merge --no-ff --no-edit upstream/main
+
+          # Patch-stack model: replay the fork's PAI commits on top of the new
+          # upstream instead of merging upstream in. A `--no-ff` merge re-introduces
+          # the pre-rebase copies of every PAI patch on each run, which is exactly
+          # what produced the duplicated-commit history this workflow used to create.
+          # Rebasing keeps `main` linear (upstream/main + the PAI patch series, no
+          # merge commits) and surfaces any conflict once, per patch.
+          if ! git rebase upstream/main; then
+            git rebase --abort || true
+            echo "::error::Rebasing PAI patches onto upstream/main hit conflicts."
+            echo "Resolve locally, then force-update main:"
+            echo "  git fetch upstream && git checkout main && git rebase upstream/main"
+            echo "  # resolve conflicts, then:"
+            echo "  git push --force-with-lease origin main"
+            echo "Left the existing $BRANCH untouched for manual resolution."
+            exit 1
+          fi
 
           git push --force-with-lease origin "HEAD:$BRANCH"
 
           cat > /tmp/upstream-sync-pr-body.md <<'EOF'
           Automated upstream sync from NousResearch/hermes-agent into pai-scaffolde/hermes-agent.
 
+          This branch is `upstream/main` with the PAI patch series **rebased** on top -
+          a linear patch stack, no merge commits. Review the diff and let CI run here.
+
           Policy:
-          - This PR is review-gated.
-          - Do not auto-merge blindly.
-          - Existing CI/checks must pass before merging.
-          - If conflicts occur, resolve manually on this branch.
+          - This PR is review-gated. Do not auto-merge blindly.
+          - Existing CI/checks must pass before landing.
+          - Land by fast-forwarding `main` to this branch - do NOT use the green
+            "Merge" button (a merge commit reintroduces the dual-history problem).
+            From a clean checkout:
+            ```
+            git fetch origin
+            git checkout main
+            git reset --hard origin/automation/upstream-sync
+            git push --force-with-lease origin main
+            ```
+          - If the workflow used the GITHUB_TOKEN fallback, PR checks may need a
+            manual rerun because workflow-created pushes do not always trigger
+            downstream workflows.
+          - If the rebase conflicted, this PR was not updated; resolve locally per the
+            failed job log and force-update `main` directly.
 
           Source:
           - upstream: NousResearch/hermes-agent main
-          - fork base: pai-scaffolde/hermes-agent main
+          - fork base: pai-scaffolde/hermes-agent main (PAI patch stack)
           EOF
 
           PR_NUMBER="$(gh pr list \
