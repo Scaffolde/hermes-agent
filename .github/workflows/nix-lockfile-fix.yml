@@ -8,6 +8,7 @@ on:
       - 'package.json'
       - 'ui-tui/package.json'
       - 'apps/desktop/package.json'
+      - '.github/workflows/nix-lockfile-fix.yml'
   workflow_dispatch:
     inputs:
       pr_number:
