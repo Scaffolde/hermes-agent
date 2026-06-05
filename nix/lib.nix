@@ -268,6 +268,15 @@ in
         fi
       fi
 
+      # prefetch-npm-deps hashes the lockfile contents, while fetchNpmDeps
+      # hashes the full npm dependency derivation. If those disagree but the
+      # existing Nix hash verifies, the lockfile is not stale.
+      if nix build ".#${attr}.npmDeps" --no-link --print-build-logs >/dev/null 2>&1; then
+        echo "prefetch-npm-deps gave $NEW_HASH but existing Nix hash verifies; treating as current" >&2
+        echo "ok"
+        exit 0
+      fi
+
       HASH_LINE=$(grep -n 'npmDepsHash = "sha256-' "$LIB_FILE" | head -1 | cut -d: -f1)
       echo "stale: $LIB_FILE:$HASH_LINE $OLD_HASH -> $NEW_HASH"
       STALE=1
@@ -275,9 +284,9 @@ in
       if [ -n "$LINK_REPO" ] && [ -n "$LINK_SHA" ]; then
         LIB_URL="$LINK_SERVER/$LINK_REPO/blob/$LINK_SHA/$LIB_FILE#L$HASH_LINE"
         LOCK_URL="$LINK_SERVER/$LINK_REPO/blob/$LINK_SHA/$LOCK_FILE"
-        REPORT="- [\`$LIB_FILE:$HASH_LINE\`]($LIB_URL): \`$OLD_HASH\` → \`$NEW_HASH\` — lockfile: [\`$LOCK_FILE\`]($LOCK_URL)"$'\\n'
+        REPORT="- [\`$LIB_FILE:$HASH_LINE\`]($LIB_URL): \`$OLD_HASH\` → \`$NEW_HASH\` — lockfile: [\`$LOCK_FILE\`]($LOCK_URL)"
       else
-        REPORT="- \`$LIB_FILE:$HASH_LINE\`: \`$OLD_HASH\` → \`$NEW_HASH\`"$'\\n'
+        REPORT="- \`$LIB_FILE:$HASH_LINE\`: \`$OLD_HASH\` → \`$NEW_HASH\`"
       fi
 
       if [ "$MODE" = "--apply" ]; then
@@ -311,7 +320,7 @@ in
           [ "$FIXED" -eq 1 ] && echo "changed=true" || echo "changed=false"
           if [ -n "$REPORT" ]; then
             echo "report<<REPORT_EOF"
-            printf "%s" "$REPORT"
+            printf "%s\n" "$REPORT"
             echo "REPORT_EOF"
           fi
         } >> "$GITHUB_OUTPUT"
