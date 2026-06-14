@@ -192,22 +192,6 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
 
 
-def _git_stdout(repo_dir: Path, *args: str, timeout: int = 5) -> Optional[str]:
-    try:
-        result = subprocess.run(
-            ["git", *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(repo_dir),
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return None
-
-
 def _local_git_cache_state(repo_dir: Path) -> Dict[str, Optional[str]]:
     """Return git state that invalidates stale update-check cache entries.
 
@@ -216,10 +200,10 @@ def _local_git_cache_state(repo_dir: Path) -> Dict[str, Optional[str]]:
     claim main is behind after the checkout returns to fork main.
     """
     return {
-        "head": _git_stdout(repo_dir, "rev-parse", "HEAD"),
-        "branch": _git_stdout(repo_dir, "rev-parse", "--abbrev-ref", "HEAD"),
-        "origin_head": _git_stdout(repo_dir, "rev-parse", "--verify", "origin/main"),
-        "origin_url": _git_stdout(repo_dir, "remote", "get-url", "origin"),
+        "head": _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir),
+        "branch": _git_stdout(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_dir),
+        "origin_head": _git_stdout(["rev-parse", "--verify", "origin/main"], cwd=repo_dir),
+        "origin_url": _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir),
     }
 
 
