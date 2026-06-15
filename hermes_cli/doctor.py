@@ -131,6 +131,34 @@ def _doctor_tool_availability_detail(toolset: str) -> str:
     return ""
 
 
+def _doctor_disabled_toolsets() -> set[str]:
+    """Return toolsets disabled by config so doctor doesn't ask for unused secrets."""
+    try:
+        import yaml
+
+        config_path = HERMES_HOME / "config.yaml"
+        if not config_path.exists():
+            return set()
+        raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        agent_cfg = raw_config.get("agent") if isinstance(raw_config, dict) else {}
+        disabled = agent_cfg.get("disabled_toolsets") if isinstance(agent_cfg, dict) else []
+        if isinstance(disabled, str):
+            disabled = [disabled]
+        if not isinstance(disabled, list):
+            return set()
+        return {str(item).strip() for item in disabled if str(item).strip()}
+    except Exception:
+        return set()
+
+
+def _filter_doctor_disabled_toolsets(unavailable: list[dict], disabled_toolsets: set[str] | None = None) -> list[dict]:
+    """Drop intentionally disabled toolsets from doctor warning/issue accounting."""
+    disabled = disabled_toolsets if disabled_toolsets is not None else _doctor_disabled_toolsets()
+    if not disabled:
+        return list(unavailable)
+    return [item for item in unavailable if item.get("name") not in disabled]
+
+
 def _apply_doctor_tool_availability_overrides(available: list[str], unavailable: list[dict]) -> tuple[list[str], list[dict]]:
     """Adjust runtime-gated tool availability for doctor diagnostics."""
     updated_available = list(available)
@@ -2082,6 +2110,7 @@ def run_doctor(args):
         
         available, unavailable = check_tool_availability()
         available, unavailable = _apply_doctor_tool_availability_overrides(available, unavailable)
+        unavailable = _filter_doctor_disabled_toolsets(unavailable)
         
         for tid in available:
             info = TOOLSET_REQUIREMENTS.get(tid, {})

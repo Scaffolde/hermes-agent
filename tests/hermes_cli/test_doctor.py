@@ -167,6 +167,15 @@ class TestDoctorToolAvailabilityOverrides:
 
         assert doctor._doctor_tool_availability_detail("kanban") == "(runtime-gated; loaded only for dispatcher-spawned workers)"
 
+    def test_filters_config_disabled_toolsets_from_unavailable(self):
+        unavailable = [
+            {"name": "discord", "env_vars": ["DISCORD_BOT_TOKEN"], "tools": ["send_discord"]},
+            {"name": "spotify", "env_vars": [], "tools": ["spotify_play"]},
+            {"name": "custom", "env_vars": ["CUSTOM_API_KEY"], "tools": ["custom"]},
+        ]
+
+        assert doctor._filter_doctor_disabled_toolsets(unavailable, {"discord", "spotify"}) == [unavailable[2]]
+
 
 class TestHonchoDoctorConfigDetection:
     def test_reports_configured_when_enabled_with_api_key(self, monkeypatch):

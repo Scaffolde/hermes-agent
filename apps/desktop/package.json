@@ -118,6 +118,7 @@
     "cross-env": "^10.1.0",
     "electron": "^40.9.3",
     "electron-builder": "^26.8.1",
+    "esbuild": "^0.28.1",
     "eslint": "^9.39.4",
     "eslint-plugin-perfectionist": "^5.9.0",
     "eslint-plugin-react": "^7.37.5",
@@ -128,7 +129,7 @@
     "prettier": "^3.8.3",
     "rcedit": "^5.0.2",
     "typescript": "^6.0.3",
-    "vite": "^8.0.10",
+    "vite": "^8.0.16",
     "vitest": "^4.1.5",
     "wait-on": "^9.0.5"
   },
