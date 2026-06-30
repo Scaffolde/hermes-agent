@@ -489,8 +489,25 @@ class TestSanePathIncludesHomebrew:
         path_entries = result["PATH"].split(":")
         assert "/opt/homebrew/bin" in path_entries
         assert "/opt/homebrew/sbin" in path_entries
-        # Original entries keep their leading precedence.
+        # Original entries keep their leading precedence unless per-user CLI bins
+        # exist and are prepended by the separate user-bin helper.
         assert path_entries[:4] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+
+    def test_make_run_env_prepends_existing_user_cli_bins(self, tmp_path):
+        """GUI/cron gateway PATH should still find Bun/Cargo/pipx-style CLIs."""
+        from tools.environments.local import _make_run_env
+        home = tmp_path / "home"
+        for rel in (".bun/bin", ".local/bin", ".cargo/bin"):
+            (home / rel).mkdir(parents=True)
+        with patch.dict(os.environ, {"HOME": str(home), "PATH": "/usr/bin:/bin"}, clear=True):
+            result = _make_run_env({})
+        path_entries = result["PATH"].split(":")
+        assert path_entries[:3] == [
+            str(home / ".bun/bin"),
+            str(home / ".local/bin"),
+            str(home / ".cargo/bin"),
+        ]
+        assert "/usr/bin" in path_entries
 
     def test_make_run_env_collapses_duplicate_caller_entries(self):
         """Duplicates already present in the caller PATH are de-duplicated."""

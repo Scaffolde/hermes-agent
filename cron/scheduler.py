@@ -1545,7 +1545,7 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(script_path: str, *, cwd: Optional[str] = None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -1628,16 +1628,17 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         argv = [sys.executable, str(path)]
 
     try:
-        from tools.environments.local import _sanitize_subprocess_env
+        from tools.environments.local import _make_run_env
 
+        script_cwd = str(Path(cwd).expanduser().resolve()) if cwd else str(path.parent)
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
         result = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=script_timeout,
-            cwd=str(path.parent),
-            env=_sanitize_subprocess_env(os.environ.copy()),
+            cwd=script_cwd,
+            env=_make_run_env({}),
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
@@ -2014,7 +2015,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_job_script(script_path, cwd=_job_workdir)
         finally:
             if _prior_cwd is not None:
                 try:
@@ -2096,6 +2097,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     except Exception as e:
         logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
 
+    # Per-job working directory.  Validate before scripts run so both pre-check
+    # scripts and terminal/file/code-exec tools share the same project context.
+    _job_workdir = (job.get("workdir") or "").strip() or None
+    if _job_workdir and not Path(_job_workdir).is_dir():
+        logger.warning(
+            "Job '%s': configured workdir %r no longer exists — running without it",
+            job_id, _job_workdir,
+        )
+        _job_workdir = None
+    _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
+
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
     # the whole agent run. We pass the result into _build_job_prompt so
@@ -2103,7 +2115,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_job_script(script_path, cwd=_job_workdir)
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
@@ -2155,8 +2167,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     agent = None
 
     # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
+    # Preserve/restore the process env in finally: the scheduler can live inside
+    # the gateway process, and leaking this flag makes later interactive tool
+    # calls incorrectly inherit cron restrictions.
+    _prior_cron_session = os.environ.get("HERMES_CRON_SESSION", "_UNSET_")
     os.environ["HERMES_CRON_SESSION"] = "1"
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
@@ -2197,26 +2211,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
 
-    # Per-job working directory.  When set (and validated at create/update
-    # time), we point TERMINAL_CWD at it so:
-    #   - build_context_files_prompt() picks up AGENTS.md / CLAUDE.md /
-    #     .cursorrules from the job's project dir, AND
-    #   - the terminal, file, and code-exec tools run commands from there.
-    #
-    # tick() serializes workdir-jobs outside the parallel pool, so mutating
-    # os.environ["TERMINAL_CWD"] here is safe for those jobs.  For workdir-less
-    # jobs we leave TERMINAL_CWD untouched — preserves the original behaviour
-    # (skip_context_files=True, tools use whatever cwd the scheduler has).
-    _job_workdir = (job.get("workdir") or "").strip() or None
-    if _job_workdir and not Path(_job_workdir).is_dir():
-        # Directory was removed between create-time validation and now.  Log
-        # and drop back to old behaviour rather than crashing the job.
-        logger.warning(
-            "Job '%s': configured workdir %r no longer exists — running without it",
-            job_id, _job_workdir,
-        )
-        _job_workdir = None
-    _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
+    # Set TERMINAL_CWD for the agent/tool phase after the pre-check script has
+    # run with the same workdir via _run_job_script(cwd=...).
     if _job_workdir:
         os.environ["TERMINAL_CWD"] = _job_workdir
         logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
@@ -2707,6 +2703,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 os.environ.pop("TERMINAL_CWD", None)
             else:
                 os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
+        if _prior_cron_session == "_UNSET_":
+            os.environ.pop("HERMES_CRON_SESSION", None)
+        else:
+            os.environ["HERMES_CRON_SESSION"] = _prior_cron_session
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
         for _var_name in _cron_delivery_vars:

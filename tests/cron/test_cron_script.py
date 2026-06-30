@@ -157,6 +157,39 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    def test_shell_script_path_includes_user_cli_bins(self, cron_env, tmp_path, monkeypatch):
+        """Desktop/cron-launched scripts should find CLIs installed under HOME."""
+        from cron.scheduler import _run_job_script
+
+        home = tmp_path / "home"
+        bin_dir = home / ".bun" / "bin"
+        bin_dir.mkdir(parents=True)
+        fake = bin_dir / "fakebuncli"
+        fake.write_text("#!/bin/sh\necho fakebuncli-ok\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+        script = cron_env / "scripts" / "uses-user-bin.sh"
+        script.write_text("fakebuncli\n")
+
+        success, output = _run_job_script("uses-user-bin.sh")
+        assert success is True
+        assert output == "fakebuncli-ok"
+
+    def test_script_can_run_from_explicit_workdir(self, cron_env, tmp_path):
+        from cron.scheduler import _run_job_script
+
+        workdir = tmp_path / "project"
+        workdir.mkdir()
+        (workdir / "data.txt").write_text("workdir-ok\n")
+        script = cron_env / "scripts" / "read-relative.sh"
+        script.write_text("cat data.txt\n")
+
+        success, output = _run_job_script("read-relative.sh", cwd=str(workdir))
+        assert success is True
+        assert output == "workdir-ok"
+
     def test_script_empty_output(self, cron_env):
         from cron.scheduler import _run_job_script
 

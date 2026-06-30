@@ -452,6 +452,18 @@ _SANE_PATH = (
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 
+# Per-user CLI install locations that GUI/launchd-started gateways often miss.
+# These are intentionally conditional in _prepend_existing_user_bin_dirs(): we
+# add only directories that exist for this user, so a generic install does not
+# grow PATH with dead entries. This closes the macOS Desktop/cron gap where
+# commands installed by Bun/Cargo/pipx (e.g. bun, bunx, project CLIs) work in a
+# normal terminal but fail as "command not found" inside Hermes.
+_USER_BIN_SUFFIXES = (
+    ".bun/bin",
+    ".local/bin",
+    ".cargo/bin",
+)
+
 # Cached directory containing the ``hermes`` console-script.
 # ``_SENTINEL`` distinguishes "not resolved yet" from a resolved ``None``.
 _SENTINEL = object()
@@ -580,6 +592,34 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
     return ":".join(ordered_entries)
 
 
+def _prepend_existing_user_bin_dirs(existing_path: str) -> str:
+    """Prepend existing per-user bin dirs that login shells commonly add.
+
+    Desktop/launchd and cron-started gateway processes can have a skeletal PATH
+    that never sources ~/.zprofile or ~/.bashrc. Static system fallbacks cover
+    Homebrew and /usr/local, but modern developer CLIs frequently live under
+    HOME (.bun/bin, .cargo/bin, .local/bin). Add the dirs only when present,
+    de-dupe first occurrence, and leave Windows untouched (different PATH
+    conventions and install locations).
+    """
+    if _IS_WINDOWS:
+        return existing_path
+    home = os.environ.get("HOME")
+    if not home:
+        return existing_path
+    entries = [e for e in existing_path.split(os.pathsep) if e] if existing_path else []
+    seen = set(entries)
+    prepend: list[str] = []
+    for suffix in _USER_BIN_SUFFIXES:
+        candidate = os.path.join(home, suffix)
+        if os.path.isdir(candidate) and candidate not in seen:
+            prepend.append(candidate)
+            seen.add(candidate)
+    if not prepend:
+        return existing_path
+    return os.pathsep.join([*prepend, *entries])
+
+
 def _path_env_key(run_env: dict) -> str | None:
     """Return the PATH env key to update without altering Windows casing.
 
@@ -616,6 +656,7 @@ def _make_run_env(env: dict) -> dict:
     path_key = _path_env_key(run_env)
     if path_key is not None:
         new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))
+        new_path = _prepend_existing_user_bin_dirs(new_path)
         # Ensure the hermes install dir is reachable so plugins can shell out
         # to bare ``hermes`` via the terminal tool even when the gateway was
         # launched without it on PATH (systemd, service managers, cron, etc.).
