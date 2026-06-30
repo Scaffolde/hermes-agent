@@ -3037,7 +3037,9 @@ def _probe_config_health(cfg: dict) -> str:
     null_keys = sorted(
         k for k, v in cfg.items() if v is None and k in mapping_section_keys
     )
-    if null_keys:
+    if not null_keys:
+        pass
+    else:
         keys = ", ".join(f"`{k}`" for k in null_keys)
         warnings.append(
             f"config.yaml has empty section(s): {keys}. "
@@ -7821,15 +7823,23 @@ def _(rid, params: dict) -> dict:
         list_active_subagents,
         _get_max_concurrent_children,
         _get_max_spawn_depth,
+        _get_max_async_children,
     )
+    try:
+        from tools.async_delegation import list_async_delegations
+        async_background = list_async_delegations()
+    except Exception:
+        async_background = []
 
     return _ok(
         rid,
         {
             "active": list_active_subagents(),
+            "async_background": async_background,
             "paused": is_spawn_paused(),
             "max_spawn_depth": _get_max_spawn_depth(),
             "max_concurrent_children": _get_max_concurrent_children(),
+            "max_async_children": _get_max_async_children(),
         },
     )
 

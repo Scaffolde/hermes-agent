@@ -5,6 +5,7 @@ onto the shared process_registry.completion_queue, the rich re-injection block
 formatting, capacity rejection, and crash handling.
 """
 
+import json
 import queue
 import threading
 import time
@@ -177,6 +178,38 @@ def test_crashed_runner_produces_error_completion():
     assert text is not None
     assert "did not complete successfully" in text
     assert "subagent exploded" in text
+
+
+def test_running_records_from_previous_process_load_as_interrupted():
+    path = ad._state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "records": [
+                    {
+                        "delegation_id": "deleg_stale",
+                        "goal": "lost work",
+                        "status": "running",
+                        "dispatched_at": time.time() - 60,
+                        "completed_at": None,
+                        "session_key": "sess",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ad._records.clear()
+    ad._records_loaded = False
+
+    records = ad.list_async_delegations()
+
+    assert records[0]["delegation_id"] == "deleg_stale"
+    assert records[0]["status"] == "interrupted"
+    assert "Hermes exited" in records[0]["error"]
+    assert ad.active_count() == 0
 
 
 def test_interrupt_all_signals_running_children():

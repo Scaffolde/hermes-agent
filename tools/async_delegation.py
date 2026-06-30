@@ -36,6 +36,7 @@ logic stays in one place.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -43,6 +44,7 @@ import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.thread import _worker
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -96,10 +98,96 @@ _records_lock = threading.Lock()
 # delegation_id -> record dict. Kept for the lifetime of the run plus a short
 # tail after completion so `list_async_delegations()` can show recent results.
 _records: Dict[str, Dict[str, Any]] = {}
+_records_loaded = False
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
+_STATE_FILE_NAME = "async-delegations.json"
+
+
+def _state_path() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+
+        root = get_hermes_home()
+    except Exception:
+        root = Path.home() / ".hermes"
+    return root / _STATE_FILE_NAME
+
+
+def _serializable_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in record.items() if k != "interrupt_fn"}
+
+
+def _persist_records_locked() -> None:
+    """Best-effort durable status ledger for background delegations.
+
+    The actual subagent threads are intentionally not durable, but the user must
+    be able to tell after a Desktop/gateway restart that work was interrupted
+    instead of silently disappearing.  Persist only JSON-safe public metadata.
+    Caller must hold _records_lock.
+    """
+    try:
+        path = _state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "records": [_serializable_record(r) for r in _records.values()],
+        }
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except Exception as exc:  # pragma: no cover - status persistence is best-effort
+        logger.debug("async delegation state persist failed: %s", exc)
+
+
+def _ensure_records_loaded_locked() -> None:
+    """Load the durable status ledger once and mark stale running work lost.
+
+    If Hermes exits while background subagents are running, those daemon threads
+    die with the process and cannot deliver completions.  On next startup, expose
+    those records as interrupted so /agents/delegation.status shows the truth.
+    Caller must hold _records_lock.
+    """
+    global _records_loaded
+    if _records_loaded:
+        return
+    _records_loaded = True
+    try:
+        path = _state_path()
+        if not path.exists():
+            return
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw_records = payload.get("records") if isinstance(payload, dict) else None
+        if not isinstance(raw_records, list):
+            return
+        now = time.time()
+        for raw in raw_records:
+            if not isinstance(raw, dict):
+                continue
+            rid = str(raw.get("delegation_id") or "")
+            if not rid:
+                continue
+            record = dict(raw)
+            record["interrupt_fn"] = None
+            if record.get("status") == "running":
+                record["status"] = "interrupted"
+                record["completed_at"] = record.get("completed_at") or now
+                record["error"] = (
+                    "Hermes exited before this background delegation completed; "
+                    "the subagent was interrupted and must be re-dispatched if still needed."
+                )
+            _records[rid] = record
+        _prune_completed_locked()
+        _persist_records_locked()
+    except Exception as exc:  # pragma: no cover - corrupt status file must not break dispatch
+        logger.debug("async delegation state load failed: %s", exc)
+
+
+def _ensure_records_loaded() -> None:
+    with _records_lock:
+        _ensure_records_loaded_locked()
 
 
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
@@ -124,6 +212,7 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
 def active_count() -> int:
     """Number of async delegations currently running."""
     with _records_lock:
+        _ensure_records_loaded_locked()
         return sum(1 for r in _records.values() if r.get("status") == "running")
 
 
@@ -209,6 +298,7 @@ def dispatch_async_delegation(
     # active_count() separately would let two concurrent dispatches (e.g.
     # from different gateway sessions) both pass the check and exceed the cap.
     with _records_lock:
+        _ensure_records_loaded_locked()
         running = sum(
             1 for r in _records.values() if r.get("status") == "running"
         )
@@ -224,6 +314,7 @@ def dispatch_async_delegation(
                 ),
             }
         _records[delegation_id] = record
+        _persist_records_locked()
 
     executor = _get_executor(max_async_children)
 
@@ -251,6 +342,7 @@ def dispatch_async_delegation(
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
+            _persist_records_locked()
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -275,6 +367,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         # Snapshot fields needed for the event while holding the lock.
         event_record = dict(record)
         _prune_completed_locked()
+        _persist_records_locked()
 
     _push_completion_event(event_record, result, status)
 
@@ -389,6 +482,7 @@ def dispatch_async_delegation_batch(
         "is_batch": True,
     }
     with _records_lock:
+        _ensure_records_loaded_locked()
         running = sum(
             1 for r in _records.values() if r.get("status") == "running"
         )
@@ -403,6 +497,7 @@ def dispatch_async_delegation_batch(
                 ),
             }
         _records[delegation_id] = record
+        _persist_records_locked()
 
     executor = _get_executor(max_async_children)
 
@@ -436,6 +531,7 @@ def dispatch_async_delegation_batch(
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)
+            _persist_records_locked()
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
@@ -461,6 +557,7 @@ def _finalize_batch(
         record["interrupt_fn"] = None
         event_record = dict(record)
         _prune_completed_locked()
+        _persist_records_locked()
 
     try:
         from tools.process_registry import process_registry
@@ -510,6 +607,7 @@ def list_async_delegations() -> List[Dict[str, Any]]:
     Safe to call from any thread. Excludes the non-serialisable interrupt_fn.
     """
     with _records_lock:
+        _ensure_records_loaded_locked()
         return [
             {k: v for k, v in r.items() if k != "interrupt_fn"}
             for r in _records.values()
@@ -524,7 +622,10 @@ def interrupt_all(reason: str = "shutdown") -> int:
     completion event (status='interrupted') via the normal finalize path.
     """
     count = 0
+    now = time.time()
+    changed = False
     with _records_lock:
+        _ensure_records_loaded_locked()
         targets = [
             r for r in _records.values() if r.get("status") == "running"
         ]
@@ -539,6 +640,21 @@ def interrupt_all(reason: str = "shutdown") -> int:
                     "interrupt_all: %s interrupt failed: %s",
                     r.get("delegation_id"), exc,
                 )
+        # Persist the interruption immediately. If the process exits before the
+        # worker reaches _finalize(), the durable status still tells the user the
+        # background work was stopped during shutdown instead of vanishing.
+        sid = str(r.get("delegation_id") or "")
+        with _records_lock:
+            current = _records.get(sid)
+            if current and current.get("status") == "running":
+                current["status"] = "interrupted"
+                current["completed_at"] = now
+                current["error"] = f"Interrupted before completion ({reason})"
+                current["interrupt_fn"] = None
+                changed = True
+    if changed:
+        with _records_lock:
+            _persist_records_locked()
     if count:
         logger.info("Interrupted %d async delegation(s) (%s)", count, reason)
     return count
@@ -546,7 +662,7 @@ def interrupt_all(reason: str = "shutdown") -> int:
 
 def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor."""
-    global _executor, _executor_max_workers
+    global _executor, _executor_max_workers, _records_loaded
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)
@@ -554,3 +670,5 @@ def _reset_for_tests() -> None:
         _executor_max_workers = 0
     with _records_lock:
         _records.clear()
+        _records_loaded = True
+        _persist_records_locked()
