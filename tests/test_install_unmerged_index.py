@@ -13,6 +13,7 @@ before stashing (#4735); both installer scripts must do the same.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -84,6 +85,30 @@ def _make_unmerged_repo(repo: Path) -> None:
     _git(repo, "merge", "feature", check=False)
 
 
+def _make_origin_with_checkout_target(tmp_path: Path) -> tuple[Path, Path, str]:
+    """Create an existing install checkout whose dirty file blocks pin checkout."""
+    origin_work = tmp_path / "origin-work"
+    origin_work.mkdir()
+    _git(origin_work, "init", "-b", "main")
+    (origin_work / "f.txt").write_text("base\n")
+    _git(origin_work, "add", "f.txt")
+    _git(origin_work, "commit", "-m", "base")
+    base_commit = _git(origin_work, "rev-parse", "HEAD").stdout.strip()
+
+    (origin_work / "f.txt").write_text("main\n")
+    _git(origin_work, "add", "f.txt")
+    _git(origin_work, "commit", "-m", "main")
+
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "clone", "--bare", str(origin_work), str(origin))
+
+    install_dir = tmp_path / "hermes-agent"
+    _git(tmp_path, "clone", str(origin), str(install_dir))
+    (install_dir / "f.txt").write_text("local dirty edit\n")
+
+    return origin, install_dir, base_commit
+
+
 @pytest.mark.live_system_guard_bypass  # runs against a dedicated throwaway repo
 def test_install_sh_clears_unmerged_index_then_stashes(tmp_path: Path) -> None:
     repo = tmp_path / "hermes-agent"
@@ -125,6 +150,41 @@ def test_install_sh_clears_unmerged_index_then_stashes(tmp_path: Path) -> None:
     assert _git(repo, "stash", "list").stdout.strip(), (
         "local changes should be preserved in a stash"
     )
+
+
+@pytest.mark.live_system_guard_bypass  # runs against a dedicated throwaway repo
+def test_install_sh_stage_protocol_fails_when_pin_checkout_is_blocked(
+    tmp_path: Path,
+) -> None:
+    _, install_dir, base_commit = _make_origin_with_checkout_target(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+
+    res = subprocess.run(
+        [
+            "bash",
+            str(INSTALL_SH),
+            "--stage",
+            "repository",
+            "--non-interactive",
+            "--json",
+            "--commit",
+            base_commit,
+        ],
+        env={
+            **os.environ,
+            "HERMES_INSTALL_DIR": str(install_dir),
+            "HERMES_HOME": str(home),
+        },
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert res.returncode != 0
+    assert '"ok":false' in res.stdout
+    assert "Your local changes to the following files would be overwritten" in res.stderr
+    assert "Repository ready" not in res.stdout
 
 
 def test_install_ps1_clears_unmerged_index_before_stash() -> None:

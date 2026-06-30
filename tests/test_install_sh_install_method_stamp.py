@@ -38,3 +38,13 @@ def test_install_sh_stamps_code_tree_not_home() -> None:
         "dir may be shared with a Docker gateway whose 'docker' stamp would "
         "clobber it and block host-side `hermes update`"
     )
+
+
+def test_install_method_stamp_is_ignored_by_git() -> None:
+    gitignore = (REPO_ROOT / ".gitignore").read_text()
+
+    assert re.search(r"(?m)^\.install_method$", gitignore), (
+        "install.sh writes $INSTALL_DIR/.install_method as runtime state; "
+        "the managed checkout must ignore it so repair/update does not treat "
+        "every install as locally dirty"
+    )

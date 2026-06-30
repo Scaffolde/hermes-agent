@@ -14,6 +14,27 @@ from hermes_cli.active_sessions import active_session_registry_snapshot
 from tui_gateway import server
 
 
+def test_config_health_allows_null_scalar_knobs():
+    warning = server._probe_config_health(
+        {
+            "max_concurrent_sessions": None,
+            "context_file_max_chars": None,
+            "agent": {"max_turns": 90},
+        }
+    )
+
+    assert warning == ""
+
+
+def test_config_health_warns_on_null_mapping_sections():
+    warning = server._probe_config_health(
+        {"agent": None, "max_concurrent_sessions": None}
+    )
+
+    assert "`agent`" in warning
+    assert "`max_concurrent_sessions`" not in warning
+
+
 def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()

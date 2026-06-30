@@ -3005,10 +3005,39 @@ def _probe_config_health(cfg: dict) -> str:
     if not isinstance(cfg, dict):
         return ""
     warnings: list[str] = []
-    null_keys = sorted(k for k, v in cfg.items() if v is None)
-    if not null_keys:
-        pass
-    else:
+    # A top-level YAML ``null`` is only suspicious for sections that are meant
+    # to contain nested settings. Scalar knobs may intentionally use ``null`` to
+    # mean "auto"/"disabled" (for example ``max_concurrent_sessions: null``),
+    # and warning on those makes a healthy desktop look broken on every session
+    # create. Keep the guard targeted at known mapping sections.
+    mapping_section_keys = {
+        "agent",
+        "approvals",
+        "auxiliary",
+        "browser",
+        "compression",
+        "cron",
+        "display",
+        "gateway",
+        "image_gen",
+        "logging",
+        "memory",
+        "mcp_servers",
+        "model",
+        "plugins",
+        "providers",
+        "stt",
+        "terminal",
+        "tool_output",
+        "toolsets",
+        "tts",
+        "video_gen",
+        "web",
+    }
+    null_keys = sorted(
+        k for k, v in cfg.items() if v is None and k in mapping_section_keys
+    )
+    if null_keys:
         keys = ", ".join(f"`{k}`" for k in null_keys)
         warnings.append(
             f"config.yaml has empty section(s): {keys}. "
