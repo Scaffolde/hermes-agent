@@ -154,7 +154,16 @@ class GoogleAntigravityCLIClient:
                 f"Antigravity CLI returned no usable completion{detail}",
                 returncode=proc.returncode,
             )
-        return (proc.stdout or "").strip()
+        output = (proc.stdout or "").strip()
+        if not output:
+            stderr = (proc.stderr or "").strip()
+            detail = f" stderr={stderr[:500]!r}" if stderr else ""
+            raise AntigravityCLIError(
+                "Antigravity CLI exited 0 but produced no output; refusing to "
+                f"treat an empty compression summary as success.{detail}",
+                returncode=proc.returncode,
+            )
+        return output
 
 
 class _AsyncAntigravityCompletions:

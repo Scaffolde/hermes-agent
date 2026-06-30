@@ -560,3 +560,22 @@ class TestGoogleAntigravityAuxiliaryProvider:
         async_client, async_model = get_async_text_auxiliary_client("compression")
         assert isinstance(async_client, AsyncGoogleAntigravityCLIClient)
         assert async_model == "antigravity-cli"
+
+    def test_antigravity_client_rejects_empty_stdout_success(self, monkeypatch):
+        from subprocess import CompletedProcess
+
+        import pytest
+
+        from agent.google_antigravity_cli_adapter import (
+            AntigravityCLIError,
+            GoogleAntigravityCLIClient,
+        )
+
+        monkeypatch.setattr(
+            "agent.google_antigravity_cli_adapter.subprocess.run",
+            lambda *args, **kwargs: CompletedProcess(args[0], 0, stdout="", stderr=""),
+        )
+
+        client = GoogleAntigravityCLIClient(command="/bin/agy")
+        with pytest.raises(AntigravityCLIError, match="produced no output"):
+            client.complete("Reply OK")
