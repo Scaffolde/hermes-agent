@@ -729,7 +729,14 @@ def recover_with_credential_pool(
     # that seeded the pool.
     current_provider = (getattr(agent, "provider", "") or "").strip().lower()
     pool_provider = (getattr(pool, "provider", "") or "").strip().lower()
-    if current_provider and pool_provider and current_provider != pool_provider:
+    # Guard: skip credential pool recovery when the pool is scoped to a
+    # different provider than the agent.  Only guard when the pool has a
+    # known provider — an empty pool provider means "unscoped" (applies to
+    # any provider).  An empty agent provider is treated as a mismatch
+    # because swapping the pool's credentials would set base_url/api_key
+    # without fixing the empty provider field, leaving the agent in a
+    # corrupted state (provider="" model="").
+    if pool_provider and current_provider != pool_provider:
         # Custom endpoints use two naming conventions for the SAME provider:
         # the agent carries the generic ``custom`` label while the pool is
         # keyed ``custom:<name>`` (see CUSTOM_POOL_PREFIX). A literal string
@@ -1267,6 +1274,12 @@ def restore_primary_runtime(agent) -> bool:
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
         agent._fallback_index = 0
+
+        # Reset the stale-call circuit breaker (#58962): the streak measured
+        # the FALLBACK provider we're leaving; the restored primary deserves
+        # a fresh stream attempt before the breaker can trip again.
+        from agent.chat_completion_helpers import _reset_stale_streak
+        _reset_stale_streak(agent)
 
         # Undo the fallback's identity rewrite so the prompt is
         # byte-identical to the stored copy again (prefix cache match).
@@ -1984,6 +1997,14 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     # ── Invalidate cached system prompt so it rebuilds next turn ──
     agent._cached_system_prompt = None
+
+    # ── Reset the cross-turn stale-call circuit breaker (#58962) ──
+    # The breaker's error text tells the user to "switch models ... then
+    # retry"; without this reset the streak stays latched and the freshly
+    # selected (healthy) provider would keep short-circuiting before any
+    # stream is even attempted.
+    from agent.chat_completion_helpers import _reset_stale_streak
+    _reset_stale_streak(agent)
 
     # ── Update _primary_runtime so the change persists across turns ──
     _cc = agent.context_compressor if hasattr(agent, "context_compressor") and agent.context_compressor else None
