@@ -513,8 +513,10 @@ def _ensure_current_event_loop(request):
 #    instead of silently murdering the real gateway.
 #  • ``subprocess.run`` / ``subprocess.Popen`` / ``call`` / ``check_call`` /
 #    ``check_output`` reject any ``systemctl ... <verb> hermes-gateway``
-#    invocation that would mutate the live unit. Read-only systemctl
-#    calls (``status``, ``show``, ``list-units``) still pass through.
+#    invocation that would mutate the live unit, plus Chromium-family debug
+#    launches that could detach from pytest and retain its temporary profile.
+#    Read-only systemctl calls (``status``, ``show``, ``list-units``) still pass
+#    through.
 #
 # We intentionally do NOT stub ``find_gateway_pids`` / ``_scan_gateway_pids``
 # here — tests of those functions themselves need the real implementation.
@@ -733,6 +735,23 @@ def _live_system_guard(request, monkeypatch):
                     return True
         return False
 
+    def _is_browser_debug_launcher(cmd) -> bool:
+        """Detect real Chromium-family CDP launches before a process exists."""
+        cmd_str = _cmd_to_string(cmd)
+        low = cmd_str.lower()
+        if "--remote-debugging-port" not in low:
+            return False
+        return any(
+            browser in low
+            for browser in (
+                "chrome",
+                "chromium",
+                "brave",
+                "msedge",
+                "microsoft edge",
+            )
+        )
+
     def _check_subprocess_cmd(name, cmd):
         if _is_blocked_systemctl(cmd):
             raise RuntimeError(
@@ -749,6 +768,15 @@ def _live_system_guard(request, monkeypatch):
                 "targeting hermes/python could hit the live gateway. "
                 "Mark with @pytest.mark.live_system_guard_bypass if "
                 "intentional."
+            )
+        if _is_browser_debug_launcher(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — a Chromium-family debug "
+                "process can detach from pytest and retain its temporary "
+                "profile/port after failure or interruption. Mock the browser "
+                "launcher in unit tests, or mark the dedicated browser E2E "
+                "fixture with @pytest.mark.live_system_guard_bypass."
             )
         # Block any subprocess that would run `hermes update` (or the
         # equivalent `python -m hermes_cli.main update`).  These commands

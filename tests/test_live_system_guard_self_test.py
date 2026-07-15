@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 
 import pytest
 
@@ -101,6 +102,20 @@ def test_subprocess_run_string_shell_true_blocked():
 def test_subprocess_popen_systemctl_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
         subprocess.Popen(["systemctl", "--user", "stop", "hermes-gateway"])
+
+
+def test_subprocess_popen_chrome_debug_blocked_before_profile_creation(tmp_path):
+    """A missed browser mock must fail before Chrome, its profile, or port exists."""
+    profile = tmp_path / "chrome-debug"
+    with pytest.raises(RuntimeError, match="Chromium-family debug process"):
+        subprocess.Popen(
+            [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "--remote-debugging-port=9222",
+                f"--user-data-dir={profile}",
+            ]
+        )
+    assert not profile.exists()
 
 
 def test_subprocess_call_systemctl_blocked():
@@ -206,9 +221,18 @@ def test_subprocess_killall_hermes_blocked():
 
 def test_systemctl_status_passes_through():
     """Read-only systemctl probes (status/show/list-units) are fine."""
-    # Run with check=False so we don't fail on the gateway's exit code.
+    # Carry the inspected command text through Python so this remains portable
+    # on macOS/Windows hosts where the real systemctl binary does not exist.
     r = subprocess.run(
-        ["systemctl", "--user", "status", "hermes-gateway", "--no-pager"],
+        [
+            sys.executable,
+            "-c",
+            "pass",
+            "systemctl",
+            "--user",
+            "status",
+            "hermes-gateway",
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -218,7 +242,15 @@ def test_systemctl_status_passes_through():
 
 def test_systemctl_show_passes_through():
     r = subprocess.run(
-        ["systemctl", "--user", "show", "hermes-gateway", "--no-pager"],
+        [
+            sys.executable,
+            "-c",
+            "pass",
+            "systemctl",
+            "--user",
+            "show",
+            "hermes-gateway",
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -228,7 +260,15 @@ def test_systemctl_show_passes_through():
 
 def test_systemctl_list_units_passes_through():
     r = subprocess.run(
-        ["systemctl", "--user", "list-units", "fake-not-real-unit*", "--no-pager"],
+        [
+            sys.executable,
+            "-c",
+            "pass",
+            "systemctl",
+            "--user",
+            "list-units",
+            "fake-not-real-unit*",
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -243,7 +283,15 @@ def test_systemctl_unrelated_unit_passes_through():
     # --dry-run via the privileged API; on user scope it usually fails
     # quickly without side effects.
     r = subprocess.run(
-        ["systemctl", "--user", "show", "fake-not-real-unit"],
+        [
+            sys.executable,
+            "-c",
+            "pass",
+            "systemctl",
+            "--user",
+            "show",
+            "fake-not-real-unit",
+        ],
         capture_output=True,
         text=True,
         check=False,

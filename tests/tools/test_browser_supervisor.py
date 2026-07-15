@@ -25,10 +25,13 @@ import time
 import pytest
 
 
-pytestmark = pytest.mark.skipif(
-    not shutil.which("google-chrome") and not shutil.which("chromium"),
-    reason="Chrome/Chromium not installed",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not shutil.which("google-chrome") and not shutil.which("chromium"),
+        reason="Chrome/Chromium not installed",
+    ),
+    pytest.mark.live_system_guard_bypass,
+]
 
 
 def _find_chrome() -> str:
@@ -58,6 +61,31 @@ def chrome_cdp(request):
         port_offset = int(worker_id.lstrip("gw"))
     port = 9225 + port_offset
     profile = tempfile.mkdtemp(prefix="hermes-supervisor-test-")
+    proc = None
+
+    def cleanup():
+        """Reap Chrome and its profile after success, setup failure, or interruption."""
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=3)
+            except (subprocess.TimeoutExpired, AssertionError, Exception):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except (AssertionError, Exception):
+                    pass
+        shutil.rmtree(profile, ignore_errors=True)
+
+    # Register before spawning. Pytest runs finalizers even when fixture setup
+    # fails or is interrupted before reaching ``yield``.
+    request.addfinalizer(cleanup)
     proc = subprocess.Popen(
         [
             _find_chrome(),
@@ -87,46 +115,9 @@ def chrome_cdp(request):
         except Exception:
             time.sleep(0.25)
     if ws_url is None:
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except (subprocess.TimeoutExpired, AssertionError, Exception):
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=2)
-            except (AssertionError, Exception):
-                pass
-        shutil.rmtree(profile, ignore_errors=True)
         pytest.skip("Chrome didn't expose CDP in time")
 
     yield ws_url, port
-
-    # Tear down Chrome. The stdlib `subprocess._wait()` POSIX implementation
-    # has a known race (https://bugs.python.org/issue38630): when SIGCHLD
-    # arrives concurrently with `proc.wait()`, `_try_wait(WNOHANG)` can
-    # return a foreign pid and the `assert pid == self.pid or pid == 0`
-    # fires. We saw this in CI on slice 1 after this fixture's teardown
-    # (PR #33661 follow-up). Swallow the stdlib race + force-kill if wait
-    # hangs, then always reap so we don't leak a zombie.
-    try:
-        proc.terminate()
-    except Exception:
-        pass
-    try:
-        proc.wait(timeout=3)
-    except (subprocess.TimeoutExpired, AssertionError, Exception):
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=2)
-        except (AssertionError, Exception):
-            pass
-    shutil.rmtree(profile, ignore_errors=True)
 
 
 def _test_page_url() -> str:
