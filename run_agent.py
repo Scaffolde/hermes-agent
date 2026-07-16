@@ -5760,6 +5760,7 @@ class AIAgent:
         invocation paths (concurrent, sequential, inline).
         """
         from tools.delegate_tool import (
+            _model_background_value,
             _strip_model_hidden_task_fields,
             delegate_task as _delegate_task,
         )
@@ -5773,15 +5774,17 @@ class AIAgent:
         #     synchronous: the orchestrator needs its workers' results within
         #     its own turn to compose a summary, and a subagent doesn't own the
         #     gateway session the async result would route back to.
-        # The schema-level `background` param is intentionally ignored here.
-        _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        # Headless one-shot CLI sessions are also synchronous: their process
+        # exits as soon as this turn ends, so a daemon-thread completion would
+        # be abandoned before it could re-enter the conversation. The
+        # schema-level `background` param remains intentionally ignored.
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
-            background=(not _is_subagent),
+            background=_model_background_value(function_args, self),
             parent_agent=self,
         )
 

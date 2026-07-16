@@ -601,6 +601,10 @@ def test_model_dispatch_forces_background():
     top._delegate_depth = 0
     sub = MagicMock()
     sub._delegate_depth = 1
+    oneshot = MagicMock()
+    oneshot._delegate_depth = 0
+    oneshot.quiet_mode = True
+    oneshot.platform = "cli"
 
     # Registry-fallback helper: top-level always background, regardless of
     # single vs batch; subagent never.
@@ -613,6 +617,7 @@ def test_model_dispatch_forces_background():
     assert dt._model_background_value(
         {"tasks": [{"goal": "a"}, {"goal": "b"}]}, sub
     ) is False
+    assert dt._model_background_value({"goal": "x"}, oneshot) is False
 
 
 def test_run_agent_dispatch_forces_background():
@@ -624,6 +629,8 @@ def test_run_agent_dispatch_forces_background():
 
     class _FakeAgent:
         _delegate_depth = 0
+        quiet_mode = False
+        platform = "cli"
 
     captured = {}
 
@@ -644,6 +651,11 @@ def test_run_agent_dispatch_forces_background():
         sub = _FakeAgent()
         sub._delegate_depth = 1
         run_agent.AIAgent._dispatch_delegate_task(sub, {"goal": "x"})
+        assert captured["background"] is False
+
+        oneshot = _FakeAgent()
+        oneshot.quiet_mode = True
+        run_agent.AIAgent._dispatch_delegate_task(oneshot, {"goal": "x"})
         assert captured["background"] is False
 
 
@@ -836,5 +848,4 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
 

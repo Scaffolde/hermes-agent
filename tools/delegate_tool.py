@@ -3441,12 +3441,11 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "boolean",
                 "description": (
                     "DEPRECATED / IGNORED. Single-task delegations always run "
-                    "in the background automatically — you do not need to (and "
-                    "cannot) opt in or out. The result re-enters the "
-                    "conversation as a new message when the subagent finishes; "
-                    "just continue working in the meantime. Setting this has no "
-                    "effect; the parameter remains only for backward "
-                    "compatibility."
+                    "in the background automatically on persistent interactive "
+                    "and gateway sessions. Headless one-shot CLI sessions run "
+                    "delegations synchronously because their process exits when "
+                    "the turn ends. Setting this has no effect; the parameter "
+                    "remains only for backward compatibility."
                 ),
             },
         },
@@ -3462,17 +3461,20 @@ from tools.registry import registry, tool_error
 def _model_background_value(args: dict, parent_agent=None) -> bool:
     """Background flag for the MODEL-facing dispatch path (registry fallback).
 
-    Delegations from the top-level agent always run in the background — the
-    model does not choose. This applies to both a single task and a fan-out
-    batch (each task becomes its own independent background subagent). The one
-    exception is a delegation from an orchestrator subagent (depth > 0), which
-    needs its workers' results within its own turn. The live path is
+    Delegations from a persistent top-level agent run in the background — the
+    model does not choose. An orchestrator subagent (depth > 0) and a headless
+    one-shot CLI agent both run synchronously because neither owns a persistent
+    session that can receive a later completion. The live path is
     ``run_agent._dispatch_delegate_task``; this lambda mirrors it for the rare
     case the intercept is bypassed. Direct Python callers of ``delegate_task``
     keep the historical synchronous default.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    is_headless_oneshot = (
+        getattr(parent_agent, "quiet_mode", False) is True
+        and getattr(parent_agent, "platform", None) == "cli"
+    )
+    return not (is_subagent or is_headless_oneshot)
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
