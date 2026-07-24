@@ -141,6 +141,7 @@ function installRefForStamp(installStamp) {
 
   const hasFallbackCommit =
     installStamp && typeof installStamp.commit === 'string' && FALLBACK_COMMIT_RE.test(installStamp.commit)
+
   const hasLegacyBranchOnlyStamp =
     installStamp && installStamp.commit == null && typeof installStamp.branch === 'string' && installStamp.branch
 

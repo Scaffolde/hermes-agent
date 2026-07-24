@@ -495,6 +495,7 @@ describe('createBackendSessionForSend profile routing', () => {
     setCurrentFastMode(false)
 
     let createParams: Record<string, unknown> | undefined
+
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
       if (method === 'session.create') {
         createParams = params
@@ -537,6 +538,7 @@ describe('createBackendSessionForSend profile routing', () => {
 
   it('does not carry fast mode from a previous session into a fresh GPT draft', async () => {
     let createParams: Record<string, unknown> | undefined
+
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
       if (method === 'session.create') {
         createParams = params
@@ -553,6 +555,7 @@ describe('createBackendSessionForSend profile routing', () => {
     // startFreshSessionDraft is not exposed through the shared harness, so use
     // the full hook harness inline.
     const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
+
     function FullHarness({ onReady }: { onReady: (next: ReturnType<typeof useSessionActions>) => void }) {
       const next = useSessionActions({
         activeSessionId: null,

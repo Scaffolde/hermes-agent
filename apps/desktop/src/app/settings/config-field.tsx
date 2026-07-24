@@ -165,8 +165,7 @@ export function ConfigField({
   }
 
   const isPrimitiveList =
-    schema.type === 'list' &&
-    (!Array.isArray(value) || value.every(item => item === null || typeof item !== 'object'))
+    schema.type === 'list' && (!Array.isArray(value) || value.every(item => item === null || typeof item !== 'object'))
 
   if (isPrimitiveList) {
     return row(

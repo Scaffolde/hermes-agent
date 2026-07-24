@@ -201,6 +201,7 @@ export function ModelEditSubmenu({
           } else if (activeSessionId) {
             sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, fast: !enabled }))
           }
+
           notifyError(err, copy.fastFailed)
         }
       })()
