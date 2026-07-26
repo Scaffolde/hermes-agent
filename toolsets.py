@@ -59,6 +59,8 @@ _HERMES_CORE_TOOLS = [
     # off every CLI/messaging/cron schema (narrow waist).
     # Session history search
     "session_search",
+    # Scaffolde native capability narrow waist (status/list/invoke over descriptor registry)
+    "scaffolde_capability",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
