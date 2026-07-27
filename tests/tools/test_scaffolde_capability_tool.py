@@ -10,9 +10,15 @@ from hermes_constants import reset_hermes_home_override, set_hermes_home_overrid
 
 
 @pytest.fixture()
-def hermes_home(tmp_path):
+def hermes_home(tmp_path, monkeypatch):
     home = tmp_path / "hermes-home"
     (home / "scaffolde").mkdir(parents=True)
+    bin_dir = home / "test-bin"
+    bin_dir.mkdir()
+    bun = bin_dir / "bun"
+    bun.write_text("#!/bin/sh\nexec python3 \"$@\"\n", encoding="utf-8")
+    bun.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     token = set_hermes_home_override(str(home))
     try:
         yield home
@@ -23,11 +29,12 @@ def hermes_home(tmp_path):
 def _write_fake_runner(home: Path, *, exit_code: int = 0) -> Path:
     runner = home / "fake_runner.ts"
     runner.write_text(
-        "const keys = ['HOME','PATH','LIFEOS_DIR','GOOGLE_KEYCHAIN_ACCOUNT','SCAFFOLDE_AUTOMATION_SENDER_EMAIL','GOOGLE_APPLICATION_CREDENTIALS'];\n"
-        "const env = Object.fromEntries(keys.map((key) => [key, process.env[key] ?? null]));\n"
-        "console.log(JSON.stringify({ argv: Bun.argv.slice(2), cwd: process.cwd(), env }));\n"
-        "console.error('stderr contains SECRET_TOKEN=should-redact and harmless detail');\n"
-        f"process.exit({exit_code});\n",
+        "import json, os, sys\n"
+        "keys = ['HOME','PATH','LIFEOS_DIR','GOOGLE_KEYCHAIN_ACCOUNT','SCAFFOLDE_AUTOMATION_SENDER_EMAIL','GOOGLE_APPLICATION_CREDENTIALS']\n"
+        "env = {key: os.environ.get(key) for key in keys}\n"
+        "print(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), 'env': env}))\n"
+        "print('stderr contains SECRET_TOKEN=should-redact and harmless detail', file=sys.stderr)\n"
+        f"raise SystemExit({exit_code})\n",
         encoding="utf-8",
     )
     return runner
@@ -53,8 +60,8 @@ def _descriptor(home: Path, *, runner: Path | None = None, risk="read", extra=No
             "inherit": ["HOME", "PATH"],
             "set": {
                 "LIFEOS_DIR": "${HERMES_HOME}",
-                "GOOGLE_KEYCHAIN_ACCOUNT": "pai@scaffolde.ai",
-                "SCAFFOLDE_AUTOMATION_SENDER_EMAIL": "pai@scaffolde.ai",
+                "GOOGLE_KEYCHAIN_ACCOUNT": "automation@scaffolde.test",
+                "SCAFFOLDE_AUTOMATION_SENDER_EMAIL": "automation@scaffolde.test",
             },
         },
         "operations": {
@@ -315,7 +322,10 @@ def test_prompt_routing_block_precedes_skill_guidance(hermes_home):
 
 def test_incident_regression_fake_scaffolde_gmail_succeeds_without_generic_invocation(hermes_home, monkeypatch):
     runner = hermes_home / "gmail_fake.ts"
-    runner.write_text("console.log(JSON.stringify({from:'Sarah',subject:'PAI update',generic_invoked:false}));", encoding="utf-8")
+    runner.write_text(
+        "import json\nprint(json.dumps({'from': 'Sarah', 'subject': 'PAI update', 'generic_invoked': False}))\n",
+        encoding="utf-8",
+    )
     _write_registry(hermes_home, _descriptor(hermes_home, runner=runner))
     result = _call_tool(action="invoke", capability_id="scaffolde.gmail.pai", operation="search", arguments={"query": "Sarah", "limit": 1})
     assert result["status"] == "ok"
@@ -333,7 +343,7 @@ def test_runtime_failures_are_capability_degraded(hermes_home):
     assert failed["error_type"] == "nonzero_exit"
 
     slow = hermes_home / "slow.ts"
-    slow.write_text("await Bun.sleep(5000);\n", encoding="utf-8")
+    slow.write_text("import time\ntime.sleep(5)\n", encoding="utf-8")
     _write_registry(hermes_home, _descriptor(hermes_home, runner=slow))
     timed_out = invoke_capability("scaffolde.gmail.pai", "search", {"query": "Sarah", "limit": 1}, timeout=1)
     assert timed_out["status"] == "capability_degraded"
