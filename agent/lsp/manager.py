@@ -35,6 +35,7 @@ in-process syntax check.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import threading
@@ -60,6 +61,53 @@ logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
+
+# Concurrent-client cap.  The idle reaper bounds clients by *time*, which
+# is not enough on its own: N simultaneously-active workspace roots hold
+# N servers alive indefinitely, and each tsserver on a large TypeScript
+# checkout is ~1.3 GiB resident.  Thirteen of them exceeded a 16 GiB host
+# outright, pushed the box into compressor + swap, and took the
+# self-hosted CI runner offline for 5.5h.  The cap bounds the population
+# independently of idleness.
+LSP_FOOTPRINT_GIB = 1.3  # measured: tsserver on a scaffolde-ai checkout
+LSP_MEMORY_BUDGET_FRACTION = 0.25  # share of host RAM language servers may hold
+MIN_MAX_CLIENTS = 2  # never cap below this — one root plus a neighbour
+MAX_MAX_CLIENTS = 32  # sanity ceiling on very large hosts
+
+
+def _host_total_gib() -> Optional[float]:
+    """Total physical RAM in GiB, or ``None`` when it can't be determined.
+
+    ``os.sysconf`` covers Linux and macOS.  Any failure returns None so
+    the caller falls back to a conservative fixed default rather than
+    guessing wrong in either direction.
+    """
+    try:
+        page = os.sysconf("SC_PAGE_SIZE")
+        pages = os.sysconf("SC_PHYS_PAGES")
+        if page > 0 and pages > 0:
+            return (page * pages) / (1024.0**3)
+    except (ValueError, OSError, AttributeError):
+        pass
+    return None
+
+
+def default_max_clients() -> int:
+    """Derive the concurrent-client cap from host memory.
+
+    A 16 GiB Mac Mini and a 128 GiB workstation must not get the same
+    cap — that is the whole point of deriving rather than hardcoding.
+    At a 25% budget and ~1.3 GiB per server this yields 3 on a 16 GiB
+    host and 24 on a 128 GiB one.
+
+    Falls back to :data:`MIN_MAX_CLIENTS` when host memory is unknown:
+    under-capping costs a respawn (seconds), over-capping costs swap.
+    """
+    total = _host_total_gib()
+    if total is None:
+        return MIN_MAX_CLIENTS
+    derived = int((total * LSP_MEMORY_BUDGET_FRACTION) / LSP_FOOTPRINT_GIB)
+    return max(MIN_MAX_CLIENTS, min(MAX_MAX_CLIENTS, derived))
 
 
 class _BackgroundLoop:
@@ -156,6 +204,7 @@ class LSPService:
         init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        max_clients: Optional[int] = None,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -166,6 +215,9 @@ class LSPService:
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
+        self._max_clients = (
+            default_max_clients() if max_clients is None else int(max_clients)
+        )
 
         self._loop = _BackgroundLoop()
         if self._enabled:
@@ -178,6 +230,14 @@ class LSPService:
         self._last_used: Dict[Tuple[str, str], float] = {}
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
+
+        # In-flight request count per key.  Both eviction paths (idle
+        # reap and LRU cap) refuse to shut down a client with work in
+        # flight — killing one mid-request surfaces as an outer timeout,
+        # which ``_mark_broken_for_file`` then latches into the
+        # broken-set for the life of the process.  A busy client is
+        # simply skipped; the next sweep or spawn reconsiders it.
+        self._inflight: Dict[Tuple[str, str], int] = {}
 
         # Delta baseline: file path → snapshot of diagnostics taken
         # immediately before a write.  ``get_diagnostics_sync`` filters
@@ -220,6 +280,20 @@ class LSPService:
             # mark the (server, workspace) pair broken for the process
             # lifetime.  Clamp to a safe floor (0 still disables).
             idle_timeout = MIN_IDLE_TIMEOUT
+        raw_max = lsp_cfg.get("max_clients")
+        if raw_max is None:
+            # Absent from config → derive from host memory rather than
+            # baking in a number that is wrong on most machines.
+            max_clients: Optional[int] = None
+        else:
+            try:
+                max_clients = int(raw_max)
+            except (TypeError, ValueError):
+                max_clients = None
+            if max_clients is not None and 0 < max_clients < MIN_MAX_CLIENTS:
+                # A cap of 1 thrashes: every alternating edit between two
+                # roots would evict and respawn.  0 still disables.
+                max_clients = MIN_MAX_CLIENTS
         servers_cfg = lsp_cfg.get("servers") or {}
         disabled = []
         binary_overrides: Dict[str, List[str]] = {}
@@ -251,6 +325,7 @@ class LSPService:
             init_overrides=init_overrides,
             disabled_servers=disabled,
             idle_timeout=idle_timeout,
+            max_clients=max_clients,
         )
 
     # ------------------------------------------------------------------
@@ -482,8 +557,13 @@ class LSPService:
         if client is None:
             return []
         try:
-            version = await client.open_file(file_path, language_id=language_id_for(file_path))
-            fresh = await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
+            with self._busy(client):
+                version = await client.open_file(
+                    file_path, language_id=language_id_for(file_path)
+                )
+                fresh = await client.wait_for_diagnostics(
+                    file_path, version, mode=self._wait_mode
+                )
         except Exception as e:  # noqa: BLE001
             logger.debug("snapshot open/wait failed: %s", e)
             return []
@@ -508,11 +588,14 @@ class LSPService:
         if client is None:
             return None
         try:
-            version = await client.open_file(file_path, language_id=language_id_for(file_path))
-            await client.save_file(file_path)
-            fresh = await client.wait_for_diagnostics(
-                file_path, version, mode=self._wait_mode, timeout=self._wait_timeout
-            )
+            with self._busy(client):
+                version = await client.open_file(
+                    file_path, language_id=language_id_for(file_path)
+                )
+                await client.save_file(file_path)
+                fresh = await client.wait_for_diagnostics(
+                    file_path, version, mode=self._wait_mode, timeout=self._wait_timeout
+                )
         except Exception as e:  # noqa: BLE001
             logger.debug("open/wait failed for %s: %s", file_path, e)
             return None
@@ -609,7 +692,12 @@ class LSPService:
                 self._clients[key] = client
                 self._last_used[key] = time.time()
             eventlog.log_active(srv.server_id, per_server_root)
+            # Hand the client to any waiters BEFORE enforcing the cap so
+            # they aren't blocked behind another client's shutdown.  The
+            # client we just registered is the most-recently-used, so LRU
+            # ordering never selects it as its own victim.
             spawn_future.set_result(client)
+            await self._enforce_max_clients()
             return client
         finally:
             with self._state_lock:
@@ -617,6 +705,72 @@ class LSPService:
 
     async def _start_idle_reaper(self) -> None:
         self._idle_reaper_task = asyncio.create_task(self._idle_reaper_loop())
+
+    @contextlib.contextmanager
+    def _busy(self, client: LSPClient):
+        """Mark ``client`` as having a request in flight for the duration.
+
+        Both eviction paths consult this and skip busy clients, so an
+        in-flight open/wait always drains rather than being shut down
+        underneath.  The count is decremented in ``finally`` so an
+        exception can't leak a permanently-busy key (which would pin the
+        client forever and reintroduce the leak).
+        """
+        key = (client.server_id, client.workspace_root)
+        with self._state_lock:
+            self._inflight[key] = self._inflight.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            with self._state_lock:
+                remaining = self._inflight.get(key, 1) - 1
+                if remaining > 0:
+                    self._inflight[key] = remaining
+                else:
+                    self._inflight.pop(key, None)
+
+    def _is_busy(self, key: Tuple[str, str]) -> bool:
+        """True when ``key`` has at least one request in flight.
+
+        Callers must already hold ``_state_lock``.
+        """
+        return self._inflight.get(key, 0) > 0
+
+    async def _enforce_max_clients(self) -> None:
+        """Evict least-recently-used clients until the cap is satisfied.
+
+        Called after a successful spawn.  The idle reaper bounds clients
+        by time; this bounds them by count, so N concurrently-active
+        roots can't collectively exceed host memory no matter how busy
+        they are.  Clients with work in flight are never evicted — if
+        every candidate is busy the cap is briefly exceeded and the next
+        spawn or sweep reconsiders, which is strictly better than
+        breaking a live request.
+        """
+        if self._max_clients <= 0:
+            return  # 0 disables the cap
+        with self._state_lock:
+            overflow = len(self._clients) - self._max_clients
+            if overflow <= 0:
+                return
+            # Oldest last-used first; skip anything mid-request.
+            candidates = sorted(
+                (k for k in self._clients if not self._is_busy(k)),
+                key=lambda k: self._last_used.get(k, 0.0),
+            )
+            victims = candidates[:overflow]
+            clients = [self._clients.pop(k) for k in victims]
+            for k in victims:
+                self._last_used.pop(k, None)
+        if clients:
+            eventlog.log_evicted(
+                [(c.server_id, c.workspace_root) for c in clients],
+                self._max_clients,
+            )
+            await asyncio.gather(
+                *(client.shutdown() for client in clients),
+                return_exceptions=True,
+            )
 
     def _touch(self, client: LSPClient) -> None:
         """Refresh the last-used timestamp for a client we just used.
@@ -651,7 +805,7 @@ class LSPService:
             idle_keys = [
                 key
                 for key in self._clients
-                if self._last_used.get(key, 0) < cutoff
+                if self._last_used.get(key, 0) < cutoff and not self._is_busy(key)
             ]
             clients = [self._clients.pop(key) for key in idle_keys]
             for key in idle_keys:
@@ -677,6 +831,7 @@ class LSPService:
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
+            self._inflight.clear()
         await asyncio.gather(
             *(c.shutdown() for c in clients),
             return_exceptions=True,
@@ -704,6 +859,8 @@ class LSPService:
             "wait_mode": self._wait_mode,
             "wait_timeout": self._wait_timeout,
             "install_strategy": self._install_strategy,
+            "idle_timeout": self._idle_timeout,
+            "max_clients": self._max_clients,
             "clients": clients,
             "broken": broken,
             "disabled_servers": sorted(self._disabled_servers),

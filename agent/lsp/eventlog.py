@@ -207,6 +207,30 @@ def log_reaped(keys: List[Tuple[str, str]], idle_timeout: float) -> None:
     )
 
 
+def log_evicted(keys: List[Tuple[str, str]], max_clients: int) -> None:
+    """Clients were shut down to satisfy the concurrent-client cap.
+
+    Deliberately distinct from :func:`log_reaped`: "evicted (cap N)" and
+    "reaped idle" are different causes with different remedies — the
+    first says the host can't hold this many workspaces at once and
+    ``lsp.max_clients`` is the knob, the second says a workspace simply
+    went quiet.  Collapsing them into one line would make "the cap is
+    thrashing" indistinguishable from "servers are idling out".
+
+    Clears the ``log_active`` announce cache for evicted keys so a later
+    respawn re-announces at INFO, matching the reaper's behaviour.
+    """
+    with _announce_lock:
+        for key in keys:
+            _announced_active.discard(key)
+    summary = ", ".join(f"{sid} ({root})" for sid, root in keys)
+    _emit(
+        "reaper",
+        logging.INFO,
+        f"evicted {len(keys)} LRU client(s) to satisfy cap {max_clients}: {summary}",
+    )
+
+
 def reset_announce_caches() -> None:
     """Test-only: clear the dedup caches.  Production code never calls this."""
     with _announce_lock:

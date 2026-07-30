@@ -171,6 +171,13 @@ lsp:
   # clamped to 30 so a sweep can never reap a client mid-operation.
   idle_timeout: 600
 
+  # Maximum language servers held at once. `idle_timeout` bounds servers
+  # by time; this bounds them by count, which is what N simultaneously
+  # active worktrees need. Unset (null) derives the cap from host memory
+  # (~25% of RAM at ~1.3 GiB per server): 3 on a 16 GiB machine, 24 on a
+  # 128 GiB one. Set to 0 to disable the cap.
+  max_clients: null
+
   # Per-server overrides (all optional).
   servers:
     pyright:
@@ -236,6 +243,27 @@ one language-server process per workspace forever. A reaped server is
 respawned automatically on the next relevant file operation. Set
 `idle_timeout: 0` to disable reaping and hold every server's index warm
 for the life of the process.
+
+Idleness alone isn't a sufficient bound: N *simultaneously active*
+worktrees hold N servers alive no matter how short the timeout is, and
+a `tsserver` on a large TypeScript checkout is ~1.3 GiB resident. On a
+16 GiB host, thirteen of them exceed physical memory outright and push
+the machine into swap. `lsp.max_clients` bounds the population by count
+as well as by time: when the cap is exceeded, the least-recently-used
+client is shut down. Left unset the cap is derived from host memory
+rather than hardcoded, so a 16 GiB Mac Mini (3) and a 128 GiB
+workstation (24) get appropriate values. Set `max_clients: 0` to
+disable the cap.
+
+Neither bound will shut down a client with a request in flight — an
+in-flight open/wait always drains first, and the eviction is deferred
+to the next spawn or sweep. Both paths log what they removed and why,
+at INFO under the `lsp[reaper]` prefix:
+
+```
+lsp[reaper] reaped 2 idle client(s) after 600s: pyright (/repo/a), typescript (/repo/b)
+lsp[reaper] evicted 1 LRU client(s) to satisfy cap 3: typescript (/repo/old)
+```
 
 ## Disabling
 

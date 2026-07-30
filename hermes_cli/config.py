@@ -3380,6 +3380,17 @@ DEFAULT_CONFIG = {
         # to disable idle reaping and keep servers for process lifetime.
         "idle_timeout": 600.0,
 
+        # Maximum number of language servers held at once.  The idle
+        # timeout above bounds servers by *time*; this bounds them by
+        # *count*, which is what N simultaneously-active worktrees
+        # need — each tsserver on a large TypeScript checkout is
+        # ~1.3 GiB, so thirteen of them exceed a 16 GiB host outright
+        # and push it into swap.  When unset (null) the cap is derived
+        # from host memory: ~25% of RAM at ~1.3 GiB per server, which
+        # is 3 on a 16 GiB machine and 24 on a 128 GiB one.  Set to 0
+        # to disable the cap entirely.
+        "max_clients": None,
+
         # Per-server overrides.  Each key is a server_id from the
         # registry (``pyright``, ``typescript``, ``gopls``,
         # ``rust-analyzer``, etc.) and accepts:

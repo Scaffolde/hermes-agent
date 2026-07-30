@@ -342,3 +342,307 @@ def test_default_config_declares_idle_timeout():
     from hermes_cli.config import DEFAULT_CONFIG
 
     assert float(DEFAULT_CONFIG["lsp"]["idle_timeout"]) == float(DEFAULT_IDLE_TIMEOUT)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Concurrent-client cap (SCA-4389)
+#
+# The idle reaper bounds servers by time.  These cover the second bound:
+# N simultaneously-active workspace roots must not collectively exceed
+# host memory.  Thirteen live tsservers (~1.3 GiB each) on a 16 GiB Mac
+# Mini is what took the self-hosted CI runner offline for 5.5h.
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def mock_pyright_repos(monkeypatch, tmp_path):
+    """Install the mock as ``pyright`` and yield a factory for git repos.
+
+    Each repo is a distinct workspace root, so each one the service
+    touches becomes a separate (server_id, root) cache key — which is
+    exactly the per-worktree accumulation this cap has to bound.
+    """
+    made = []
+
+    def _make(name: str):
+        repo = tmp_path / name
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        (repo / "pyproject.toml").write_text("")
+        f = repo / "x.py"
+        f.write_text("")
+        made.append(repo)
+        return f
+
+    first = _make("repo0")
+    monkeypatch.chdir(str(first.parent))
+    gen = _install_mock_server(monkeypatch, "errors", "pyright")
+    next(gen)
+    yield _make
+    try:
+        next(gen)
+    except StopIteration:
+        pass
+
+
+def _svc(**kw):
+    base = dict(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+        idle_timeout=0,  # cap tests drive eviction, not the clock
+    )
+    base.update(kw)
+    return LSPService(**base)
+
+
+def test_lru_cap_evicts_least_recently_used(mock_pyright_repos):
+    """The (cap + 1)-th root evicts the least-recently-used client.
+
+    This is the criterion that a cache with an eviction path which never
+    executes would silently fail — so it asserts on the victim's process
+    actually exiting, not merely on dict membership.
+    """
+    a = mock_pyright_repos("a")
+    b = mock_pyright_repos("b")
+    c = mock_pyright_repos("c")
+    svc = _svc(max_clients=2)
+    try:
+        svc.get_diagnostics_sync(str(a))
+        svc.get_diagnostics_sync(str(b))
+        assert len(svc._clients) == 2
+
+        key_a = next(k for k in svc._clients if str(a.parent) in k[1])
+        victim = svc._clients[key_a]
+        victim_proc = victim._proc
+        assert victim_proc is not None
+
+        # Make A unambiguously the least-recently-used, then spawn C.
+        svc._last_used[key_a] = time.time() - 999
+        svc.get_diagnostics_sync(str(c))
+
+        assert len(svc._clients) == 2, "cap must hold after the third root"
+        assert key_a not in svc._clients, "LRU victim must be evicted"
+
+        deadline = time.monotonic() + 5.0
+        while victim_proc.returncode is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert victim_proc.returncode is not None, (
+            "evicted client's process must actually exit — an eviction that "
+            "only forgets the reference still leaks the ~1.3 GiB server"
+        )
+    finally:
+        svc.shutdown()
+
+
+def test_lru_cap_zero_disables_eviction(mock_pyright_repos):
+    """``max_clients: 0`` means unbounded — the documented escape hatch."""
+    a = mock_pyright_repos("a")
+    b = mock_pyright_repos("b")
+    c = mock_pyright_repos("c")
+    svc = _svc(max_clients=0)
+    try:
+        for f in (a, b, c):
+            svc.get_diagnostics_sync(str(f))
+        assert len(svc._clients) == 3
+    finally:
+        svc.shutdown()
+
+
+def test_cap_eviction_skips_in_flight_client(mock_pyright_repos):
+    """Eviction must never shut down a client mid-request.
+
+    A client killed under an in-flight open/wait surfaces as an outer
+    timeout, which ``_mark_broken_for_file`` then latches into the
+    broken-set for the life of the process — one transient eviction
+    would disable LSP for that workspace permanently.
+    """
+    a = mock_pyright_repos("a")
+    b = mock_pyright_repos("b")
+    c = mock_pyright_repos("c")
+    svc = _svc(max_clients=3)
+    try:
+        svc.get_diagnostics_sync(str(a))
+        svc.get_diagnostics_sync(str(b))
+        assert len(svc._clients) == 2
+
+        key_a = next(k for k in svc._clients if str(a.parent) in k[1])
+        key_b = next(k for k in svc._clients if str(b.parent) in k[1])
+
+        # A is the least-recently-used, so it is the natural victim.
+        svc._last_used[key_a] = 0.0
+        svc._last_used[key_b] = time.time()
+
+        # Tighten the cap so exactly one client must go, with A busy.
+        svc._max_clients = 1
+        with svc._busy(svc._clients[key_a]):
+            svc._loop.run(svc._enforce_max_clients(), timeout=5.0)
+            assert key_a in svc._clients, (
+                "a busy client must be skipped by cap eviction even when it "
+                "is the least-recently-used and the cache is over quota"
+            )
+            assert key_b not in svc._clients, (
+                "eviction must fall through to the next-oldest idle client "
+                "rather than skipping the sweep entirely"
+            )
+
+        # Skipping a busy client defers eviction, it does not cancel it.
+        # Once A drains, the next spawn puts the cache over quota again
+        # and A — now idle and least-recently-used — is the victim.
+        svc._last_used[key_a] = 0.0
+        svc.get_diagnostics_sync(str(c))
+        assert key_a not in svc._clients, (
+            "after the in-flight request drains the client is evictable"
+        )
+        assert len(svc._clients) == 1
+    finally:
+        svc.shutdown()
+
+
+def test_idle_reaper_skips_in_flight_client(mock_pyright_repos):
+    """The idle sweep honours the same in-flight guard as the cap.
+
+    A long ``wait_for_diagnostics`` on a large project can outlast the
+    idle cutoff; reaping it mid-wait is the same broken-set trap.
+    """
+    a = mock_pyright_repos("a")
+    svc = _svc(max_clients=0, idle_timeout=60.0)
+    try:
+        svc.get_diagnostics_sync(str(a))
+        key = next(iter(svc._clients))
+        client = svc._clients[key]
+
+        svc._last_used[key] = 0.0  # far past the cutoff
+        with svc._busy(client):
+            svc._loop.run(svc._reap_idle_once(), timeout=5.0)
+            assert key in svc._clients, "a busy client must survive the sweep"
+
+        svc._loop.run(svc._reap_idle_once(), timeout=5.0)
+        assert key not in svc._clients, "an idle, drained client is reaped"
+    finally:
+        svc.shutdown()
+
+
+def test_busy_counter_released_on_exception(mock_pyright_repos):
+    """``_busy`` must decrement on the error path.
+
+    A leaked count pins the client permanently un-evictable, which
+    reintroduces the very leak the cap exists to close.
+    """
+    a = mock_pyright_repos("a")
+    svc = _svc(max_clients=0)
+    try:
+        svc.get_diagnostics_sync(str(a))
+        key = next(iter(svc._clients))
+        client = svc._clients[key]
+
+        with pytest.raises(RuntimeError):
+            with svc._busy(client):
+                assert svc._inflight[key] == 1
+                raise RuntimeError("boom")
+
+        assert key not in svc._inflight, "in-flight count must not leak"
+        assert not svc._is_busy(key)
+    finally:
+        svc.shutdown()
+
+
+def test_default_max_clients_scales_with_host_memory(monkeypatch):
+    """The cap is derived from host RAM, not hardcoded — a 16 GiB Mac
+    Mini and a 128 GiB workstation must not get the same number."""
+    from agent.lsp import manager as mgr
+
+    monkeypatch.setattr(mgr, "_host_total_gib", lambda: 16.0)
+    assert mgr.default_max_clients() == 3
+
+    monkeypatch.setattr(mgr, "_host_total_gib", lambda: 128.0)
+    assert mgr.default_max_clients() == 24
+
+    # Unknown host memory falls back to the floor rather than guessing.
+    monkeypatch.setattr(mgr, "_host_total_gib", lambda: None)
+    assert mgr.default_max_clients() == mgr.MIN_MAX_CLIENTS
+
+    # Tiny hosts still get a workable floor, never 0.
+    monkeypatch.setattr(mgr, "_host_total_gib", lambda: 2.0)
+    assert mgr.default_max_clients() == mgr.MIN_MAX_CLIENTS
+
+    # Huge hosts are bounded by the sanity ceiling.
+    monkeypatch.setattr(mgr, "_host_total_gib", lambda: 4096.0)
+    assert mgr.default_max_clients() == mgr.MAX_MAX_CLIENTS
+
+
+def test_create_from_config_reads_max_clients(monkeypatch):
+    """``lsp.max_clients`` in config.yaml reaches the service."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"lsp": {"enabled": False, "max_clients": 7}},
+    )
+    svc = LSPService.create_from_config()
+    assert svc is not None
+    assert svc._max_clients == 7
+
+
+def test_create_from_config_max_clients_absent_derives_from_host(monkeypatch):
+    """Absent config → derived default, not a hardcoded constant."""
+    from agent.lsp import manager as mgr
+
+    monkeypatch.setattr(mgr, "_host_total_gib", lambda: 16.0)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"lsp": {"enabled": False}},
+    )
+    svc = LSPService.create_from_config()
+    assert svc is not None
+    assert svc._max_clients == 3
+
+
+def test_create_from_config_clamps_and_rejects_bad_max_clients(monkeypatch):
+    """A cap of 1 thrashes (alternating edits evict each other); 0 still
+    disables; garbage falls back to the derived default."""
+    from agent.lsp import manager as mgr
+
+    monkeypatch.setattr(mgr, "_host_total_gib", lambda: 16.0)
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"lsp": {"enabled": False, "max_clients": 1}},
+    )
+    assert LSPService.create_from_config()._max_clients == mgr.MIN_MAX_CLIENTS
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"lsp": {"enabled": False, "max_clients": 0}},
+    )
+    assert LSPService.create_from_config()._max_clients == 0
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"lsp": {"enabled": False, "max_clients": "not-a-number"}},
+    )
+    assert LSPService.create_from_config()._max_clients == 3
+
+
+def test_default_config_declares_max_clients():
+    """The knob is discoverable via DEFAULT_CONFIG, declared as null so
+    the host-derived default applies unless the user overrides it."""
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert "max_clients" in DEFAULT_CONFIG["lsp"]
+    assert DEFAULT_CONFIG["lsp"]["max_clients"] is None
+
+
+def test_status_reports_cap_and_timeout(mock_pyright_repos):
+    """``hermes lsp status`` must surface both bounds — otherwise "the
+    cache never evicts" stays unfalsifiable from outside the process."""
+    a = mock_pyright_repos("a")
+    svc = _svc(max_clients=5, idle_timeout=123.0)
+    try:
+        svc.get_diagnostics_sync(str(a))
+        status = svc.get_status()
+        assert status["max_clients"] == 5
+        assert status["idle_timeout"] == 123.0
+    finally:
+        svc.shutdown()
+
+
