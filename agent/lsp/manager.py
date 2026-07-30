@@ -557,16 +557,17 @@ class LSPService:
         if client is None:
             return []
         try:
-            with self._busy(client):
-                version = await client.open_file(
-                    file_path, language_id=language_id_for(file_path)
-                )
-                fresh = await client.wait_for_diagnostics(
-                    file_path, version, mode=self._wait_mode
-                )
+            version = await client.open_file(
+                file_path, language_id=language_id_for(file_path)
+            )
+            fresh = await client.wait_for_diagnostics(
+                file_path, version, mode=self._wait_mode
+            )
         except Exception as e:  # noqa: BLE001
             logger.debug("snapshot open/wait failed: %s", e)
             return []
+        finally:
+            self._release(client)
         self._touch(client)
         if not fresh:
             # No fresh data for the pre-edit content — an empty baseline
@@ -588,17 +589,18 @@ class LSPService:
         if client is None:
             return None
         try:
-            with self._busy(client):
-                version = await client.open_file(
-                    file_path, language_id=language_id_for(file_path)
-                )
-                await client.save_file(file_path)
-                fresh = await client.wait_for_diagnostics(
-                    file_path, version, mode=self._wait_mode, timeout=self._wait_timeout
-                )
+            version = await client.open_file(
+                file_path, language_id=language_id_for(file_path)
+            )
+            await client.save_file(file_path)
+            fresh = await client.wait_for_diagnostics(
+                file_path, version, mode=self._wait_mode, timeout=self._wait_timeout
+            )
         except Exception as e:  # noqa: BLE001
             logger.debug("open/wait failed for %s: %s", file_path, e)
             return None
+        finally:
+            self._release(client)
         self._touch(client)
         if not fresh:
             return None
@@ -640,14 +642,30 @@ class LSPService:
             client = self._clients.get(key)
             if client is not None and client.is_running:
                 self._last_used[key] = time.time()
+                # Take the in-flight reference under the SAME lock that
+                # read the client.  Acquiring it after the lock is
+                # released leaves a window in which a concurrent sweep
+                # sees refcount 0 and shuts this client down between the
+                # lookup and the caller's first request.
+                self._inflight[key] = self._inflight.get(key, 0) + 1
                 eventlog.log_active(srv.server_id, per_server_root)
                 return client
             spawning = self._spawning.get(key)
         if spawning is not None:
             try:
-                return await spawning
+                client = await spawning
             except Exception:  # noqa: BLE001
                 return None
+            if client is None:
+                return None
+            # The spawning task registered the client and released the
+            # lock before we got here, so re-check membership before
+            # taking a reference — it may already have been evicted.
+            with self._state_lock:
+                if key not in self._clients:
+                    return None
+                self._inflight[key] = self._inflight.get(key, 0) + 1
+            return client
 
         # Begin spawn
         loop = asyncio.get_running_loop()
@@ -691,6 +709,10 @@ class LSPService:
             with self._state_lock:
                 self._clients[key] = client
                 self._last_used[key] = time.time()
+                # Reference held from birth, for the same reason as the
+                # cache-hit path above: the cap sweep below must not be
+                # able to evict the client we are about to hand back.
+                self._inflight[key] = self._inflight.get(key, 0) + 1
             eventlog.log_active(srv.server_id, per_server_root)
             # Hand the client to any waiters BEFORE enforcing the cap so
             # they aren't blocked behind another client's shutdown.  The
@@ -706,15 +728,30 @@ class LSPService:
     async def _start_idle_reaper(self) -> None:
         self._idle_reaper_task = asyncio.create_task(self._idle_reaper_loop())
 
+    def _release(self, client: LSPClient) -> None:
+        """Drop one in-flight reference taken by :meth:`_get_or_spawn`.
+
+        Must run in a ``finally`` — a leaked count pins the client
+        permanently un-evictable, which reintroduces exactly the
+        unbounded accumulation the cap exists to close.
+        """
+        key = (client.server_id, client.workspace_root)
+        with self._state_lock:
+            remaining = self._inflight.get(key, 1) - 1
+            if remaining > 0:
+                self._inflight[key] = remaining
+            else:
+                self._inflight.pop(key, None)
+
     @contextlib.contextmanager
     def _busy(self, client: LSPClient):
-        """Mark ``client`` as having a request in flight for the duration.
+        """Hold an in-flight reference on ``client`` for the duration.
 
-        Both eviction paths consult this and skip busy clients, so an
-        in-flight open/wait always drains rather than being shut down
-        underneath.  The count is decremented in ``finally`` so an
-        exception can't leak a permanently-busy key (which would pin the
-        client forever and reintroduce the leak).
+        Production code takes its reference inside :meth:`_get_or_spawn`
+        (under the lookup lock, so eviction can't slip in between) and
+        drops it via :meth:`_release`.  This wrapper is the standalone
+        acquire/release pair used by tests and by any caller that
+        already holds a client.
         """
         key = (client.server_id, client.workspace_root)
         with self._state_lock:
@@ -722,12 +759,7 @@ class LSPService:
         try:
             yield
         finally:
-            with self._state_lock:
-                remaining = self._inflight.get(key, 1) - 1
-                if remaining > 0:
-                    self._inflight[key] = remaining
-                else:
-                    self._inflight.pop(key, None)
+            self._release(client)
 
     def _is_busy(self, key: Tuple[str, str]) -> bool:
         """True when ``key`` has at least one request in flight.

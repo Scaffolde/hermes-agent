@@ -548,6 +548,42 @@ def test_busy_counter_released_on_exception(mock_pyright_repos):
         svc.shutdown()
 
 
+def test_get_or_spawn_returns_client_with_reference_held(mock_pyright_repos):
+    """``_get_or_spawn`` must hand back a client that is already marked
+    in-flight.
+
+    Taking the reference after the lookup lock is released leaves a
+    window where a concurrent sweep sees refcount 0 and shuts the client
+    down between the lookup and the caller's first request.  Assert the
+    reference exists at hand-off on both the spawn and cache-hit paths,
+    and that a sweep in that window is a no-op.
+    """
+    a = mock_pyright_repos("a")
+    svc = _svc(max_clients=0, idle_timeout=60.0)
+    try:
+        # Spawn path.
+        client = svc._loop.run(svc._get_or_spawn(str(a)), timeout=10.0)
+        assert client is not None
+        key = (client.server_id, client.workspace_root)
+        assert svc._is_busy(key), "spawn path must return with a reference held"
+
+        # A sweep in the hand-off window must not evict it.
+        svc._last_used[key] = 0.0
+        svc._loop.run(svc._reap_idle_once(), timeout=5.0)
+        assert key in svc._clients
+        svc._release(client)
+        assert not svc._is_busy(key)
+
+        # Cache-hit path.
+        client2 = svc._loop.run(svc._get_or_spawn(str(a)), timeout=10.0)
+        assert client2 is client
+        assert svc._is_busy(key), "cache-hit path must return with a reference held"
+        svc._release(client2)
+        assert not svc._is_busy(key)
+    finally:
+        svc.shutdown()
+
+
 def test_default_max_clients_scales_with_host_memory(monkeypatch):
     """The cap is derived from host RAM, not hardcoded — a 16 GiB Mac
     Mini and a 128 GiB workstation must not get the same number."""
