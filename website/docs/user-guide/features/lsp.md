@@ -164,6 +164,18 @@ lsp:
   #   manual  — only use binaries already on PATH
   install_strategy: auto
 
+  # Seconds a server may sit unused before it is shut down (and
+  # respawned on the next relevant file operation). 0 disables reaping.
+  idle_timeout: 600
+
+  # Seconds between idle sweeps.
+  sweep_interval: 60
+
+  # Maximum servers held at once. Unset (null) measures the host:
+  # ~25% of RAM at ~1.3 GiB per server — 3 on a 16 GiB machine,
+  # 24 on a 128 GiB one.
+  max_clients: null
+
   # Per-server overrides (all optional).
   servers:
     pyright:
@@ -222,9 +234,27 @@ answered after it). Slow servers that haven't re-checked yet result
 in "no data" for that edit — never in yesterday's errors being
 re-reported as current.
 
-Servers are kept alive for the life of the Hermes process. There's
-no idle-timeout reaper — the cost of restarting the server's index
-on every write would be far higher than holding the daemon.
+Servers are cached per `(server, workspace root)` and bounded two ways.
+
+**By time** — a server with no request for `lsp.idle_timeout` seconds
+(default 600) is shut down and respawned on the next relevant file
+operation. Restarting an index costs seconds; holding it costs ~1.3 GiB
+indefinitely. Set `idle_timeout: 0` to keep every server warm for the
+life of the process.
+
+**By count** — idleness alone isn't a sufficient bound: N
+*simultaneously active* worktrees hold N servers alive no matter how
+short the timeout is. `lsp.max_clients` caps the population and evicts
+the least-recently-used server when it's exceeded. Left unset the cap is
+measured from host memory rather than hardcoded, so a 16 GiB Mac Mini
+(3) and a 128 GiB workstation (24) get appropriate values. Set
+`max_clients: 0` to disable the cap.
+
+Neither bound shuts down a server with a request in flight — the
+in-flight work drains first and the eviction defers to the next sweep.
+Both log what they removed and why, at INFO under `lsp[reaper]`, so
+"the cache never evicts" is falsifiable from a log rather than
+reconstructed from `ps`.
 
 ## Disabling
 

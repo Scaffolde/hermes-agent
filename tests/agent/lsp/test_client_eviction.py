@@ -36,6 +36,7 @@ import pytest
 from agent.lsp import eventlog
 from agent.lsp.manager import (
     DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_SWEEP_INTERVAL,
     LSP_CLIENT_FOOTPRINT_BYTES,
     LSP_MEMORY_BUDGET_FRACTION,
     MAX_CLIENT_CAP,
@@ -430,5 +431,57 @@ def test_create_from_config_rejects_bad_bounds(monkeypatch, bad):
     assert svc is not None
     try:
         assert MIN_CLIENT_CAP <= svc._max_clients <= MAX_CLIENT_CAP
+    finally:
+        svc.shutdown()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Config discoverability
+#
+# The bounds are readable from config.yaml, but a knob that isn't in
+# DEFAULT_CONFIG is undiscoverable: `hermes config` won't list it and
+# users can't find it without reading the source.  These pin the
+# declaration to the manager's own constants so the two can't drift.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_default_config_declares_eviction_bounds():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    lsp = DEFAULT_CONFIG["lsp"]
+    for key in ("idle_timeout", "sweep_interval", "max_clients"):
+        assert key in lsp, f"lsp.{key} must be declared in DEFAULT_CONFIG"
+
+
+def test_default_config_bounds_match_manager_constants():
+    """A declared default that disagrees with the code is worse than no
+    default — it documents behaviour the service doesn't have."""
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    lsp = DEFAULT_CONFIG["lsp"]
+    assert float(lsp["idle_timeout"]) == float(DEFAULT_IDLE_TIMEOUT)
+    assert float(lsp["sweep_interval"]) == float(DEFAULT_SWEEP_INTERVAL)
+    # null means "measure this host", which is what create_from_config
+    # translates into default_max_clients().
+    assert lsp["max_clients"] is None
+
+
+def test_declared_default_config_round_trips_through_the_service(monkeypatch):
+    """Feeding DEFAULT_CONFIG back in must reproduce the shipped defaults.
+
+    Catches a declaration that parses but lands on different values than
+    an absent config would.
+    """
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    cfg = {"lsp": dict(DEFAULT_CONFIG["lsp"])}
+    cfg["lsp"]["enabled"] = False
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+
+    svc = LSPService.create_from_config()
+    assert svc is not None
+    try:
+        assert svc._idle_timeout == DEFAULT_IDLE_TIMEOUT
+        assert svc._max_clients == default_max_clients()
     finally:
         svc.shutdown()

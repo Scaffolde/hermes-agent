@@ -3372,6 +3372,31 @@ DEFAULT_CONFIG = {
         # ``"off"`` — alias for ``manual``.
         "install_strategy": "auto",
 
+        # ── Eviction bounds ───────────────────────────────────────────
+        # One language server is held per (server, workspace root).  Each
+        # tsserver on a large TypeScript checkout is ~1.3 GiB resident,
+        # so an unbounded cache is a memory ratchet: thirteen live
+        # servers exceeded a 16 GiB host outright, pushed it into swap,
+        # and held the self-hosted CI runner offline for 5.5h.
+
+        # Seconds a server may sit unused before it is shut down and
+        # respawned on the next relevant file operation.  Set to 0 to
+        # disable idle reaping and hold every server for the life of the
+        # process.
+        "idle_timeout": 600.0,
+
+        # Seconds between idle sweeps.
+        "sweep_interval": 60.0,
+
+        # Maximum servers held at once.  ``idle_timeout`` bounds the
+        # cache by time; this bounds it by count, which is what N
+        # *simultaneously active* worktrees need — they hold N servers
+        # alive no matter how short the timeout is.  When unset (null)
+        # the cap is measured from host memory (~25% of RAM at ~1.3 GiB
+        # per server) rather than hardcoded, so a 16 GiB Mac Mini gets 3
+        # and a 128 GiB workstation gets 24.
+        "max_clients": None,
+
         # Per-server overrides.  Each key is a server_id from the
         # registry (``pyright``, ``typescript``, ``gopls``,
         # ``rust-analyzer``, etc.) and accepts:
