@@ -59,6 +59,93 @@ from agent.lsp.workspace import (
 logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
+DEFAULT_SWEEP_INTERVAL = 60.0  # seconds between idle sweeps
+
+# Cap derivation.  A language server's cost is dominated by the TypeScript
+# program it loads, not by anything we control, so the population has to be
+# bounded against the host rather than guessed.  1.3 GiB is the median
+# resident footprint measured across 13 live ``typescript-language-server``
+# processes on pai-mac-mini (range 1.2-1.65 GiB, each with its own tsserver
+# child).  A quarter of RAM is the share we are willing to let editor
+# tooling hold before it competes with the actual workload — on a 16 GiB
+# host that is 4 GiB, i.e. 3 servers, against the 13 that were live when
+# the box went into swap and took the self-hosted CI runner down.
+LSP_CLIENT_FOOTPRINT_BYTES = 1300 * 1024 * 1024
+LSP_MEMORY_BUDGET_FRACTION = 0.25
+MIN_CLIENT_CAP = 1
+MAX_CLIENT_CAP = 24
+# Used only when host memory can't be read at all.  Deliberately the
+# small-host answer: under-caching costs a few seconds of respawn, while
+# over-caching costs gigabytes the host may not have.
+FALLBACK_CLIENT_CAP = 3
+
+
+def host_memory_bytes() -> Optional[int]:
+    """Total physical RAM in bytes, or ``None`` if it can't be determined.
+
+    ``SC_PHYS_PAGES``/``SC_PAGE_SIZE`` are present on Linux and macOS.
+    Anything else (Windows, an exotic libc, a sandbox that stubs sysconf)
+    falls through to ``None`` and the caller uses a conservative default.
+    """
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        return None
+    if pages <= 0 or page_size <= 0:
+        return None
+    return pages * page_size
+
+
+def default_max_clients(total_bytes: Optional[int] = None) -> int:
+    """How many concurrent language servers this host can afford.
+
+    Pass ``total_bytes`` to compute the cap for a hypothetical host; omit
+    it to measure the current one.  The result is always clamped to
+    ``[MIN_CLIENT_CAP, MAX_CLIENT_CAP]`` — one server is the floor because
+    a cap of zero would disable the feature outright, and the ceiling
+    keeps a very large host from accumulating an unbounded pool simply
+    because it has the headroom to hide the growth.
+    """
+    if total_bytes is None:
+        total_bytes = host_memory_bytes()
+    if not total_bytes or total_bytes <= 0:
+        return FALLBACK_CLIENT_CAP
+    budget = int(total_bytes * LSP_MEMORY_BUDGET_FRACTION)
+    derived = budget // LSP_CLIENT_FOOTPRINT_BYTES
+    return max(MIN_CLIENT_CAP, min(MAX_CLIENT_CAP, int(derived)))
+
+
+def _coerce_positive(value: Any, default: float) -> float:
+    """Parse a config bound, falling back to *default* on anything unusable.
+
+    Garbage must not silently disable a bound — that is how the
+    pre-eviction behaviour comes back without anyone noticing.
+    """
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed <= 0:
+        return default
+    return parsed
+
+
+def _coerce_non_negative(value: Any, default: float) -> float:
+    """Like :func:`_coerce_positive` but accepts an explicit ``0``.
+
+    Used for the idle timeout, where ``0`` is a meaningful opt-out ("pin
+    servers for the life of the process") rather than a typo.  The cap has
+    no such reading — a cap of zero would disable the feature — so it uses
+    the strictly-positive form and clamps instead.
+    """
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < 0:
+        return default
+    return parsed
 
 
 class _BackgroundLoop:
@@ -116,6 +203,22 @@ class _BackgroundLoop:
             fut.cancel()
             raise
 
+    def spawn(self, coro):
+        """Schedule ``coro`` on the loop without waiting for it.
+
+        Returns the :class:`concurrent.futures.Future` so the caller can
+        cancel it later (the reaper is cancelled at shutdown), or ``None``
+        if the loop isn't running.  Unlike :meth:`run` this never blocks —
+        a long-lived background task submitted through ``run`` would
+        deadlock the caller forever.
+        """
+        from agent.async_utils import safe_schedule_threadsafe
+        if self._loop is None:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            return None
+        return safe_schedule_threadsafe(coro, self._loop)
+
     def stop(self) -> None:
         loop = self._loop
         if loop is None:
@@ -155,6 +258,8 @@ class LSPService:
         init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        max_clients: Optional[int] = None,
+        sweep_interval: float = DEFAULT_SWEEP_INTERVAL,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -165,6 +270,11 @@ class LSPService:
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
+        self._max_clients = (
+            default_max_clients() if max_clients is None
+            else max(MIN_CLIENT_CAP, min(MAX_CLIENT_CAP, int(max_clients)))
+        )
+        self._sweep_interval = sweep_interval
 
         self._loop = _BackgroundLoop()
         if self._enabled:
@@ -175,13 +285,25 @@ class LSPService:
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
+        # Outstanding requests per key.  A client with a non-zero count is
+        # mid-request and must never be evicted underneath it — the caller
+        # is blocked on a diagnostics round-trip that would come back as a
+        # spurious "server died" instead of an answer.
+        self._inflight: Dict[Tuple[str, str], int] = {}
         self._state_lock = threading.Lock()
+        self._reaper: Any = None
 
         # Delta baseline: file path → snapshot of diagnostics taken
         # immediately before a write.  ``get_diagnostics_sync`` filters
         # out anything in the baseline so the agent only sees errors
         # introduced by the current edit.
         self._delta_baseline: Dict[str, List[Dict[str, Any]]] = {}
+
+        # The reaper is what makes the idle timeout real.  Before this
+        # existed, ``_idle_timeout`` and ``_last_used`` were both written
+        # and never read, so the cache grew for the life of the gateway.
+        if self._enabled and self._idle_timeout > 0:
+            self._reaper = self._loop.spawn(self._reaper_loop())
 
     @classmethod
     def create_from_config(cls) -> Optional["LSPService"]:
@@ -226,6 +348,22 @@ class LSPService:
                 if isinstance(init, dict):
                     init_overrides[name] = init
 
+        # Eviction bounds.  Defaults are host-derived rather than fixed:
+        # a 16 GiB Mac Mini and a 128 GiB workstation should not carry the
+        # same number of language servers.  ``max_clients`` omitted (or
+        # unparseable) means "measure this host".
+        idle_timeout = _coerce_non_negative(
+            lsp_cfg.get("idle_timeout", DEFAULT_IDLE_TIMEOUT), DEFAULT_IDLE_TIMEOUT
+        )
+        sweep_interval = _coerce_positive(
+            lsp_cfg.get("sweep_interval", DEFAULT_SWEEP_INTERVAL), DEFAULT_SWEEP_INTERVAL
+        )
+        raw_cap = lsp_cfg.get("max_clients")
+        max_clients = (
+            None if raw_cap is None
+            else int(_coerce_positive(raw_cap, default_max_clients()))
+        )
+
         return cls(
             enabled=enabled,
             wait_mode=wait_mode,
@@ -235,6 +373,9 @@ class LSPService:
             env_overrides=env_overrides,
             init_overrides=init_overrides,
             disabled_servers=disabled,
+            idle_timeout=idle_timeout,
+            max_clients=max_clients,
+            sweep_interval=sweep_interval,
         )
 
     # ------------------------------------------------------------------
@@ -434,6 +575,11 @@ class LSPService:
         # ``_clients`` with a half-initialized state.
         with self._state_lock:
             client = self._clients.pop(key, None)
+            # Drop the eviction bookkeeping with it — a key left in
+            # ``_last_used`` with no client behind it is exactly the stale
+            # state that made the idle timeout unauditable.
+            self._last_used.pop(key, None)
+            self._inflight.pop(key, None)
         if client is not None:
             try:
                 # Fire-and-forget shutdown — give it a second to cleanup,
@@ -449,12 +595,157 @@ class LSPService:
         """Tear down all clients and stop the background loop."""
         if not self._enabled:
             return
+        reaper = self._reaper
+        self._reaper = None
+        if reaper is not None:
+            reaper.cancel()
         try:
             self._loop.run(self._shutdown_async(), timeout=10.0)
         except Exception as e:  # noqa: BLE001
             logger.debug("LSP shutdown error: %s", e)
         self._loop.stop()
         clear_cache()
+
+    # ------------------------------------------------------------------
+    # eviction
+    # ------------------------------------------------------------------
+
+    def _acquire(self, key: Tuple[str, str]) -> None:
+        """Mark a request as in-flight against *key*.
+
+        Refcounted rather than a boolean: two concurrent edits in the same
+        project share one client, and the first to finish must not expose
+        it to eviction while the second is still waiting.
+        """
+        with self._state_lock:
+            self._inflight[key] = self._inflight.get(key, 0) + 1
+
+    def _release(self, key: Tuple[str, str]) -> None:
+        with self._state_lock:
+            remaining = self._inflight.get(key, 0) - 1
+            if remaining > 0:
+                self._inflight[key] = remaining
+            else:
+                self._inflight.pop(key, None)
+
+    def sweep_idle_now(self) -> List[Tuple[str, str]]:
+        """Run one idle sweep synchronously; return the keys evicted.
+
+        The reaper calls the same coroutine on its timer — this is the
+        hand-crank for tests and for ``hermes lsp`` tooling, not a
+        substitute for the timer.
+        """
+        if not self._enabled:
+            return []
+        try:
+            return self._loop.run(self._sweep_idle_async(), timeout=15.0) or []
+        except Exception as e:  # noqa: BLE001
+            logger.debug("LSP idle sweep failed: %s", e)
+            return []
+
+    def enforce_cap_now(self) -> List[Tuple[str, str]]:
+        """Evict least-recently-used clients until the cap is satisfied."""
+        if not self._enabled:
+            return []
+        try:
+            return self._loop.run(self._enforce_cap_async(), timeout=15.0) or []
+        except Exception as e:  # noqa: BLE001
+            logger.debug("LSP cap enforcement failed: %s", e)
+            return []
+
+    async def _evict(self, key: Tuple[str, str], reason: str) -> bool:
+        """Shut down the client at *key* and drop its bookkeeping.
+
+        Returns False if it vanished under us (a concurrent shutdown or a
+        second sweep) so callers can keep their evicted-list honest.
+        """
+        with self._state_lock:
+            if self._inflight.get(key, 0) > 0:
+                return False
+            client = self._clients.pop(key, None)
+            self._last_used.pop(key, None)
+        if client is None:
+            return False
+        eventlog.log_evicted(key[0], key[1], reason)
+        try:
+            await client.shutdown()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("evicted client %s failed to shut down cleanly: %s", key, e)
+        return True
+
+    def _evictable(self) -> List[Tuple[Tuple[str, str], float]]:
+        """(key, last_used) for clients with no outstanding request,
+        oldest first."""
+        with self._state_lock:
+            candidates = [
+                (key, self._last_used.get(key, 0.0))
+                for key in self._clients
+                if self._inflight.get(key, 0) == 0
+            ]
+        candidates.sort(key=lambda kv: kv[1])
+        return candidates
+
+    async def _sweep_idle_async(self) -> List[Tuple[str, str]]:
+        if self._idle_timeout <= 0:
+            return []
+        cutoff = time.time() - self._idle_timeout
+        evicted: List[Tuple[str, str]] = []
+        for key, last_used in self._evictable():
+            if last_used > cutoff:
+                # Sorted oldest-first, so the first fresh one ends the scan.
+                break
+            if await self._evict(key, f"idle > {int(self._idle_timeout)}s"):
+                evicted.append(key)
+        return evicted
+
+    async def _enforce_cap_async(
+        self, protect: Optional[Tuple[str, str]] = None
+    ) -> List[Tuple[str, str]]:
+        """Drain to ``_max_clients``, evicting least-recently-used first.
+
+        *protect* is the key that just spawned: evicting the client the
+        caller is about to use would turn a cap into an infinite
+        spawn/evict loop.
+        """
+        evicted: List[Tuple[str, str]] = []
+        while True:
+            with self._state_lock:
+                overage = len(self._clients) - self._max_clients
+            if overage <= 0:
+                break
+            victim = next(
+                (key for key, _ in self._evictable() if key != protect),
+                None,
+            )
+            if victim is None:
+                # Everything left is in-flight or protected.  Going over
+                # the cap briefly is the right trade against killing a
+                # live request; the next sweep collects the slack.
+                logger.debug(
+                    "LSP cap %d exceeded by %d but all clients are busy",
+                    self._max_clients,
+                    overage,
+                )
+                break
+            if await self._evict(victim, f"lru cap {self._max_clients}"):
+                evicted.append(victim)
+            else:
+                break
+        return evicted
+
+    async def _reaper_loop(self) -> None:
+        """Periodically evict idle clients for the life of the service."""
+        interval = max(1.0, min(self._sweep_interval, max(self._idle_timeout, 1.0)))
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._sweep_idle_async()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                # A reaper that dies on one bad client silently restores the
+                # unbounded-growth behaviour, so it never exits on error.
+                logger.debug("LSP reaper iteration failed: %s", e)
 
     # ------------------------------------------------------------------
     # async internals
@@ -464,13 +755,23 @@ class LSPService:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return []
+        # ``_get_or_spawn`` hands back a client with the in-flight refcount
+        # already held; releasing it is this caller's responsibility.
+        key = (client.server_id, client.workspace_root)
         try:
             version = await client.open_file(file_path, language_id=language_id_for(file_path))
             fresh = await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
         except Exception as e:  # noqa: BLE001
             logger.debug("snapshot open/wait failed: %s", e)
             return []
-        self._last_used[(client.server_id, client.workspace_root)] = time.time()
+        finally:
+            # Touch before releasing: a slow or failed request is still
+            # activity on this root, and counting it as idle would make a
+            # struggling server the first thing the reaper kills.
+            with self._state_lock:
+                if key in self._clients:
+                    self._last_used[key] = time.time()
+            self._release(key)
         if not fresh:
             # No fresh data for the pre-edit content — an empty baseline
             # is safe: worst case the delta filter removes less, never
@@ -490,6 +791,7 @@ class LSPService:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return None
+        key = (client.server_id, client.workspace_root)
         try:
             version = await client.open_file(file_path, language_id=language_id_for(file_path))
             await client.save_file(file_path)
@@ -499,7 +801,11 @@ class LSPService:
         except Exception as e:  # noqa: BLE001
             logger.debug("open/wait failed for %s: %s", file_path, e)
             return None
-        self._last_used[(client.server_id, client.workspace_root)] = time.time()
+        finally:
+            with self._state_lock:
+                if key in self._clients:
+                    self._last_used[key] = time.time()
+            self._release(key)
         if not fresh:
             return None
         return list(client.diagnostics_for(file_path, fresh_only=True))
@@ -539,14 +845,22 @@ class LSPService:
         with self._state_lock:
             client = self._clients.get(key)
             if client is not None and client.is_running:
+                # Acquire under the same lock that read the client, so an
+                # eviction can never slip between the lookup and the
+                # refcount and shut the server down under this caller.
+                self._inflight[key] = self._inflight.get(key, 0) + 1
                 eventlog.log_active(srv.server_id, per_server_root)
                 return client
             spawning = self._spawning.get(key)
         if spawning is not None:
             try:
-                return await spawning
+                client = await spawning
             except Exception:  # noqa: BLE001
                 return None
+            if client is None:
+                return None
+            self._acquire(key)
+            return client
 
         # Begin spawn
         loop = asyncio.get_running_loop()
@@ -589,9 +903,15 @@ class LSPService:
                 return None
             with self._state_lock:
                 self._clients[key] = client
-            self._last_used[key] = time.time()
+                self._last_used[key] = time.time()
+                self._inflight[key] = self._inflight.get(key, 0) + 1
             eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
+            # Bound the population the moment it grows.  ``protect=key``
+            # keeps the cap from evicting the client this caller is about
+            # to use, which would otherwise spin spawn/evict forever once
+            # the cap is saturated.
+            await self._enforce_cap_async(protect=key)
             return client
         finally:
             with self._state_lock:
@@ -603,6 +923,7 @@ class LSPService:
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
+            self._inflight.clear()
         await asyncio.gather(
             *(c.shutdown() for c in clients),
             return_exceptions=True,
@@ -614,6 +935,7 @@ class LSPService:
 
     def get_status(self) -> Dict[str, Any]:
         """Return a snapshot of the service for the CLI status command."""
+        now = time.time()
         with self._state_lock:
             clients = [
                 {
@@ -621,6 +943,12 @@ class LSPService:
                     "workspace_root": k[1],
                     "state": c.state,
                     "running": c.is_running,
+                    # Surfacing idleness and busyness makes the eviction
+                    # bounds auditable from ``hermes lsp status`` — an
+                    # operator can see why a server is or isn't a
+                    # candidate without reading this file.
+                    "idle_seconds": round(now - self._last_used.get(k, now), 1),
+                    "inflight": self._inflight.get(k, 0),
                 }
                 for k, c in self._clients.items()
             ]
@@ -630,6 +958,9 @@ class LSPService:
             "wait_mode": self._wait_mode,
             "wait_timeout": self._wait_timeout,
             "install_strategy": self._install_strategy,
+            "idle_timeout": self._idle_timeout,
+            "max_clients": self._max_clients,
+            "sweep_interval": self._sweep_interval,
             "clients": clients,
             "broken": broken,
             "disabled_servers": sorted(self._disabled_servers),
@@ -667,4 +998,15 @@ def _diag_key(d: Dict[str, Any]) -> str:
     )
 
 
-__all__ = ["LSPService"]
+__all__ = [
+    "LSPService",
+    "DEFAULT_IDLE_TIMEOUT",
+    "DEFAULT_SWEEP_INTERVAL",
+    "LSP_CLIENT_FOOTPRINT_BYTES",
+    "LSP_MEMORY_BUDGET_FRACTION",
+    "MIN_CLIENT_CAP",
+    "MAX_CLIENT_CAP",
+    "FALLBACK_CLIENT_CAP",
+    "host_memory_bytes",
+    "default_max_clients",
+]

@@ -188,6 +188,31 @@ def log_spawn_failed(server_id: str, workspace_root: str, exc: BaseException) ->
     )
 
 
+def log_evicted(server_id: str, workspace_root: str, reason: str) -> None:
+    """A live client was shut down to reclaim memory.  INFO every time.
+
+    Evictions are rare (bounded by the idle timeout and the cap) and are
+    the single line that makes "the cache never evicts" falsifiable from
+    the log instead of reconstructed from ``ps``, so they are never
+    deduped.  *reason* distinguishes an idle reap from a cap eviction:
+    the first says the host is quiet, the second says it is oversubscribed.
+    """
+    _emit(server_id, logging.INFO, f"evicted {workspace_root} ({reason})")
+    forget_active(server_id, workspace_root)
+
+
+def forget_active(server_id: str, workspace_root: str) -> None:
+    """Drop the ``log_active`` INFO-once memo for this pair.
+
+    Called on eviction so a later legitimate re-spawn announces itself at
+    INFO again.  Without it the respawn silently degrades to the "reused
+    client" DEBUG line and the log reads as though the server had been up
+    continuously across an eviction it in fact did not survive.
+    """
+    with _announce_lock:
+        _announced_active.discard((server_id, workspace_root))
+
+
 def reset_announce_caches() -> None:
     """Test-only: clear the dedup caches.  Production code never calls this."""
     with _announce_lock:
@@ -209,5 +234,7 @@ __all__ = [
     "log_timeout",
     "log_server_error",
     "log_spawn_failed",
+    "log_evicted",
+    "forget_active",
     "reset_announce_caches",
 ]
