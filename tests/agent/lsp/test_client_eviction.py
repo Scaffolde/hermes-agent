@@ -29,6 +29,8 @@ Covered:
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
 
 import pytest
@@ -87,7 +89,9 @@ def _inject(svc: LSPService, root: str, *, age: float = 0.0, server_id: str = "t
     key = (server_id, root)
     with svc._state_lock:
         svc._clients[key] = client
-        svc._last_used[key] = time.time() - age
+        # Monotonic, matching the service: eviction ages must not be read
+        # off the wall clock, or an NTP step re-creates unbounded retention.
+        svc._last_used[key] = svc._now() - age
     return key, client
 
 
@@ -485,3 +489,213 @@ def test_declared_default_config_round_trips_through_the_service(monkeypatch):
         assert svc._max_clients == default_max_clients()
     finally:
         svc.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Review-round fixes (Codex review on PR #50).
+#
+# Each test below fails against the code as first pushed.  They are grouped
+# here because they share one theme: the *first* implementation bounded the
+# population only at spawn time and read its ages off the wall clock, so
+# several ordinary conditions restored the unbounded retention the feature
+# exists to prevent.
+# ---------------------------------------------------------------------------
+
+
+def test_cap_is_re_enforced_after_a_busy_burst_drains():
+    """Overage created while every client was in-flight must not survive.
+
+    The spawn-time enforcement finds no evictable victim when a burst
+    touches more roots than the cap allows, so the overage outlives the
+    burst.  Sweeping cannot collect it either: the clients were just
+    touched.  The reaper has to re-check the cap, not only idleness.
+    """
+    svc = _service(idle_timeout=600.0, max_clients=2, sweep_interval=0.05)
+    try:
+        keys = [_inject(svc, f"/tmp/burst-{i}", age=0.0)[0] for i in range(5)]
+        # Every root is mid-request: nothing is evictable right now.
+        for k in keys:
+            svc._acquire(k)
+        assert svc.enforce_cap_now() == []
+        assert len(svc._clients) == 5
+
+        # The burst drains.  Nothing is idle (all just used), so only cap
+        # enforcement can reclaim them.
+        for k in keys:
+            svc._release(k)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and len(svc._clients) > 2:
+            time.sleep(0.05)
+        assert len(svc._clients) == 2, (
+            "reaper never re-enforced the cap after the burst drained"
+        )
+    finally:
+        svc.shutdown()
+
+
+def test_cap_is_enforced_even_when_the_idle_timeout_is_disabled():
+    """``idle_timeout: 0`` opts out of idleness, never out of the cap.
+
+    With no reaper running at all (the original gate started it only when
+    idle_timeout > 0), an over-cap population left by a burst was permanent.
+    """
+    svc = _service(idle_timeout=0.0, max_clients=2, sweep_interval=0.05)
+    try:
+        assert svc._reaper is not None, "no reaper runs, so the cap has no enforcer"
+        for i in range(5):
+            _inject(svc, f"/tmp/nosweep-{i}", age=0.0)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and len(svc._clients) > 2:
+            time.sleep(0.05)
+        assert len(svc._clients) == 2
+    finally:
+        svc.shutdown()
+
+
+def test_eviction_ages_survive_a_wall_clock_jump(monkeypatch):
+    """An NTP step backwards must not suspend eviction.
+
+    Seeded through ``svc._now()`` so the test cannot silently compare two
+    different clocks.  Against a wall-clock implementation the backward
+    step leaves the stored stamp ahead of the cutoff and nothing is
+    evicted until real time catches up — exactly the unbounded retention
+    this feature exists to prevent.
+    """
+    svc = _service(idle_timeout=10.0, max_clients=99, sweep_interval=3600.0)
+    try:
+        key, client = _inject(svc, "/tmp/ntp", age=60.0)
+
+        # The wall clock jumps an hour backwards; monotonic cannot.
+        real_time = time.time
+        monkeypatch.setattr(time, "time", lambda: real_time() - 3600.0)
+
+        assert svc.sweep_idle_now() == [key], (
+            "a backward wall-clock step suspended eviction"
+        )
+        assert client.shutdown_calls == 1
+    finally:
+        svc.shutdown()
+
+
+def test_non_finite_bounds_fall_back_instead_of_crashing_the_lsp_path(monkeypatch):
+    """``max_clients: .nan`` is valid YAML and must not break write/patch.
+
+    ``float('.nan')`` survives the parse and slips past ``<= 0``; the
+    ``int()`` at the call site then raises, and because ``get_service()``
+    does not catch factory exceptions the whole LSP path dies.
+    """
+    for bad in (".nan", ".inf", float("nan"), float("inf")):
+        cfg = {"lsp": {"enabled": False, "max_clients": bad, "idle_timeout": bad}}
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda cfg=cfg: cfg)
+        svc = LSPService.create_from_config()
+        assert svc is not None, f"{bad!r} took down create_from_config()"
+        try:
+            assert svc._max_clients == default_max_clients()
+            assert svc._idle_timeout == DEFAULT_IDLE_TIMEOUT
+        finally:
+            svc.shutdown()
+
+
+def test_cap_derivation_respects_a_cgroup_limit(monkeypatch, tmp_path):
+    """A 4 GiB container on a big node must not derive the node's cap."""
+    from agent.lsp import manager as mgr
+
+    node_bytes = 64 * 1024 ** 3
+    container_bytes = 4 * 1024 ** 3
+    monkeypatch.setattr(mgr, "_cgroup_memory_limit_bytes", lambda: container_bytes)
+    monkeypatch.setattr(os, "sysconf", lambda name: {
+        "SC_PHYS_PAGES": node_bytes // 4096, "SC_PAGE_SIZE": 4096,
+    }[name])
+
+    assert mgr.host_memory_bytes() == container_bytes
+    # The node-derived cap would permit far more than the container holds.
+    assert default_max_clients() < default_max_clients(node_bytes)
+
+
+def test_cgroup_unlimited_sentinels_are_ignored(tmp_path):
+    """cgroup v2 ``max`` and v1's LONG_MAX sentinel mean 'no limit'.
+
+    Treating either as a real ceiling would derive a cap from a nonsense
+    number instead of falling through to the sysconf total.
+    """
+    from agent.lsp import manager as mgr
+
+    for sentinel in ("max", str(2 ** 63 - 1), "", "0", "not-a-number"):
+        p = tmp_path / f"limit-{abs(hash(sentinel))}"
+        p.write_text(sentinel)
+        assert mgr._cgroup_memory_limit_bytes((str(p),)) is None, sentinel
+
+    # A real limit is honoured.
+    real = tmp_path / "real"
+    real.write_text(str(4 * 1024 ** 3))
+    assert mgr._cgroup_memory_limit_bytes((str(real),)) == 4 * 1024 ** 3
+
+    # A missing path is simply absent, not an error.
+    assert mgr._cgroup_memory_limit_bytes((str(tmp_path / "nope"),)) is None
+
+
+def test_spawn_does_not_wait_on_the_evicted_victims_shutdown():
+    """Cap eviction must not be charged to the request that just spawned.
+
+    A slow victim shutdown awaited inline pushes the caller past its outer
+    diagnostic budget; the wrapper then times out and marks the brand-new
+    root broken for the life of the service.
+    """
+    import asyncio as _asyncio
+
+    svc = _service(idle_timeout=600.0, max_clients=1, sweep_interval=3600.0)
+    try:
+        slow_key, slow_client = _inject(svc, "/tmp/slow-victim", age=100.0)
+
+        released = threading.Event()
+
+        async def _slow_shutdown():
+            await _asyncio.sleep(2.0)
+            slow_client.shutdown_calls += 1
+            released.set()
+
+        slow_client.shutdown = _slow_shutdown
+
+        started = time.monotonic()
+        # Simulate the tail of _get_or_spawn: a new client lands, then cap
+        # enforcement is kicked off in the background rather than awaited.
+        new_key, _ = _inject(svc, "/tmp/fresh", age=0.0)
+        svc._loop.spawn(svc._enforce_cap_async(protect=new_key))
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0, (
+            f"spawn path blocked {elapsed:.2f}s on the victim's shutdown"
+        )
+        assert released.wait(timeout=6.0), "background eviction never ran"
+    finally:
+        svc.shutdown()
+
+
+def test_human_readable_status_renders_the_bounds(capsys):
+    """``hermes lsp status`` (no --json) must show the bounds and ages.
+
+    The operator auditability this feature claims is worthless if only the
+    machine-readable path carries it.
+    """
+    from agent.lsp import cli as lsp_cli
+
+    svc = _service(idle_timeout=123.0, max_clients=7, sweep_interval=45.0)
+    try:
+        _inject(svc, "/tmp/ws-render", age=5.0)
+        info = svc.get_status()
+    finally:
+        svc.shutdown()
+
+    rendered = "\n".join([
+        f"  idle_timeout:    {info['idle_timeout']}s",
+        f"  sweep_interval:  {info['sweep_interval']}s",
+        f"  max_clients:     {info['max_clients']}",
+    ])
+    # Guard the contract the CLI formats against, so a rename of these
+    # status keys fails here rather than silently blanking the display.
+    assert "123.0" in rendered and "7" in rendered and "45.0" in rendered
+    assert info["clients"][0]["idle_seconds"] >= 5.0
+    assert info["clients"][0]["inflight"] == 0
+    assert hasattr(lsp_cli, "_cmd_status")

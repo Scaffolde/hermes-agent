@@ -165,7 +165,8 @@ lsp:
   install_strategy: auto
 
   # Seconds a server may sit unused before it is shut down (and
-  # respawned on the next relevant file operation). 0 disables reaping.
+  # respawned on the next relevant file operation). 0 disables the idle
+  # bound only; the max_clients cap is still enforced.
   idle_timeout: 600
 
   # Seconds between idle sweeps.
@@ -240,7 +241,12 @@ Servers are cached per `(server, workspace root)` and bounded two ways.
 (default 600) is shut down and respawned on the next relevant file
 operation. Restarting an index costs seconds; holding it costs ~1.3 GiB
 indefinitely. Set `idle_timeout: 0` to keep every server warm for the
-life of the process.
+life of the process — this opts out of the *idle* bound only, and
+`max_clients` continues to be enforced.
+
+Ages are measured on a monotonic clock, so an NTP correction, a VM
+resume, or a manual clock change cannot suspend reaping or evict a
+server that was just used.
 
 **By count** — idleness alone isn't a sufficient bound: N
 *simultaneously active* worktrees hold N servers alive no matter how
@@ -252,6 +258,15 @@ measured from host memory rather than hardcoded, so a 16 GiB Mac Mini
 
 Neither bound shuts down a server with a request in flight — the
 in-flight work drains first and the eviction defers to the next sweep.
+The cap is therefore re-checked on every sweep, not only when a server
+is spawned: a burst that touches more roots than the cap allows finds
+every client busy, and the resulting overage is collected once those
+requests drain. Cap eviction also runs in the background rather than on
+the spawning request, so a slow shutdown can never be charged to the
+caller that just started a server.
+
+In a memory-limited container the cap is derived from the cgroup limit
+when one is present, not from the node's total RAM.
 Both log what they removed and why, at INFO under `lsp[reaper]`, so
 "the cache never evicts" is falsifiable from a log rather than
 reconstructed from `ps`.

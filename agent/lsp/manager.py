@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import threading
 import time
@@ -80,21 +81,66 @@ MAX_CLIENT_CAP = 24
 FALLBACK_CLIENT_CAP = 3
 
 
+CGROUP_MEMORY_LIMIT_PATHS = (
+    "/sys/fs/cgroup/memory.max",  # v2
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # v1
+)
+
+
+def _cgroup_memory_limit_bytes(paths: Tuple[str, ...] = CGROUP_MEMORY_LIMIT_PATHS) -> Optional[int]:
+    """The cgroup memory ceiling in bytes, or ``None`` if unlimited/absent.
+
+    Checked before trusting sysconf because in a memory-limited container
+    ``SC_PHYS_PAGES`` reports the *node's* RAM, not the share this process
+    may actually use.  cgroup v2 writes ``max`` for "no limit"; v1 writes a
+    sentinel near 2**63, so implausibly large values are treated as absent.
+
+    *paths* is injectable so the sentinel handling is testable off-Linux.
+    """
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = fh.read().strip()
+        except (OSError, ValueError):
+            continue
+        if not raw or raw == "max":
+            continue
+        try:
+            limit = int(raw)
+        except ValueError:
+            continue
+        # v1's "unlimited" sentinel is page-aligned LONG_MAX; anything at
+        # petabyte scale is that sentinel rather than a real allocation.
+        if limit <= 0 or limit >= (1 << 50):
+            continue
+        return limit
+    return None
+
+
 def host_memory_bytes() -> Optional[int]:
-    """Total physical RAM in bytes, or ``None`` if it can't be determined.
+    """Memory this process may actually use, or ``None`` if undeterminable.
 
     ``SC_PHYS_PAGES``/``SC_PAGE_SIZE`` are present on Linux and macOS.
     Anything else (Windows, an exotic libc, a sandbox that stubs sysconf)
     falls through to ``None`` and the caller uses a conservative default.
+
+    A cgroup limit, when present, wins over the sysconf total whenever it
+    is smaller: deriving the cap from 64 GiB of node RAM inside a 4 GiB
+    container permits a client population that OOMs the container.
     """
+    total: Optional[int]
     try:
         pages = os.sysconf("SC_PHYS_PAGES")
         page_size = os.sysconf("SC_PAGE_SIZE")
     except (ValueError, OSError, AttributeError):
-        return None
-    if pages <= 0 or page_size <= 0:
-        return None
-    return pages * page_size
+        total = None
+    else:
+        total = pages * page_size if pages > 0 and page_size > 0 else None
+
+    limit = _cgroup_memory_limit_bytes()
+    if limit is not None:
+        return limit if total is None else min(total, limit)
+    return total
 
 
 def default_max_clients(total_bytes: Optional[int] = None) -> int:
@@ -126,6 +172,13 @@ def _coerce_positive(value: Any, default: float) -> float:
         parsed = float(value)
     except (TypeError, ValueError):
         return default
+    # ``.nan``/``.inf`` are valid YAML and survive ``float()``, but both
+    # slip past the ``<= 0`` test and then blow up in the ``int()`` at the
+    # call site (ValueError / OverflowError).  That exception escapes
+    # ``create_from_config`` and takes the whole LSP path down, so a
+    # merely-odd config would break write/patch instead of falling back.
+    if not math.isfinite(parsed):
+        return default
     if parsed <= 0:
         return default
     return parsed
@@ -142,6 +195,8 @@ def _coerce_non_negative(value: Any, default: float) -> float:
     try:
         parsed = float(value)
     except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
         return default
     if parsed < 0:
         return default
@@ -285,6 +340,9 @@ class LSPService:
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
+        # Strong refs to in-flight background cap-enforcement tasks; see
+        # the ``create_task`` call in ``_get_or_spawn``.
+        self._cap_tasks: set = set()
         # Outstanding requests per key.  A client with a non-zero count is
         # mid-request and must never be evicted underneath it — the caller
         # is blocked on a diagnostics round-trip that would come back as a
@@ -302,7 +360,11 @@ class LSPService:
         # The reaper is what makes the idle timeout real.  Before this
         # existed, ``_idle_timeout`` and ``_last_used`` were both written
         # and never read, so the cache grew for the life of the gateway.
-        if self._enabled and self._idle_timeout > 0:
+        # It runs whenever the service is enabled, not only when an idle
+        # timeout is set: ``idle_timeout: 0`` opts out of *idleness* but
+        # not out of the cap, and the cap needs a periodic enforcer to
+        # collect overage left behind by a concurrent burst.
+        if self._enabled:
             self._reaper = self._loop.spawn(self._reaper_loop())
 
     @classmethod
@@ -610,6 +672,19 @@ class LSPService:
     # eviction
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _now() -> float:
+        """The clock every eviction age is measured against.
+
+        Monotonic, never wall time: an NTP correction, a VM resume, or a
+        manual clock change must not be able to suspend the reaper (a
+        backward step leaves every stored stamp ahead of the cutoff) or
+        evict clients that were just used (a forward step).  Routing all
+        eviction bookkeeping through one seam keeps the two sides from
+        drifting onto different clocks.
+        """
+        return time.monotonic()
+
     def _acquire(self, key: Tuple[str, str]) -> None:
         """Mark a request as in-flight against *key*.
 
@@ -688,7 +763,7 @@ class LSPService:
     async def _sweep_idle_async(self) -> List[Tuple[str, str]]:
         if self._idle_timeout <= 0:
             return []
-        cutoff = time.time() - self._idle_timeout
+        cutoff = self._now() - self._idle_timeout
         evicted: List[Tuple[str, str]] = []
         for key, last_used in self._evictable():
             if last_used > cutoff:
@@ -734,12 +809,20 @@ class LSPService:
         return evicted
 
     async def _reaper_loop(self) -> None:
-        """Periodically evict idle clients for the life of the service."""
+        """Periodically evict idle and over-cap clients, for the service's life."""
         interval = max(1.0, min(self._sweep_interval, max(self._idle_timeout, 1.0)))
         while True:
             try:
                 await asyncio.sleep(interval)
                 await self._sweep_idle_async()
+                # The cap must be re-checked every iteration, not only at
+                # spawn.  When requests against more than ``_max_clients``
+                # roots overlap, every existing client is in-flight and the
+                # spawn-time enforcement finds no evictable victim, so the
+                # overage outlives the burst.  Sweeping alone cannot collect
+                # it: those clients were just touched, and with
+                # ``idle_timeout: 0`` the sweep is a no-op forever.
+                await self._enforce_cap_async()
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -770,7 +853,7 @@ class LSPService:
             # struggling server the first thing the reaper kills.
             with self._state_lock:
                 if key in self._clients:
-                    self._last_used[key] = time.time()
+                    self._last_used[key] = self._now()
             self._release(key)
         if not fresh:
             # No fresh data for the pre-edit content — an empty baseline
@@ -804,7 +887,7 @@ class LSPService:
         finally:
             with self._state_lock:
                 if key in self._clients:
-                    self._last_used[key] = time.time()
+                    self._last_used[key] = self._now()
             self._release(key)
         if not fresh:
             return None
@@ -903,7 +986,7 @@ class LSPService:
                 return None
             with self._state_lock:
                 self._clients[key] = client
-                self._last_used[key] = time.time()
+                self._last_used[key] = self._now()
                 self._inflight[key] = self._inflight.get(key, 0) + 1
             eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
@@ -911,7 +994,22 @@ class LSPService:
             # keeps the cap from evicting the client this caller is about
             # to use, which would otherwise spin spawn/evict forever once
             # the cap is saturated.
-            await self._enforce_cap_async(protect=key)
+            #
+            # Deliberately not awaited: the victim's shutdown can take up
+            # to its own shutdown timeout, and charging that to the caller
+            # that just spawned pushes it past the outer diagnostic budget.
+            # The wrappers then time out, mark the root broken, and kill a
+            # client that started perfectly well — disabling that root for
+            # the rest of the service's life.  Eviction is background work;
+            # the reaper re-checks the cap regardless.
+            #
+            # ``create_task`` (not ``_loop.spawn``) because we are already
+            # on the loop here, and a strong reference is retained because
+            # the event loop only holds a weak one — an unreferenced task
+            # can be collected mid-shutdown, silently skipping eviction.
+            task = asyncio.create_task(self._enforce_cap_async(protect=key))
+            self._cap_tasks.add(task)
+            task.add_done_callback(self._cap_tasks.discard)
             return client
         finally:
             with self._state_lock:
@@ -935,7 +1033,7 @@ class LSPService:
 
     def get_status(self) -> Dict[str, Any]:
         """Return a snapshot of the service for the CLI status command."""
-        now = time.time()
+        now = self._now()
         with self._state_lock:
             clients = [
                 {

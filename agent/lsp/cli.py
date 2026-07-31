@@ -122,13 +122,31 @@ def _cmd_status(emit_json: bool) -> int:
         out.append(f"  wait_mode:       {info.get('wait_mode')}")
         out.append(f"  wait_timeout:    {info.get('wait_timeout')}s")
         out.append(f"  install_strategy:{info.get('install_strategy')}")
+        # Eviction bounds belong in the default view, not only --json:
+        # the operator auditability this feature claims is worthless if
+        # the plain command cannot answer "why did my server go away?".
+        idle_timeout = info.get("idle_timeout")
+        if idle_timeout is not None:
+            out.append(
+                f"  idle_timeout:    {idle_timeout}s"
+                + ("" if idle_timeout else "  (disabled)")
+            )
+        if info.get("sweep_interval") is not None:
+            out.append(f"  sweep_interval:  {info.get('sweep_interval')}s")
+        if info.get("max_clients") is not None:
+            out.append(f"  max_clients:     {info.get('max_clients')}")
         clients = info.get("clients") or []
         if clients:
             out.append(f"  active clients:  {len(clients)}")
             for c in clients:
-                out.append(
+                line = (
                     f"    - {c['server_id']:20s} state={c['state']:10s} root={c['workspace_root']}"
                 )
+                if c.get("idle_seconds") is not None:
+                    line += f" idle={c['idle_seconds']}s"
+                if c.get("inflight") is not None:
+                    line += f" inflight={c['inflight']}"
+                out.append(line)
         else:
             out.append("  active clients:  none")
         broken = info.get("broken") or []
