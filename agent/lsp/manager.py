@@ -184,6 +184,20 @@ def _coerce_positive(value: Any, default: float) -> float:
     return parsed
 
 
+def _is_positive_number(value: Any) -> bool:
+    """True when :func:`_coerce_positive` would keep *value* rather than
+    substitute its default.
+
+    Kept beside the coercion it mirrors so the "did we honour the config?"
+    test cannot drift away from the coercion's own accept/reject rule.
+    """
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(parsed) and parsed > 0
+
+
 def _coerce_non_negative(value: Any, default: float) -> float:
     """Like :func:`_coerce_positive` but accepts an explicit ``0``.
 
@@ -421,10 +435,25 @@ class LSPService:
             lsp_cfg.get("sweep_interval", DEFAULT_SWEEP_INTERVAL), DEFAULT_SWEEP_INTERVAL
         )
         raw_cap = lsp_cfg.get("max_clients")
-        max_clients = (
-            None if raw_cap is None
-            else int(_coerce_positive(raw_cap, default_max_clients()))
-        )
+        max_clients: Optional[int]
+        if raw_cap is None:
+            max_clients = None
+        else:
+            derived = default_max_clients()
+            max_clients = int(_coerce_positive(raw_cap, derived))
+            # The cap is deliberately not disableable — an unbounded client
+            # population is what put this host into swap and took CI
+            # offline — so a non-positive or unparseable value falls back.
+            # Falling back *silently* is its own failure: the operator asked
+            # to remove a bound, did not, and is never told, so warn on the
+            # exact seam where the request was refused.
+            if not _is_positive_number(raw_cap):
+                logger.warning(
+                    "lsp.max_clients=%r is not a positive number; the cap "
+                    "cannot be disabled, using the host-derived default %d",
+                    raw_cap,
+                    max_clients,
+                )
 
         return cls(
             enabled=enabled,
@@ -808,9 +837,25 @@ class LSPService:
                 break
         return evicted
 
+    def _reaper_interval(self) -> float:
+        """How long the reaper sleeps between iterations.
+
+        The idle timeout clamps the interval so a server cannot sit idle
+        well past its deadline waiting for the next sweep.  That clamp is
+        meaningless once idleness is opted out (``idle_timeout: 0``): only
+        the cap still needs re-checking and the cap has no deadline, so the
+        configured sweep interval stands.  Folding 0 through the clamp drove
+        the interval to the 1.0s floor, which turned the documented
+        "keep every server warm" setting into a wakeup every second for the
+        life of the process.
+        """
+        if self._idle_timeout > 0:
+            return max(1.0, min(self._sweep_interval, self._idle_timeout))
+        return max(1.0, self._sweep_interval)
+
     async def _reaper_loop(self) -> None:
         """Periodically evict idle and over-cap clients, for the service's life."""
-        interval = max(1.0, min(self._sweep_interval, max(self._idle_timeout, 1.0)))
+        interval = self._reaper_interval()
         while True:
             try:
                 await asyncio.sleep(interval)

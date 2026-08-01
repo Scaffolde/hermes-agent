@@ -699,3 +699,85 @@ def test_human_readable_status_renders_the_bounds(capsys):
     assert info["clients"][0]["idle_seconds"] >= 5.0
     assert info["clients"][0]["inflight"] == 0
     assert hasattr(lsp_cli, "_cmd_status")
+
+
+# ---------------------------------------------------------------------------
+# round 2 — defects found verifying the Codex review threads (SCA-4389)
+# ---------------------------------------------------------------------------
+
+
+def test_reaper_interval_honours_sweep_interval_when_idle_is_disabled():
+    """``idle_timeout: 0`` must not collapse the reaper into a 1s busy-poll.
+
+    The interval is clamped by the idle timeout so a server cannot sit idle
+    well past its deadline waiting for the next sweep.  That clamp is
+    meaningless once idleness is opted out: only the cap still needs
+    re-checking, and the cap has no deadline.  Feeding 0 through the clamp
+    drove the interval to the 1.0s floor, so the documented "keep every
+    server warm" setting silently bought a wakeup every second for the life
+    of the process.
+    """
+    pinned = _service(idle_timeout=0.0, sweep_interval=60.0)
+    try:
+        assert pinned._reaper_interval() == 60.0
+    finally:
+        pinned.shutdown()
+
+    # The clamp must still bite when idleness *is* enabled: a 5s timeout
+    # cannot wait 60s for its sweep.
+    tight = _service(idle_timeout=5.0, sweep_interval=60.0)
+    try:
+        assert tight._reaper_interval() == 5.0
+    finally:
+        tight.shutdown()
+
+    # ...and the sweep interval wins when it is the smaller of the two.
+    normal = _service(idle_timeout=600.0, sweep_interval=60.0)
+    try:
+        assert normal._reaper_interval() == 60.0
+    finally:
+        normal.shutdown()
+
+
+def test_config_max_clients_zero_is_rejected_loudly(monkeypatch, caplog):
+    """A non-positive cap falls back to the host default — and says so.
+
+    ``max_clients: 0`` reads like "no limit" and the user guide said exactly
+    that, but the cap is deliberately not disableable: this whole feature
+    exists because an unbounded population put the host into swap and took
+    self-hosted CI offline.  Falling back is the right behaviour; doing it
+    *silently* is not, because the operator then believes a bound they asked
+    to remove is gone when it is still enforced (and vice versa).
+    """
+    cfg = {"lsp": {"enabled": False, "max_clients": 0}}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+
+    with caplog.at_level(logging.WARNING, logger="agent.lsp.manager"):
+        svc = LSPService.create_from_config()
+    assert svc is not None
+    try:
+        assert svc._max_clients == default_max_clients()
+    finally:
+        svc.shutdown()
+
+    assert any(
+        "max_clients" in r.getMessage() for r in caplog.records
+    ), "a rejected cap must be logged, not swallowed"
+
+
+def test_user_guide_does_not_promise_a_disableable_cap():
+    """The docs must not document a knob the code deliberately refuses.
+
+    ``max_clients: 0`` was documented as the way to disable the cap; the
+    coercion treats 0 as garbage and substitutes the host default.  A doc
+    that contradicts the code is how an operator "disables" a bound and
+    never learns it is still on.
+    """
+    from pathlib import Path
+
+    doc = Path(__file__).resolve().parents[3] / (
+        "website/docs/user-guide/features/lsp.md"
+    )
+    text = doc.read_text(encoding="utf-8")
+    assert "`max_clients: 0` to disable the cap" not in text
+    assert "max_clients" in text, "guard the path, not just the absence"

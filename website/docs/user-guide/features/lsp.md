@@ -174,7 +174,8 @@ lsp:
 
   # Maximum servers held at once. Unset (null) measures the host:
   # ~25% of RAM at ~1.3 GiB per server — 3 on a 16 GiB machine,
-  # 24 on a 128 GiB one.
+  # 24 on a 128 GiB one. Must be a positive number; the cap cannot be
+  # turned off (0 or garbage logs a warning and uses the derived value).
   max_clients: null
 
   # Per-server overrides (all optional).
@@ -253,8 +254,13 @@ server that was just used.
 short the timeout is. `lsp.max_clients` caps the population and evicts
 the least-recently-used server when it's exceeded. Left unset the cap is
 measured from host memory rather than hardcoded, so a 16 GiB Mac Mini
-(3) and a 128 GiB workstation (24) get appropriate values. Set
-`max_clients: 0` to disable the cap.
+(3) and a 128 GiB workstation (24) get appropriate values.
+
+Unlike `idle_timeout`, the cap has no off switch: an unbounded server
+population is what exhausted memory in the first place. `max_clients: 0`
+— or any non-positive or unparseable value — is refused, logged as a
+warning, and replaced by the host-derived default. Raise the number if
+you need more servers; you cannot remove the bound.
 
 Neither bound shuts down a server with a request in flight — the
 in-flight work drains first and the eviction defers to the next sweep.
