@@ -440,6 +440,79 @@ def test_create_from_config_rejects_bad_bounds(monkeypatch, bad):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Config plumbing, through the REAL loader
+#
+# Every test above stubs ``load_config`` and hands ``create_from_config``
+# the already-resolved dict it expects.  That proves the manager reads
+# the dict correctly and nothing more: it cannot catch a key that never
+# survives ``DEFAULT_CONFIG`` merging, a ``HERMES_HOME`` that resolves
+# somewhere else, or the (path, mtime_ns, size) cache in ``load_config``
+# handing back a stale entry.  A knob can be perfectly parsed here and
+# still be unreachable from a real ``config.yaml`` on disk.
+#
+# These two write an actual file under a temporary ``HERMES_HOME`` and
+# stub nothing, so the assertion covers the whole path a user's edit
+# actually takes.  (Raised by Codex review on the sibling PR #51, where
+# it applies to this branch equally.)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _write_hermes_config(tmp_path, monkeypatch, body: str) -> None:
+    """Point HERMES_HOME at *tmp_path* and write a real config.yaml there."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # HERMES_HOME_MODE would otherwise be free to redirect the home out
+    # from under the test on a host that sets it.
+    monkeypatch.delenv("HERMES_HOME_MODE", raising=False)
+    (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
+
+
+def test_eviction_bounds_survive_the_real_config_loader(tmp_path, monkeypatch):
+    """An ``lsp:`` block written to a real config.yaml reaches the service.
+
+    Non-default values on all three knobs, so a default leaking through
+    (or the block being dropped in merging) fails rather than
+    coincidentally matching.
+    """
+    _write_hermes_config(
+        tmp_path,
+        monkeypatch,
+        "lsp:\n"
+        "  enabled: false\n"
+        "  idle_timeout: 37\n"
+        "  sweep_interval: 11\n"
+        "  max_clients: 5\n",
+    )
+
+    svc = LSPService.create_from_config()
+    assert svc is not None, "create_from_config() returned None for a real config.yaml"
+    try:
+        assert svc._idle_timeout == 37.0
+        assert svc._sweep_interval == 11.0
+        assert svc._max_clients == 5
+    finally:
+        svc.shutdown()
+
+
+def test_real_config_without_an_lsp_block_still_gets_the_bounds(tmp_path, monkeypatch):
+    """Omitting ``lsp:`` entirely must fall back to the derived defaults.
+
+    This is the case that actually ships: nobody writes the block by
+    hand.  If defaults only materialised via a stubbed dict, the bound
+    would be absent exactly where the leak happened.
+    """
+    _write_hermes_config(tmp_path, monkeypatch, "model:\n  default: test\n")
+
+    svc = LSPService.create_from_config()
+    assert svc is not None
+    try:
+        assert svc._idle_timeout == DEFAULT_IDLE_TIMEOUT
+        assert svc._sweep_interval == DEFAULT_SWEEP_INTERVAL
+        assert MIN_CLIENT_CAP <= svc._max_clients <= MAX_CLIENT_CAP
+    finally:
+        svc.shutdown()
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Config discoverability
 #
 # The bounds are readable from config.yaml, but a knob that isn't in
