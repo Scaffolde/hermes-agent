@@ -125,9 +125,7 @@ export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoa
     }
 
     try {
-      const mod = (await import(
-        `${pathToFileURL(join(dir, file)).href}?t=${Date.now()}-${++widgetImportVersion}`
-      )) as {
+      const mod = (await import(`${pathToFileURL(join(dir, file)).href}?t=${Date.now()}-${++widgetImportVersion}`)) as {
         default?: (sdk: WidgetSdk) => void
       }
 

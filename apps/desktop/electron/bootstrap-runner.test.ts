@@ -91,14 +91,7 @@ test('fresh bootstrap args prefer the durable commit over a stale packaged branc
       activeRoot: '/tmp/hermes-agent',
       hermesHome: '/tmp/hermes'
     }),
-    [
-      '--dir',
-      '/tmp/hermes-agent',
-      '--hermes-home',
-      '/tmp/hermes',
-      '--commit',
-      installStamp.commit
-    ]
+    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--commit', installStamp.commit]
   )
 })
 
@@ -112,14 +105,7 @@ test('fresh bootstrap args fall back to a packaged branch when no commit is avai
       activeRoot: '/tmp/hermes-agent',
       hermesHome: '/tmp/hermes'
     }),
-    [
-      '--dir',
-      '/tmp/hermes-agent',
-      '--hermes-home',
-      '/tmp/hermes',
-      '--branch',
-      'release-branch'
-    ]
+    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--branch', 'release-branch']
   )
 })
 

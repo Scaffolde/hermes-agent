@@ -183,6 +183,7 @@ function SubagentTree({ tree }: { tree: SubagentNode[] }) {
   const [nowMs, setNowMs] = useState(() => Date.now())
 
   const active = flat.filter(n => n.status === 'running' || n.status === 'queued').length
+
   const failed = flat.filter(
     n => n.status === 'error' || n.status === 'failed' || n.status === 'interrupted' || n.status === 'timeout'
   ).length

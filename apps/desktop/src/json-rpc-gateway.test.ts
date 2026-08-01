@@ -49,10 +49,12 @@ describe('JsonRpcGatewayClient', () => {
   it('close() immediately transitions closed and rejects pending requests', async () => {
     vi.stubGlobal('WebSocket', FakeWebSocket)
     const socket = new FakeWebSocket()
+
     const client = new JsonRpcGatewayClient({
       closedErrorMessage: 'closed for test',
       socketFactory: () => socket as unknown as WebSocket
     })
+
     const states: string[] = []
     client.onState(state => states.push(state))
 

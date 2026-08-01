@@ -31,10 +31,7 @@ describe('weather reference app (async contract)', () => {
   it('launches into loading, lands the fetch via updateWidget', async () => {
     const fetchMock = vi.fn(async () => ({ json: async () => wttrReply('113'), ok: true }))
 
-    vi.stubGlobal(
-      'fetch',
-      fetchMock
-    )
+    vi.stubGlobal('fetch', fetchMock)
 
     expect(launchWidget('weather', 'Austin')).toBeNull()
     expect(activeState()?.phase.kind).toBe('loading')
