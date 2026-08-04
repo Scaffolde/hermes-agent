@@ -14,6 +14,26 @@ Design choices:
   the first request for a key spawns the client; subsequent requests
   re-use it.
 
+- The client population is **bounded** by two independent rules,
+  both applied on the request path (see :meth:`_enforce_bounds`):
+  an **idle timeout** evicts a root nobody has asked about for
+  ``idle_timeout`` seconds, and an **LRU cap** evicts the
+  least-recently-used root once the population would exceed
+  ``max_servers``.  The cap's default is derived from host RAM
+  (:func:`default_max_servers`), because one language server against
+  a large TypeScript project costs ~1.3 GiB and a 16 GiB host cannot
+  afford the same fleet as a 128 GiB one.  A server draining an
+  in-flight request is never evicted.  Every eviction emits an INFO
+  line naming the root and the reason.
+
+  This is deliberately spelled out because it was previously false:
+  ``idle_timeout`` was accepted, stored, and never read, while the
+  constant that carried it claimed servers "get reaped".  Thirteen
+  live servers holding ~16 GiB on a 16 GiB host was the result
+  (SCA-4389).  If a future change removes the eviction call, delete
+  this paragraph with it — a comment describing a reaper that does
+  not run is worse than no comment.
+
 - A **broken-set** records ``(server_id, workspace_root)`` pairs that
   failed to spawn or initialize.  These are never retried for the
   life of the service.  Mirrors OpenCode's design.
@@ -58,7 +78,72 @@ from agent.lsp.workspace import (
 
 logger = logging.getLogger("agent.lsp.manager")
 
-DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
+DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get evicted
+
+# Measured footprint of one ``typescript-language-server`` plus its
+# ``tsserver`` child against a scaffolde-ai checkout: 1.2-1.6 GiB
+# resident.  1.3 GiB is the middle of that range and is the unit the
+# default cap is denominated in.  It is a sizing constant, not a
+# limit — nothing here enforces per-process memory.
+LSP_SERVER_FOOTPRINT_BYTES = 1_300_000_000
+
+# Share of host RAM the LSP fleet may occupy before the cap bites.
+# A quarter leaves the agent runtime, the language toolchains, and
+# whatever the operator is actually running the other three quarters.
+LSP_MEMORY_BUDGET_FRACTION = 0.25
+
+# Floor and ceiling on the derived cap.  The floor keeps a small host
+# usable at all (one server is the difference between "LSP works" and
+# "LSP is off"); the ceiling stops a very large host from deriving a
+# number so high it is not a bound in any practical sense.
+MIN_DERIVED_MAX_SERVERS = 1
+MAX_DERIVED_MAX_SERVERS = 32
+
+
+def _host_memory_bytes() -> Optional[int]:
+    """Total physical RAM in bytes, or ``None`` when undiscoverable.
+
+    ``None`` is a real answer rather than a failure — the caller then
+    falls back to a conservative fixed cap instead of pretending to
+    have sized against a host it could not measure.
+    """
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+    except (ValueError, OSError, AttributeError):
+        pass
+    # macOS exposes SC_PHYS_PAGES inconsistently across Python builds;
+    # ``sysctl hw.memsize`` is the portable second source.
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if out.returncode == 0 and out.stdout.strip().isdigit():
+            return int(out.stdout.strip())
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def default_max_servers() -> int:
+    """Derive the concurrent-server cap from host memory.
+
+    A 16 GiB Mac Mini and a 128 GiB workstation must not get the same
+    number — that is the point of deriving rather than hardcoding.
+    16 GiB yields 3; 128 GiB yields 26.
+    """
+    total = _host_memory_bytes()
+    if not total:
+        # Undiscoverable host memory: assume small rather than large.
+        # Guessing high is what produced this defect in the first place.
+        return 4
+    derived = int((total * LSP_MEMORY_BUDGET_FRACTION) // LSP_SERVER_FOOTPRINT_BYTES)
+    return max(MIN_DERIVED_MAX_SERVERS, min(derived, MAX_DERIVED_MAX_SERVERS))
 
 
 class _BackgroundLoop:
@@ -155,6 +240,7 @@ class LSPService:
         init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        max_servers: Optional[int] = None,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -164,7 +250,14 @@ class LSPService:
         self._env_overrides = env_overrides or {}
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
+        # ``0``/negative disables the respective bound.  Both are read
+        # on every spawn — see ``_enforce_bounds``.  Before SCA-4389
+        # ``_idle_timeout`` was stored here and never read again, so
+        # the module docstring's "reaped" claim was false.
         self._idle_timeout = idle_timeout
+        self._max_servers = (
+            default_max_servers() if max_servers is None else int(max_servers)
+        )
 
         self._loop = _BackgroundLoop()
         if self._enabled:
@@ -175,6 +268,10 @@ class LSPService:
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
+        # Requests currently using a client, keyed the same way.  A key
+        # with a non-zero count is never evicted, so eviction cannot
+        # tear a server down mid-request.
+        self._inflight: Dict[Tuple[str, str], int] = {}
         self._state_lock = threading.Lock()
 
         # Delta baseline: file path → snapshot of diagnostics taken
@@ -202,6 +299,17 @@ class LSPService:
             lsp_cfg = {}
 
         enabled = bool(lsp_cfg.get("enabled", True))
+        # Both bounds are operator-overridable; absent config derives
+        # the cap from host memory rather than assuming this host.
+        try:
+            idle_timeout = float(lsp_cfg.get("idle_timeout", DEFAULT_IDLE_TIMEOUT))
+        except (TypeError, ValueError):
+            idle_timeout = DEFAULT_IDLE_TIMEOUT
+        max_servers_cfg = lsp_cfg.get("max_servers")
+        try:
+            max_servers = None if max_servers_cfg is None else int(max_servers_cfg)
+        except (TypeError, ValueError):
+            max_servers = None
         wait_mode = lsp_cfg.get("wait_mode", "document")
         wait_timeout = float(lsp_cfg.get("wait_timeout", DIAGNOSTICS_DOCUMENT_WAIT))
         install_strategy = lsp_cfg.get("install_strategy", "auto")
@@ -235,6 +343,8 @@ class LSPService:
             env_overrides=env_overrides,
             init_overrides=init_overrides,
             disabled_servers=disabled,
+            idle_timeout=idle_timeout,
+            max_servers=max_servers,
         )
 
     # ------------------------------------------------------------------
@@ -434,6 +544,8 @@ class LSPService:
         # ``_clients`` with a half-initialized state.
         with self._state_lock:
             client = self._clients.pop(key, None)
+            self._last_used.pop(key, None)
+            self._inflight.pop(key, None)
         if client is not None:
             try:
                 # Fire-and-forget shutdown — give it a second to cleanup,
@@ -464,13 +576,16 @@ class LSPService:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return []
+        key = (client.server_id, client.workspace_root)
+        self._acquire(key)
         try:
             version = await client.open_file(file_path, language_id=language_id_for(file_path))
             fresh = await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
         except Exception as e:  # noqa: BLE001
             logger.debug("snapshot open/wait failed: %s", e)
             return []
-        self._last_used[(client.server_id, client.workspace_root)] = time.time()
+        finally:
+            self._release(key)
         if not fresh:
             # No fresh data for the pre-edit content — an empty baseline
             # is safe: worst case the delta filter removes less, never
@@ -490,6 +605,8 @@ class LSPService:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return None
+        key = (client.server_id, client.workspace_root)
+        self._acquire(key)
         try:
             version = await client.open_file(file_path, language_id=language_id_for(file_path))
             await client.save_file(file_path)
@@ -499,7 +616,8 @@ class LSPService:
         except Exception as e:  # noqa: BLE001
             logger.debug("open/wait failed for %s: %s", file_path, e)
             return None
-        self._last_used[(client.server_id, client.workspace_root)] = time.time()
+        finally:
+            self._release(key)
         if not fresh:
             return None
         return list(client.diagnostics_for(file_path, fresh_only=True))
@@ -539,14 +657,27 @@ class LSPService:
         with self._state_lock:
             client = self._clients.get(key)
             if client is not None and client.is_running:
-                eventlog.log_active(srv.server_id, per_server_root)
-                return client
+                # Refresh the LRU stamp on reuse.  Before SCA-4389 only
+                # spawn and post-request stamped it, so a root served
+                # entirely from cache looked progressively more idle.
+                self._last_used[key] = time.time()
+                reuse = client
+            else:
+                reuse = None
             spawning = self._spawning.get(key)
+        if reuse is not None:
+            eventlog.log_active(srv.server_id, per_server_root)
+            await self._enforce_bounds(protect=key)
+            return reuse
         if spawning is not None:
             try:
                 return await spawning
             except Exception:  # noqa: BLE001
                 return None
+
+        # Make room BEFORE spawning, so the fleet never transiently
+        # exceeds the cap.  ``protect=key`` reserves this root's slot.
+        await self._enforce_bounds(protect=key)
 
         # Begin spawn
         loop = asyncio.get_running_loop()
@@ -597,12 +728,117 @@ class LSPService:
             with self._state_lock:
                 self._spawning.pop(key, None)
 
+    # ------------------------------------------------------------------
+    # eviction (SCA-4389)
+    # ------------------------------------------------------------------
+
+    def _acquire(self, key: Tuple[str, str]) -> None:
+        """Mark *key* as serving a request, so eviction skips it."""
+        with self._state_lock:
+            self._inflight[key] = self._inflight.get(key, 0) + 1
+
+    def _release(self, key: Tuple[str, str]) -> None:
+        """Drop one in-flight reference and refresh the LRU stamp."""
+        with self._state_lock:
+            remaining = self._inflight.get(key, 0) - 1
+            if remaining > 0:
+                self._inflight[key] = remaining
+            else:
+                self._inflight.pop(key, None)
+            self._last_used[key] = time.time()
+
+    def _eviction_candidates(
+        self, *, protect: Optional[Tuple[str, str]] = None, now: Optional[float] = None
+    ) -> List[Tuple[Tuple[str, str], str]]:
+        """Decide what to evict.  Pure over the service's state.
+
+        Returns ``(key, reason)`` pairs.  Split out from the shutdown
+        so the policy is testable without spawning a real server.
+
+        *protect* is the key the current request is about to use — it
+        is never a candidate even if it is the LRU, otherwise a cap of
+        1 would evict the very client the caller just asked for.
+        """
+        now = time.time() if now is None else now
+        with self._state_lock:
+            keys = list(self._clients.keys())
+            last_used = dict(self._last_used)
+            inflight = dict(self._inflight)
+
+        def evictable(k: Tuple[str, str]) -> bool:
+            # AC6: a server draining a request is never a candidate.
+            return k != protect and inflight.get(k, 0) <= 0
+
+        victims: List[Tuple[Tuple[str, str], str]] = []
+        chosen = set()
+
+        # 1. Idle timeout — independent of population size.
+        if self._idle_timeout and self._idle_timeout > 0:
+            for k in keys:
+                if not evictable(k):
+                    continue
+                age = now - last_used.get(k, now)
+                if age >= self._idle_timeout:
+                    victims.append((k, f"idle {int(age)}s >= {int(self._idle_timeout)}s"))
+                    chosen.add(k)
+
+        # 2. LRU cap — independent of idleness, so N simultaneously
+        #    active roots still cannot exceed the host's memory.
+        if self._max_servers and self._max_servers > 0:
+            survivors = [k for k in keys if k not in chosen]
+            # ``protect`` occupies a slot: it is either already in
+            # ``_clients`` or is about to be inserted by the caller.
+            projected = len(survivors) + (
+                1 if protect is not None and protect not in keys else 0
+            )
+            if projected > self._max_servers:
+                # Oldest first; unstamped keys sort oldest (0.0).
+                ranked = sorted(
+                    (k for k in survivors if evictable(k)),
+                    key=lambda k: last_used.get(k, 0.0),
+                )
+                for k in ranked:
+                    if projected <= self._max_servers:
+                        break
+                    victims.append((k, f"lru cap {self._max_servers}"))
+                    projected -= 1
+
+        return victims
+
+    async def _enforce_bounds(self, *, protect: Optional[Tuple[str, str]] = None) -> None:
+        """Evict idle and over-cap clients.  Never raises.
+
+        Called on every spawn/reuse — the request path is the only
+        clock this service has, and tying eviction to it means a cache
+        that is never consulted also spawns nothing new, so its
+        population cannot grow.
+        """
+        victims = self._eviction_candidates(protect=protect)
+        if not victims:
+            return
+        pending = []
+        for key, reason in victims:
+            with self._state_lock:
+                # Re-check under the lock: a request may have arrived
+                # for this key between the decision and the shutdown.
+                if self._inflight.get(key, 0) > 0:
+                    continue
+                client = self._clients.pop(key, None)
+                self._last_used.pop(key, None)
+            if client is None:
+                continue
+            eventlog.log_evicted(key[0], key[1], reason)
+            pending.append(client.shutdown())
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
     async def _shutdown_async(self) -> None:
         with self._state_lock:
             clients = list(self._clients.values())
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
+            self._inflight.clear()
         await asyncio.gather(
             *(c.shutdown() for c in clients),
             return_exceptions=True,
@@ -614,6 +850,7 @@ class LSPService:
 
     def get_status(self) -> Dict[str, Any]:
         """Return a snapshot of the service for the CLI status command."""
+        now = time.time()
         with self._state_lock:
             clients = [
                 {
@@ -621,6 +858,11 @@ class LSPService:
                     "workspace_root": k[1],
                     "state": c.state,
                     "running": c.is_running,
+                    # Surfacing idleness makes "is the cache evicting?"
+                    # answerable from ``hermes lsp status`` rather than
+                    # only from a log grep.
+                    "idle_seconds": int(now - self._last_used.get(k, now)),
+                    "inflight": self._inflight.get(k, 0),
                 }
                 for k, c in self._clients.items()
             ]
@@ -630,6 +872,8 @@ class LSPService:
             "wait_mode": self._wait_mode,
             "wait_timeout": self._wait_timeout,
             "install_strategy": self._install_strategy,
+            "idle_timeout": self._idle_timeout,
+            "max_servers": self._max_servers,
             "clients": clients,
             "broken": broken,
             "disabled_servers": sorted(self._disabled_servers),

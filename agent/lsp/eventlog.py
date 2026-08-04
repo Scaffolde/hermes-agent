@@ -188,6 +188,27 @@ def log_spawn_failed(server_id: str, workspace_root: str, exc: BaseException) ->
     )
 
 
+def log_evicted(server_id: str, workspace_root: str, reason: str) -> None:
+    """A cached client was shut down to bound the server population.  INFO.
+
+    Deliberately **not** deduped.  Every other announce-once helper
+    suppresses repeats because the event is a steady-state fact; an
+    eviction is a discrete action taken against a named root, and the
+    whole point of logging it is that "the cache never evicts" must be
+    falsifiable by grepping the log rather than reconstructed from
+    ``ps``.  Suppressing the second eviction of a root would hide
+    exactly the thrash we would need to see.
+
+    Also clears the root's ``log_active`` announce entry, so the INFO
+    line fires again when the root is next re-spawned.  Without that,
+    a re-spawn after eviction would only ever log at DEBUG ("reused
+    client"), which would be a lie — it is a new process.
+    """
+    _emit(server_id, logging.INFO, f"evicted {workspace_root} ({reason})")
+    with _announce_lock:
+        _announced_active.discard((server_id, workspace_root))
+
+
 def reset_announce_caches() -> None:
     """Test-only: clear the dedup caches.  Production code never calls this."""
     with _announce_lock:
@@ -202,6 +223,7 @@ __all__ = [
     "log_clean",
     "log_disabled",
     "log_active",
+    "log_evicted",
     "log_diagnostics",
     "log_no_project_root",
     "log_server_unavailable",
