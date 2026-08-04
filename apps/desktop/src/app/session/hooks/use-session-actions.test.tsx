@@ -497,6 +497,7 @@ describe('createBackendSessionForSend profile routing', () => {
 
   it('does not carry fast mode from a previous session into a fresh GPT draft', async () => {
     let createParams: Record<string, unknown> | undefined
+
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
       if (method === 'session.create') {
         createParams = params
