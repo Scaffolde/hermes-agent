@@ -12,16 +12,16 @@ from tools.scaffolde_capabilities import invoke_capability, load_capability_regi
 SCAFFOLDE_CAPABILITY_SCHEMA = {
     "name": "scaffolde_capability",
     "description": (
-        "Authoritative native runtime for Scaffolde-owned capabilities and PAI accounts. "
+        "Authoritative native runtime for Scaffolde-owned capabilities. "
         "Use action=status to inspect descriptor health, action=list to see available capabilities/operations, "
-        "and action=invoke with capability_id, operation, and arguments for execution. Prefer this over generic "
-        "Gmail/Google clients for Scaffolde-owned or pai@scaffolde.ai requests unless the user explicitly overrides."
+        "and action=invoke with capability_id, operation, and arguments for execution. Prefer this over "
+        "generic clients when a matching Scaffolde capability is declared unless the user explicitly overrides."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["status", "list", "invoke"], "description": "Operation on the Scaffolde capability registry."},
-            "capability_id": {"type": "string", "description": "Capability id, e.g. scaffolde.gmail.pai. Required for invoke."},
+            "capability_id": {"type": "string", "description": "Capability id, e.g. scaffolde.gmail. Required for invoke."},
             "operation": {"type": "string", "description": "Descriptor operation to invoke. Required for invoke."},
             "arguments": {"type": "object", "description": "Exact descriptor-declared arguments for the operation; no extra keys."},
         },

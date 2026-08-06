@@ -20,6 +20,7 @@ MAX_STDOUT_CHARS = 64_000
 MAX_STDERR_CHARS = 16_000
 DEFAULT_TIMEOUT_SECONDS = 60
 _ALLOWED_PARAM_TYPES = {"string", "integer", "boolean"}
+_RETIRED_CAPABILITY_IDS = frozenset({"scaffolde.gmail.pai"})
 _ALLOWED_RISKS = {"read", "write"}
 _SECRET_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY|CREDENTIAL)", re.I)
 _SECRET_VALUE_RE = re.compile(
@@ -128,6 +129,8 @@ def _validate_capability(
     if not isinstance(raw, dict):
         return None, None, [_err("capability_schema", "capability must be an object")]
     cid = _validate_string(raw.get("id"), "id", errors, None)
+    if cid in _RETIRED_CAPABILITY_IDS:
+        errors.append(_err("retired_capability", f"capability id is retired: {cid}", cid))
     if raw.get("version") != 1:
         errors.append(_err("capability_version", "capability.version must be 1", cid or None))
     for field in ("tool_name", "authority", "kind", "description"):
