@@ -1404,8 +1404,10 @@ class ParentBrokerAdapter:
                 "scaffolde_evo_agent_dispatch",
                 "scaffolde_evo_run",
             }
+            prior_side_effects_unresolved = False
             if side_effecting:
                 with self._claim_lock:
+                    prior_side_effects_unresolved = self._side_effects_unresolved
                     self._side_effects_unresolved = True
             try:
                 concrete_registry: ToolRegistry = registry
@@ -1434,9 +1436,13 @@ class ParentBrokerAdapter:
                     limit=_MAX_BROKERED_TOOL_RESULT_BYTES,
                 )
                 if result_payload.get("ok") is False:
-                    if result_payload.get("side_effects_unresolved") is True:
-                        with self._claim_lock:
+                    with self._claim_lock:
+                        if result_payload.get("side_effects_unresolved") is True:
                             self._side_effects_unresolved = True
+                        elif side_effecting:
+                            self._side_effects_unresolved = (
+                                prior_side_effects_unresolved
+                            )
                     return {"result": _bounded_failed_tool_result(result_payload)}
                 expected_attestation_binding = _expected_scaffolde_attestation_binding(
                     args,
@@ -1459,7 +1465,7 @@ class ParentBrokerAdapter:
                 claim_recorded = True
                 if side_effecting:
                     with self._claim_lock:
-                        self._side_effects_unresolved = False
+                        self._side_effects_unresolved = prior_side_effects_unresolved
                 return {"result": _json_safe(response_result)}
             finally:
                 if not claim_recorded:

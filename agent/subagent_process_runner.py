@@ -10,7 +10,6 @@ small callback protocols below are the serial integration seam.
 from __future__ import annotations
 
 import dataclasses
-import errno
 import math
 import os
 import platform

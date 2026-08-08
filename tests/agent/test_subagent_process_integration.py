@@ -977,6 +977,53 @@ def test_side_effecting_handler_exception_latches_unresolved_effects(
     assert adapter.tool_execution_claims == ()
 
 
+@pytest.mark.parametrize(
+    ("prior_unresolved", "expected_unresolved"),
+    [(False, False), (True, True)],
+)
+def test_contained_side_effecting_handler_failure_restores_unresolved_latch(
+    tmp_path, monkeypatch, prior_unresolved, expected_unresolved
+):
+    name = "scaffolde_evo_run"
+    _broker, old_adapter, child, _completions, _digest = _fixture(tmp_path, [])
+    child.tools = [{"type": "function", "function": {"name": name}}]
+    child._delegate_frozen_dispatch_entries = {name: object()}
+    adapter = ParentBrokerAdapter(
+        broker=old_adapter.broker,
+        child=child,
+        profile=old_adapter.profile,
+        task="run attempt",
+    )
+    adapter.profile.execution_backend = "linux_strict"
+    adapter._side_effects_unresolved = prior_unresolved
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "error_code": "evo_run_failed",
+            "error": "nested attempt failed with conclusive cleanup",
+        },
+    )
+
+    response = adapter._dispatch(
+        "tool.execute",
+        {
+            "id": "run-1",
+            "name": name,
+            "arguments": {
+                "workspace": "/workspace",
+                "experiment_id": "exp_1001",
+                "attempt_n": 1,
+                "timeout_seconds": 30,
+            },
+        },
+    )
+
+    assert response["result"]["ok"] is False
+    assert adapter.side_effects_unresolved is expected_unresolved
+    assert adapter.tool_execution_claims == ()
+
+
 def test_brokered_claim_rejects_attestation_not_bound_to_host_completion(
     tmp_path, monkeypatch
 ):
