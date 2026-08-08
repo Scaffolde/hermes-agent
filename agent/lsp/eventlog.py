@@ -207,6 +207,29 @@ def log_reaped(keys: List[Tuple[str, str]], idle_timeout: float) -> None:
     )
 
 
+def log_evicted_over_cap(keys: List[Tuple[str, str]], max_servers: int) -> None:
+    """Least-recently-used clients were shut down to stay under the
+    population cap.  INFO, and deliberately distinct from
+    ``log_reaped``: "your fleet is at its ceiling" and "a server went
+    idle" call for different operator responses — the first may warrant
+    raising ``lsp.max_servers``, the second never does.
+
+    Also clears the ``log_active`` announce cache for the evicted keys
+    so a later respawn re-announces at INFO instead of logging a
+    misleading DEBUG "reused client" for a brand-new process.
+    """
+    with _announce_lock:
+        for key in keys:
+            _announced_active.discard(key)
+    summary = ", ".join(f"{sid} ({root})" for sid, root in keys)
+    _emit(
+        "reaper",
+        logging.INFO,
+        f"evicted {len(keys)} least-recently-used client(s) to stay within "
+        f"max_servers={max_servers}: {summary}",
+    )
+
+
 def reset_announce_caches() -> None:
     """Test-only: clear the dedup caches.  Production code never calls this."""
     with _announce_lock:

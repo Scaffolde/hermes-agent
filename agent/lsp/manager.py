@@ -14,6 +14,30 @@ Design choices:
   the first request for a key spawns the client; subsequent requests
   re-use it.
 
+- The client population is bounded by **two independent rules**.  An
+  **idle timeout** reaps a root nobody has asked about for
+  ``idle_timeout`` seconds (:meth:`_reap_idle_once`, on a background
+  sweep).  An **LRU cap** evicts the least-recently-used root when the
+  population would exceed ``max_servers``
+  (:meth:`_enforce_population_cap`, on the spawn path).  Both are
+  needed: the timeout bounds a fleet nobody is touching, the cap bounds
+  a fleet *everybody* is touching, and only the second describes the
+  outage that motivated it.  Thirteen live ``typescript-language-server``
+  trees held ~16 GiB on a 16 GiB host, pushed the box into swap, pushed
+  free disk under the CI runner's admission floor and took self-hosted
+  CI offline for 5.5h — every one of the thirteen had a fresh
+  ``_last_used``, so the reaper was working as designed and could not
+  help (SCA-4389).
+
+  The cap's default is derived from host RAM
+  (:func:`default_max_servers`), because one language server against a
+  large TypeScript project costs ~1.3 GiB and a 16 GiB host cannot
+  afford the same fleet as a 128 GiB one.  A server draining an
+  in-flight request is never evicted.  If a future change removes the
+  eviction call, delete this paragraph with it — a comment describing
+  a reaper that does not run is worse than no comment, which is the
+  precise shape of the original defect.
+
 - A **broken-set** records ``(server_id, workspace_root)`` pairs that
   failed to spawn or initialize.  These are never retried for the
   life of the service.  Mirrors OpenCode's design.
@@ -60,6 +84,71 @@ logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
+
+# Measured footprint of one ``typescript-language-server`` plus its
+# ``tsserver`` child against a large TypeScript checkout: 1.2-1.6 GiB
+# resident.  1.3 GB is the middle of that range and is the unit the
+# default cap is denominated in.  It is a sizing constant, not a limit —
+# nothing here enforces per-process memory.
+LSP_SERVER_FOOTPRINT_BYTES = 1_300_000_000
+
+# Share of host RAM the LSP fleet may occupy before the cap bites.  A
+# quarter leaves the agent runtime, the language toolchains, and
+# whatever the operator is actually running the other three quarters.
+LSP_MEMORY_BUDGET_FRACTION = 0.25
+
+# Floor and ceiling on the derived cap.  The floor keeps a small host
+# usable at all (one server is the difference between "LSP works" and
+# "LSP is off"); the ceiling stops a very large host from deriving a
+# number so high it is not a bound in any practical sense.
+MIN_DERIVED_MAX_SERVERS = 1
+MAX_DERIVED_MAX_SERVERS = 32
+
+
+def _host_memory_bytes() -> Optional[int]:
+    """Total physical RAM in bytes, or ``None`` when undiscoverable.
+
+    ``None`` is a real answer rather than a failure — the caller then
+    falls back to a conservative fixed cap instead of pretending to
+    have sized against a host it could not measure.
+    """
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+    except (ValueError, OSError, AttributeError):
+        pass
+    # macOS exposes SC_PHYS_PAGES inconsistently across Python builds;
+    # ``sysctl hw.memsize`` is the portable second source.
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if out.returncode == 0 and out.stdout.strip().isdigit():
+            return int(out.stdout.strip())
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def default_max_servers() -> int:
+    """Derive the concurrent-server cap from host memory.
+
+    A 16 GiB Mac Mini and a 128 GiB workstation must not get the same
+    number — that is the point of deriving rather than hardcoding.
+    16 GiB yields 3; 128 GiB yields 26.
+    """
+    total = _host_memory_bytes()
+    if not total:
+        # Undiscoverable host memory: assume small rather than large.
+        # Guessing high is what produced this defect in the first place.
+        return 4
+    derived = int((total * LSP_MEMORY_BUDGET_FRACTION) // LSP_SERVER_FOOTPRINT_BYTES)
+    return max(MIN_DERIVED_MAX_SERVERS, min(derived, MAX_DERIVED_MAX_SERVERS))
 
 
 class _BackgroundLoop:
@@ -156,6 +245,7 @@ class LSPService:
         init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        max_servers: Optional[int] = None,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -166,6 +256,13 @@ class LSPService:
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
+        # ``0``/negative disables the cap.  ``None`` derives it from host
+        # memory.  The idle timeout bounds a fleet nobody is touching;
+        # this bounds a fleet everybody is touching, which is the case
+        # the reaper provably cannot help with (SCA-4389).
+        self._max_servers = (
+            default_max_servers() if max_servers is None else int(max_servers)
+        )
 
         self._loop = _BackgroundLoop()
         if self._enabled:
@@ -176,6 +273,13 @@ class LSPService:
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
+        # Requests currently using a client, keyed the same way.  A key
+        # with a non-zero count is never evicted by the cap, so eviction
+        # cannot tear a server down mid-request.  The idle reaper needs
+        # no equivalent: MIN_IDLE_TIMEOUT is floored above the per-op
+        # wait budget, whereas the cap fires on demand with no such
+        # time guarantee.
+        self._inflight: Dict[Tuple[str, str], int] = {}
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
 
@@ -220,6 +324,13 @@ class LSPService:
             # mark the (server, workspace) pair broken for the process
             # lifetime.  Clamp to a safe floor (0 still disables).
             idle_timeout = MIN_IDLE_TIMEOUT
+        # Absent or malformed config derives the cap from host memory
+        # rather than assuming this host.
+        max_servers_cfg = lsp_cfg.get("max_servers")
+        try:
+            max_servers = None if max_servers_cfg is None else int(max_servers_cfg)
+        except (TypeError, ValueError):
+            max_servers = None
         servers_cfg = lsp_cfg.get("servers") or {}
         disabled = []
         binary_overrides: Dict[str, List[str]] = {}
@@ -251,6 +362,7 @@ class LSPService:
             init_overrides=init_overrides,
             disabled_servers=disabled,
             idle_timeout=idle_timeout,
+            max_servers=max_servers,
         )
 
     # ------------------------------------------------------------------
@@ -451,6 +563,7 @@ class LSPService:
         with self._state_lock:
             client = self._clients.pop(key, None)
             self._last_used.pop(key, None)
+            self._inflight.pop(key, None)
         if client is not None:
             try:
                 # Fire-and-forget shutdown — give it a second to cleanup,
@@ -481,12 +594,16 @@ class LSPService:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return []
+        key = (client.server_id, client.workspace_root)
+        self._acquire(key)
         try:
             version = await client.open_file(file_path, language_id=language_id_for(file_path))
             fresh = await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
         except Exception as e:  # noqa: BLE001
             logger.debug("snapshot open/wait failed: %s", e)
             return []
+        finally:
+            self._release(key)
         self._touch(client)
         if not fresh:
             # No fresh data for the pre-edit content — an empty baseline
@@ -507,6 +624,8 @@ class LSPService:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return None
+        key = (client.server_id, client.workspace_root)
+        self._acquire(key)
         try:
             version = await client.open_file(file_path, language_id=language_id_for(file_path))
             await client.save_file(file_path)
@@ -516,6 +635,8 @@ class LSPService:
         except Exception as e:  # noqa: BLE001
             logger.debug("open/wait failed for %s: %s", file_path, e)
             return None
+        finally:
+            self._release(key)
         self._touch(client)
         if not fresh:
             return None
@@ -572,6 +693,9 @@ class LSPService:
         with self._state_lock:
             self._spawning[key] = spawn_future
         try:
+            # Make room *before* spawning: the fleet must never hold
+            # cap+1 servers, not even transiently.
+            await self._enforce_population_cap()
             ctx = ServerContext(
                 workspace_root=per_server_root,
                 install_strategy=self._install_strategy,
@@ -614,6 +738,54 @@ class LSPService:
         finally:
             with self._state_lock:
                 self._spawning.pop(key, None)
+
+    def _acquire(self, key: Tuple[str, str]) -> None:
+        """Mark a client as serving a request, so the cap won't evict it."""
+        with self._state_lock:
+            self._inflight[key] = self._inflight.get(key, 0) + 1
+
+    def _release(self, key: Tuple[str, str]) -> None:
+        with self._state_lock:
+            remaining = self._inflight.get(key, 0) - 1
+            if remaining > 0:
+                self._inflight[key] = remaining
+            else:
+                self._inflight.pop(key, None)
+
+    async def _enforce_population_cap(self) -> None:
+        """Evict least-recently-used clients until the fleet has room
+        for one more.
+
+        Called *before* spawning, so the population never transiently
+        exceeds the cap — on a host already at its memory ceiling, the
+        transient is the outage.  Clients serving an in-flight request
+        are skipped: a bound that tears a server down mid-request would
+        trade a memory leak for a correctness bug.
+        """
+        if self._max_servers <= 0:
+            return
+        with self._state_lock:
+            # Room for the caller's incoming spawn, hence ``- 1``.
+            surplus = len(self._clients) - (self._max_servers - 1)
+            if surplus <= 0:
+                return
+            evictable = [
+                key for key in self._clients if self._inflight.get(key, 0) == 0
+            ]
+            evictable.sort(key=lambda k: self._last_used.get(k, 0.0))
+            victims = evictable[:surplus]
+            clients = [self._clients.pop(key) for key in victims]
+            for key in victims:
+                self._last_used.pop(key, None)
+        if clients:
+            eventlog.log_evicted_over_cap(
+                [(c.server_id, c.workspace_root) for c in clients],
+                self._max_servers,
+            )
+            await asyncio.gather(
+                *(client.shutdown() for client in clients),
+                return_exceptions=True,
+            )
 
     async def _start_idle_reaper(self) -> None:
         self._idle_reaper_task = asyncio.create_task(self._idle_reaper_loop())
@@ -677,6 +849,7 @@ class LSPService:
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
+            self._inflight.clear()
         await asyncio.gather(
             *(c.shutdown() for c in clients),
             return_exceptions=True,
