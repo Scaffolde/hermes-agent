@@ -979,7 +979,7 @@ def test_host_run_failure_latches_unresolved_side_effects(tmp_path, monkeypatch)
             "error_code": "evo_run_side_effects_unresolved",
             "error": "nested containment failed",
             "side_effects_unresolved": True,
-            "completion": {"active_operation": "model.complete"},
+            "completion": {"lifecycle_stage": "owned-process-runner"},
         },
     )
 
@@ -1001,7 +1001,7 @@ def test_host_run_failure_latches_unresolved_side_effects(tmp_path, monkeypatch)
     assert adapter.side_effects_unresolved is True
     assert (
         adapter.unresolved_operation_label
-        == "tool.execute:scaffolde_evo_run:model.complete"
+        == "tool.execute:scaffolde_evo_run:stage:owned-process-runner"
     )
     assert adapter.tool_execution_claims == ()
 

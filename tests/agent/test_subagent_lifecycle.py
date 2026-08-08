@@ -224,6 +224,16 @@ def test_cancel_is_cooperative_and_forged_handle_is_unknown(lifecycle):
     assert other_service.status(handle).state is SubagentState.UNKNOWN
 
 
+def test_status_reports_bounded_lifecycle_stage(lifecycle):
+    handle = lifecycle.launch(SubagentLaunchRequest(goal="x"))
+    record = lifecycle._record(handle)
+    assert record is not None
+    record.diagnostic_stage = "owned-process-runner"
+    assert lifecycle.status(handle).diagnostic == "owned-process-runner"
+    lifecycle.cancel(handle, reason="test cleanup")
+    lifecycle.wait(handle, timeout_seconds=1)
+
+
 def test_cancel_uses_explicit_hard_interrupt(lifecycle):
     handle = lifecycle.launch(SubagentLaunchRequest(goal="x"))
     record = lifecycle._record(handle)

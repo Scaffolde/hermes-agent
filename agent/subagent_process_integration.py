@@ -1521,6 +1521,12 @@ class ParentBrokerAdapter:
                                 if isinstance(completion, Mapping)
                                 else None
                             )
+                            if nested_operation is None and isinstance(
+                                completion, Mapping
+                            ):
+                                lifecycle_stage = completion.get("lifecycle_stage")
+                                if isinstance(lifecycle_stage, str):
+                                    nested_operation = f"stage:{lifecycle_stage}"
                             if (
                                 isinstance(nested_operation, str)
                                 and 1 <= len(nested_operation) <= 128

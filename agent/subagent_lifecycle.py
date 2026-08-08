@@ -241,6 +241,7 @@ class _Record:
     future: Optional[Future] = None
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
+    diagnostic_stage: Optional[str] = None
     result: Optional[SubagentResult] = None
     receipt: Optional[SubagentLaunchReceipt] = None
     execution_profile: Optional[ResolvedExecutionProfile] = None
@@ -805,7 +806,12 @@ class SubagentLifecycleService:
                 handle, SubagentState.UNKNOWN, time.time(), "UNKNOWN_HANDLE"
             )
         with _REGISTRY.lock:
-            return SubagentStatus(record.handle, record.state, record.updated_at)
+            return SubagentStatus(
+                record.handle,
+                record.state,
+                record.updated_at,
+                diagnostic=record.diagnostic_stage,
+            )
 
     def wait(
         self, handle: SubagentHandle, *, timeout_seconds: Optional[float] = None
@@ -1002,8 +1008,14 @@ class SubagentLifecycleService:
         try:
             profile = record.execution_profile
             if profile is not None and profile.execution_backend != "in_process":
+                with _REGISTRY.lock:
+                    record.diagnostic_stage = "owned-process-runner"
+                    record.updated_at = time.time()
                 raw = self._run_process_child(record, goal, profile)
             else:
+                with _REGISTRY.lock:
+                    record.diagnostic_stage = "in-process-agent"
+                    record.updated_at = time.time()
                 from tools.delegate_tool import _run_child_lifecycle
 
                 if record.timeout_override is not None:
@@ -1016,6 +1028,9 @@ class SubagentLifecycleService:
                     )
                 else:
                     raw = _run_child_lifecycle(0, goal, record.agent, parent)
+            with _REGISTRY.lock:
+                record.diagnostic_stage = "result-normalization"
+                record.updated_at = time.time()
             status = (
                 str(raw.get("status", "error")) if isinstance(raw, dict) else "error"
             )
@@ -1078,6 +1093,9 @@ class SubagentLifecycleService:
                 ),
             )
         except Exception as exc:
+            with _REGISTRY.lock:
+                record.diagnostic_stage = "failure-normalization"
+                record.updated_at = time.time()
             tool_execution_summary = {}
             brokered_tool_claims = getattr(exc, "_brokered_tool_claims", ())
             if brokered_tool_claims:
@@ -1099,6 +1117,9 @@ class SubagentLifecycleService:
                     else None
                 ),
             )
+        with _REGISTRY.lock:
+            record.diagnostic_stage = "receipt-publication"
+            record.updated_at = time.time()
         result = dataclasses.replace(
             result,
             usage_metadata=_freeze_result_tree(result.usage_metadata),
@@ -1124,6 +1145,7 @@ class SubagentLifecycleService:
             record.agent = None
             record.result = result
             record.state = result.terminal_state
+            record.diagnostic_stage = None
             record.completed_at = result.completed_at
             record.updated_at = result.completed_at or time.time()
 
