@@ -617,7 +617,10 @@ def test_latched_nested_side_effects_fail_even_after_broker_quiesces(
             stdout=b'{"iterations":2,"summary":"complete"}',
             stderr=b"",
             diagnostic=None,
-            cleanup=CleanupEvidence(broker_quiesced=True),
+            cleanup=CleanupEvidence(
+                broker_quiesced=False,
+                broker_active_operation="tool.execute:scaffolde_evo_agent_dispatch",
+            ),
         ),
     )
 
