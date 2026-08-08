@@ -141,7 +141,7 @@ def agent_env():
     # different module than the one later monkeypatches target.
     def is_reload_target(name: str) -> bool:
         return (
-            name == "run_agent"
+            name in {"run_agent", "model_tools"}
             or name in {"agent", "tools"}
             or name.startswith("agent.")
             or name.startswith("tools.")
