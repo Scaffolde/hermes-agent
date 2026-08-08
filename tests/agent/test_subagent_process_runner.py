@@ -425,6 +425,7 @@ def test_runner_names_admitted_operation_when_revocation_misses_deadline(tmp_pat
     result = run_owned_process(_portable_spec(tmp_path, "-c", "pass", broker=Broker()))
 
     assert result.state == "FAILED"
+    assert result.cleanup.broker_quiesced is False
     assert result.cleanup.broker_active_operation == "model.complete"
     assert "admitted operation model.complete" in (result.diagnostic or "")
 

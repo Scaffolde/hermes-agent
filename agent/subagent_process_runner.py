@@ -991,10 +991,10 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
         except OSError:
             pass
         if broker_thread is not None:
+            cancel_errors: list[BaseException] = []
             cancel = getattr(spec.broker, "cancel", None)
             if callable(cancel):
                 cancel_result: list[Any] = []
-                cancel_errors: list[BaseException] = []
 
                 def revoke_broker() -> None:
                     try:
@@ -1069,7 +1069,7 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
             finalize = getattr(spec.broker, "finalize", None)
             if callable(finalize):
                 finalize()
-            quiesced = not cancel_errors
+            quiesced = quiesced and not cancel_errors
         broker_quiesced = quiesced
 
     try:
