@@ -346,6 +346,25 @@ def test_session_start_rejects_provider_schema_drift_after_adapter_construction(
         adapter._dispatch("session.start", {})
 
 
+def test_model_completion_rejects_provider_wrapper_drift(tmp_path):
+    normalized = SimpleNamespace(
+        content="finished", finish_reason="stop", reasoning=None, tool_calls=[]
+    )
+    _broker, adapter, child, completions, _digest = _fixture(tmp_path, [normalized])
+    original_builder = child._build_api_kwargs
+
+    def drifted_builder(messages, *, tools_for_api):
+        kwargs = original_builder(messages, tools_for_api=tools_for_api)
+        kwargs["tools"][0]["strict"] = False
+        return kwargs
+
+    child._build_api_kwargs = drifted_builder
+
+    with pytest.raises(ProcessIntegrationError, match="schema changed after launch"):
+        adapter._dispatch("model.complete", {"messages": []})
+    assert not hasattr(completions, "kwargs")
+
+
 def test_worker_loop_success_uses_authenticated_broker_and_non_streaming(tmp_path):
     normalized = SimpleNamespace(
         content="finished", finish_reason="stop", reasoning=None, tool_calls=[]
@@ -811,7 +830,14 @@ def test_host_run_claim_rejects_attempt_execution_not_bound_to_host_receipt(
 
 @pytest.mark.parametrize(
     "mutation",
-    ["missing_receipt", "receipt_hash", "result_hash", "cleanup_hash"],
+    [
+        "missing_receipt",
+        "receipt_hash",
+        "result_hash",
+        "cleanup_hash",
+        "request_identity",
+        "outcome",
+    ],
 )
 def test_host_run_claim_rejects_unbound_exact_producer_payload(
     tmp_path, monkeypatch, mutation
@@ -835,10 +861,19 @@ def test_host_run_claim_rejects_unbound_exact_producer_payload(
     elif mutation == "result_hash":
         result_payload["completion"]["result_hash"] = "9" * 64
         result_payload["broker_attestation"]["completion"]["result_hash"] = "9" * 64
-    else:
+    elif mutation == "cleanup_hash":
         result_payload["broker_attestation"]["attempt_execution"]["cleanup_sha256"] = (
             "9" * 64
         )
+    elif mutation == "request_identity":
+        result_payload["result"]["experiment_id"] = "exp_9999"
+        digest = hashlib.sha256(
+            canonical_json(result_payload["result"]).encode()
+        ).hexdigest()
+        result_payload["completion"]["result_hash"] = digest
+        result_payload["broker_attestation"]["completion"]["result_hash"] = digest
+    else:
+        result_payload["broker_attestation"]["outcome"]["status"] = "evaluated"
     monkeypatch.setattr(
         "agent.subagent_process_integration.registry.dispatch_snapshot",
         lambda *_args, **_kwargs: result_payload,
@@ -894,6 +929,50 @@ def test_host_run_failure_latches_unresolved_side_effects(tmp_path, monkeypatch)
     )
 
     assert response["result"]["ok"] is False
+    assert adapter.side_effects_unresolved is True
+    assert adapter.tool_execution_claims == ()
+
+
+def test_side_effecting_handler_exception_latches_unresolved_effects(
+    tmp_path, monkeypatch
+):
+    name = "scaffolde_evo_run"
+    _broker, old_adapter, child, _completions, _digest = _fixture(tmp_path, [])
+    child.tools = [{"type": "function", "function": {"name": name}}]
+    child._delegate_frozen_dispatch_entries = {name: object()}
+    adapter = ParentBrokerAdapter(
+        broker=old_adapter.broker,
+        child=child,
+        profile=old_adapter.profile,
+        task="run attempt",
+    )
+    adapter.profile.execution_backend = "linux_strict"
+    effects = []
+
+    def crash_after_effect(*_args, **_kwargs):
+        effects.append("workspace-mutated")
+        raise RuntimeError("crash after effect")
+
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        crash_after_effect,
+    )
+
+    with pytest.raises(RuntimeError, match="crash after effect"):
+        adapter._dispatch(
+            "tool.execute",
+            {
+                "id": "run-1",
+                "name": name,
+                "arguments": {
+                    "workspace": "/workspace",
+                    "experiment_id": "exp_1001",
+                    "attempt_n": 1,
+                    "timeout_seconds": 30,
+                },
+            },
+        )
+    assert effects == ["workspace-mutated"]
     assert adapter.side_effects_unresolved is True
     assert adapter.tool_execution_claims == ()
 

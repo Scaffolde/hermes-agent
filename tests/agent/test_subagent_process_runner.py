@@ -511,6 +511,62 @@ def test_receipt_terminal_callback_waits_for_broker_quiescence(tmp_path):
     assert len(results) == 1
 
 
+def test_unquiesced_broker_operation_fail_stops_without_terminal_receipt(
+    monkeypatch, tmp_path
+):
+    broker_started = threading.Event()
+    release = threading.Event()
+    terminal_called = threading.Event()
+    fail_stop_reasons = []
+
+    class Broker:
+        def serve(self, _channel: socket.socket, *, root_pid: int, stop_requested):
+            assert root_pid > 0
+            broker_started.set()
+            release.wait(timeout=2)
+
+        def cancel(self):
+            return False
+
+    class Receipt:
+        def on_created(self, **_kwargs):
+            pass
+
+        def on_started(self, **_kwargs):
+            pass
+
+        def on_terminal(self, **_kwargs):
+            terminal_called.set()
+
+    def observe_fail_stop(reason):
+        fail_stop_reasons.append(reason)
+
+    monkeypatch.setattr(runner_module, "_BROKER_CONTAINMENT_FAIL_STOP_SECONDS", 0.05)
+    monkeypatch.setattr(
+        runner_module, "_fail_stop_broker_containment", observe_fail_stop
+    )
+    try:
+        with pytest.raises(
+            runner_module._BrokerContainmentFailStop,
+            match="broker containment fail-stop returned",
+        ):
+            run_owned_process(
+                _portable_spec(
+                    tmp_path,
+                    "-c",
+                    "pass",
+                    broker=Broker(),
+                    receipt=Receipt(),
+                )
+            )
+    finally:
+        release.set()
+
+    assert broker_started.is_set()
+    assert fail_stop_reasons == ["host broker operation exceeded containment deadline"]
+    assert not terminal_called.is_set()
+
+
 def test_receipt_callback_observes_created_started_and_terminal(tmp_path):
     events = []
 

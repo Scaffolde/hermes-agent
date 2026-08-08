@@ -35,7 +35,13 @@ _VALID_BACKENDS = frozenset({"portable", "linux-strict"})
 _MAX_ARG_BYTES = 128_000
 _DEFAULT_OUTPUT_BYTES = 1_048_576
 _STRICT_WORKER_HOME = Path("/tmp/hermes-worker-home")
+_BROKER_CONTAINMENT_FAIL_STOP_SECONDS = 2.0
+_BROKER_CONTAINMENT_EXIT_CODE = 70
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+
+class _BrokerContainmentFailStop(BaseException):
+    """Non-recoverable fallback when the process-level fail-stop unexpectedly returns."""
 
 
 def _bounded_diagnostic_text(value: object, *, limit: int) -> str:
@@ -43,6 +49,13 @@ def _bounded_diagnostic_text(value: object, *, limit: int) -> str:
         character if character.isprintable() else " " for character in str(value)
     )
     return " ".join(printable.split())[:limit]
+
+
+def _fail_stop_broker_containment(reason: str) -> None:
+    """Terminate Hermes before any receipt can follow an uncontained host effect."""
+
+    del reason
+    os._exit(_BROKER_CONTAINMENT_EXIT_CODE)
 
 
 class BrokerCallbacks(Protocol):
@@ -1000,7 +1013,14 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                 # operation is admitted, cancellation must finish before we
                 # can publish that evidence; a deadline may trigger
                 # cancellation, but it cannot authorize a premature result.
-                revocation_thread.join()
+                revocation_thread.join(_BROKER_CONTAINMENT_FAIL_STOP_SECONDS)
+                if revocation_thread.is_alive():
+                    _fail_stop_broker_containment(
+                        "broker cancellation callback exceeded containment deadline"
+                    )
+                    raise _BrokerContainmentFailStop(
+                        "broker containment fail-stop returned"
+                    )
                 if cancel_errors:
                     quiesced = False
                     broker_errors.append(
@@ -1015,7 +1035,14 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
             # lifecycle result until every accepted operation has either
             # recorded its claim or failed; otherwise a late completion can
             # escape terminal classification and the result hash.
-            broker_thread.join()
+            broker_thread.join(_BROKER_CONTAINMENT_FAIL_STOP_SECONDS)
+            if broker_thread.is_alive():
+                _fail_stop_broker_containment(
+                    "host broker operation exceeded containment deadline"
+                )
+                raise _BrokerContainmentFailStop(
+                    "broker containment fail-stop returned"
+                )
             broker_thread = None
             finalize = getattr(spec.broker, "finalize", None)
             if callable(finalize):

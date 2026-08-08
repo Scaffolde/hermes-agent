@@ -419,6 +419,7 @@ def _canonical_public_attestation_json(
         raise ProcessIntegrationError(
             "brokered tool public attestation has an invalid kind"
         )
+    host_result: Mapping[str, Any] | None = None
     if expected_kind == "evo-run":
         attempt_execution = value.get("attempt_execution")
         if not isinstance(attempt_execution, Mapping) or set(attempt_execution) != {
@@ -678,6 +679,19 @@ def _canonical_public_attestation_json(
         raise ProcessIntegrationError(
             "brokered tool public attestation has an invalid role outcome"
         )
+    if expected_kind == "evo-run":
+        if (
+            not isinstance(host_result, Mapping)
+            or not isinstance(outcome, Mapping)
+            or set(host_result) != {"experiment_id", "attempt_n", "status", "exit_code"}
+            or host_result.get("experiment_id") != request.get("experiment_id")
+            or host_result.get("attempt_n") != request.get("attempt_n")
+            or host_result.get("status") != outcome.get("status")
+            or host_result.get("exit_code") != outcome.get("exit_code")
+        ):
+            raise ProcessIntegrationError(
+                "brokered Evo run result does not match its request and outcome"
+            )
     for field in ("protocol_sha256", "evidence_sha256"):
         digest = value.get(field)
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
@@ -1318,6 +1332,7 @@ class ParentBrokerAdapter:
                 raise ProcessIntegrationError(
                     "provider-effective tool schema changed after launch"
                 )
+            kwargs["tools"] = copy.deepcopy(self._effective_tools)
             kwargs["stream"] = False
             kwargs.pop("stream_options", None)
             response = self.child.client.chat.completions.create(**kwargs)
@@ -1385,6 +1400,13 @@ class ParentBrokerAdapter:
             ).hexdigest()
             self._reserve_claim_capacity()
             claim_recorded = False
+            side_effecting = name in {
+                "scaffolde_evo_agent_dispatch",
+                "scaffolde_evo_run",
+            }
+            if side_effecting:
+                with self._claim_lock:
+                    self._side_effects_unresolved = True
             try:
                 concrete_registry: ToolRegistry = registry
                 with bind_subagent_parent(self.child):
@@ -1435,6 +1457,9 @@ class ParentBrokerAdapter:
                     public_attestation_json=public_attestation_json,
                 )
                 claim_recorded = True
+                if side_effecting:
+                    with self._claim_lock:
+                        self._side_effects_unresolved = False
                 return {"result": _json_safe(response_result)}
             finally:
                 if not claim_recorded:
