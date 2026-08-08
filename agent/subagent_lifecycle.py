@@ -1124,6 +1124,7 @@ class SubagentLifecycleService:
             ParentBrokerAdapter,
             launch_receipt_digest,
             strict_worker_runtime_mounts,
+            strict_worker_runtime_path,
         )
         from agent.subagent_process_runner import (
             LinuxStrictConfig,
@@ -1211,16 +1212,37 @@ class SubagentLifecycleService:
                         diagnostics.append(
                             f"worker stderr: {' '.join(diagnostic.split())[:1000]}"
                         )
+                containment_evidence = [result.confinement]
+                if backend == "linux-strict":
+                    runtime_policy = {
+                        "mount_targets": sorted(
+                            str(mount.target) for mount in runtime_mounts
+                        ),
+                        "path": environment.get("PATH", ""),
+                    }
+                    containment_evidence.append(
+                        "runtime_policy_sha256="
+                        + hashlib.sha256(
+                            json.dumps(
+                                runtime_policy, sort_keys=True, separators=(",", ":")
+                            ).encode("utf-8")
+                        ).hexdigest()
+                    )
                 evidence = {
                     "exit_code": result.exit_code,
                     "term_signal": result.signal,
                     "broker_transcript_digest": broker.transcript_digest(),
                     "observed_cleanup": tuple(observed_cleanup),
-                    "containment_evidence": (result.confinement,),
+                    "containment_evidence": tuple(containment_evidence),
                     "diagnostics": tuple(diagnostics),
                 }
-                marker = getattr(recorder, f"mark_{state.lower()}")
-                record.execution_receipt = marker(**evidence)
+                if state == "FAILED" and record.execution_receipt is None:
+                    record.execution_receipt = recorder.mark_pre_start_failed(
+                        **evidence
+                    )
+                else:
+                    marker = getattr(recorder, f"mark_{state.lower()}")
+                    record.execution_receipt = marker(**evidence)
 
         adapter = ParentBrokerAdapter(
             broker=broker,
@@ -1237,8 +1259,17 @@ class SubagentLifecycleService:
             Path(__file__).with_name("subagent_worker_main.py").resolve(strict=True)
         )
         runtime_mounts = ()
+        environment = {}
         if backend == "linux-strict":
-            runtime_mounts = strict_worker_runtime_mounts()
+            exposes_evo_run = "scaffolde_evo_run" in adapter.brokered_tool_names
+            runtime_mounts = strict_worker_runtime_mounts(
+                expose_scaffolde_evo_run=exposes_evo_run
+            )
+            environment = {
+                "PATH": strict_worker_runtime_path(
+                    expose_scaffolde_evo_run=exposes_evo_run
+                )
+            }
         spec = ProcessRunSpec(
             executable=sys.executable,
             argv=(str(worker_path),),
@@ -1252,6 +1283,7 @@ class SubagentLifecycleService:
             cancellation_event=record.cancellation_event,
             broker=adapter,
             receipt=ReceiptAdapter(),
+            environment=environment,
             runtime_mounts=runtime_mounts,
             strict=(
                 LinuxStrictConfig(
@@ -1264,14 +1296,18 @@ class SubagentLifecycleService:
         )
         result = run_owned_process(spec)
         broker.close("owned process completed")
-        side_effects_unresolved = result.cleanup.broker_quiesced is False
+        side_effects_unresolved = (
+            result.cleanup.broker_quiesced is False or adapter.side_effects_unresolved
+        )
         brokered_tool_claims = (
             tuple(claim.to_dict() for claim in adapter.tool_execution_claims)
             if not side_effects_unresolved
             else ()
         )
-        if result.state != "SUCCEEDED":
+        if result.state != "SUCCEEDED" or side_effects_unresolved:
             worker_errors = [result.diagnostic] if result.diagnostic else []
+            if side_effects_unresolved:
+                worker_errors.append("brokered tool side effects unresolved")
             if result.stderr:
                 stderr_lines = [
                     line.strip()
@@ -1289,7 +1325,13 @@ class SubagentLifecycleService:
                         f"worker stderr: {' '.join(diagnostic.split())[:1000]}"
                     )
             raw_result: dict[str, Any] = {
-                "status": ("interrupted" if result.state == "CANCELLED" else "error"),
+                "status": (
+                    "timeout"
+                    if result.state == "TIMED_OUT"
+                    else "interrupted"
+                    if result.state == "CANCELLED"
+                    else "error"
+                ),
                 "error": "; ".join(worker_errors) or result.state,
                 "api_calls": 0,
                 "duration_seconds": 0,

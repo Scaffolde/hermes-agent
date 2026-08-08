@@ -10,6 +10,7 @@ import math
 import os
 import re
 import socket
+import shutil
 import stat
 import sys
 import threading
@@ -390,6 +391,7 @@ def _canonical_public_attestation_json(
             "brokered tool result must contain exactly one top-level "
             "broker_attestation mapping"
         )
+    expected_kind = expected_binding["kind"]
     expected_keys = {
         "version",
         "role",
@@ -401,9 +403,10 @@ def _canonical_public_attestation_json(
         "outcome",
         "evidence_sha256",
     }
-    expected_kind = expected_binding["kind"]
     if expected_kind is not None:
         expected_keys.add("kind")
+    if expected_kind == "evo-run":
+        expected_keys.add("attempt_execution")
     if set(value) != expected_keys:
         raise ProcessIntegrationError(
             "brokered tool public attestation does not match the Scaffolde schema"
@@ -416,6 +419,149 @@ def _canonical_public_attestation_json(
         raise ProcessIntegrationError(
             "brokered tool public attestation has an invalid kind"
         )
+    if expected_kind == "evo-run":
+        attempt_execution = value.get("attempt_execution")
+        if not isinstance(attempt_execution, Mapping) or set(attempt_execution) != {
+            "backend",
+            "containment_mode",
+            "authority_sha256",
+            "executable_sha256",
+            "cleanup_sha256",
+        }:
+            raise ProcessIntegrationError(
+                "brokered tool public attestation has an invalid attempt execution"
+            )
+        if (
+            attempt_execution.get("backend") != "linux-strict"
+            or attempt_execution.get("containment_mode")
+            != "linux-strict-bwrap-cgroup-v2"
+        ):
+            raise ProcessIntegrationError(
+                "brokered tool public attestation has an invalid attempt containment"
+            )
+        for field in ("authority_sha256", "executable_sha256", "cleanup_sha256"):
+            digest = attempt_execution.get(field)
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ProcessIntegrationError(
+                    f"brokered tool public attestation has an invalid {field}"
+                )
+        expected_payload_keys = {
+            "ok",
+            "broker_attestation",
+            "completion",
+            "result",
+            "execution_receipt",
+            "execution_receipt_hash",
+            "evidence",
+        }
+        if set(result_payload) != expected_payload_keys:
+            raise ProcessIntegrationError(
+                "brokered Evo run result does not match the exact producer schema"
+            )
+        host_receipt = result_payload.get("execution_receipt")
+        expected_receipt_keys = {
+            "version",
+            "runner",
+            "backend",
+            "containment_mode",
+            "state",
+            "authority_sha256",
+            "executable_sha256",
+            "argv_sha256",
+            "root_pid",
+            "exit_code",
+            "timed_out",
+            "cancelled",
+            "cleanup",
+        }
+        if (
+            not isinstance(host_receipt, Mapping)
+            or set(host_receipt) != expected_receipt_keys
+        ):
+            raise ProcessIntegrationError(
+                "brokered Evo run has an invalid host execution receipt"
+            )
+        host_cleanup = host_receipt.get("cleanup")
+        expected_cleanup_keys = {
+            "root_reaped",
+            "process_group_empty",
+            "cgroup_kill_sent",
+            "cgroup_empty",
+            "cgroup_removed",
+            "broker_quiesced",
+        }
+        if (
+            not isinstance(host_cleanup, Mapping)
+            or set(host_cleanup) != expected_cleanup_keys
+            or host_cleanup.get("root_reaped") is not True
+            or host_cleanup.get("process_group_empty") is not True
+            or not isinstance(host_cleanup.get("cgroup_kill_sent"), bool)
+            or host_cleanup.get("cgroup_empty") is not True
+            or host_cleanup.get("cgroup_removed") is not True
+            or host_cleanup.get("broker_quiesced") is not None
+        ):
+            raise ProcessIntegrationError(
+                "brokered Evo run host cleanup is not complete"
+            )
+        if (
+            host_receipt.get("version") != 2
+            or host_receipt.get("runner") != "scaffolde-evo-run"
+            or host_receipt.get("backend") != attempt_execution.get("backend")
+            or host_receipt.get("containment_mode")
+            != attempt_execution.get("containment_mode")
+            or host_receipt.get("state") != "SUCCEEDED"
+            or host_receipt.get("authority_sha256")
+            != attempt_execution.get("authority_sha256")
+            or host_receipt.get("executable_sha256")
+            != attempt_execution.get("executable_sha256")
+            or not isinstance(host_receipt.get("argv_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", host_receipt["argv_sha256"])
+            or isinstance(host_receipt.get("root_pid"), bool)
+            or not isinstance(host_receipt.get("root_pid"), int)
+            or host_receipt["root_pid"] < 1
+            or isinstance(host_receipt.get("exit_code"), bool)
+            or host_receipt.get("exit_code") != 0
+            or host_receipt.get("timed_out") is not False
+            or host_receipt.get("cancelled") is not False
+        ):
+            raise ProcessIntegrationError(
+                "brokered tool public attestation does not match host execution receipt"
+            )
+        cleanup_sha256 = hashlib.sha256(
+            canonical_json(_json_safe(host_cleanup)).encode("utf-8")
+        ).hexdigest()
+        if attempt_execution.get("cleanup_sha256") != cleanup_sha256:
+            raise ProcessIntegrationError(
+                "brokered tool public attestation does not match host cleanup"
+            )
+        host_receipt_sha256 = hashlib.sha256(
+            canonical_json(_json_safe(host_receipt)).encode("utf-8")
+        ).hexdigest()
+        completion = value.get("completion")
+        if (
+            result_payload.get("execution_receipt_hash") != host_receipt_sha256
+            or not isinstance(completion, Mapping)
+            or completion.get("execution_receipt_hash") != host_receipt_sha256
+        ):
+            raise ProcessIntegrationError(
+                "brokered Evo run execution receipt hash does not match its receipt"
+            )
+        host_result = result_payload.get("result")
+        host_completion = result_payload.get("completion")
+        if not isinstance(host_result, Mapping) or not isinstance(
+            host_completion, Mapping
+        ):
+            raise ProcessIntegrationError("brokered Evo run result is malformed")
+        host_result_sha256 = hashlib.sha256(
+            canonical_json(_json_safe(host_result)).encode("utf-8")
+        ).hexdigest()
+        if (
+            host_completion.get("result_hash") != host_result_sha256
+            or completion.get("result_hash") != host_result_sha256
+        ):
+            raise ProcessIntegrationError(
+                "brokered Evo run result hash does not match its result"
+            )
     if value.get("ok") is not True:
         raise ProcessIntegrationError(
             "brokered tool public attestation does not attest success"
@@ -676,7 +822,9 @@ def _bounded_failed_tool_result(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def strict_worker_runtime_mounts() -> tuple[Any, ...]:
+def strict_worker_runtime_mounts(
+    *, expose_scaffolde_evo_run: bool = False
+) -> tuple[Any, ...]:
     """Return the minimal declared runtime needed by worker-local handlers."""
     from agent.subagent_process_runner import RuntimeMount
 
@@ -698,7 +846,57 @@ def strict_worker_runtime_mounts() -> tuple[Any, ...]:
                 str(target),
                 RuntimeMount(source=target.resolve(strict=True), target=target),
             )
+    if expose_scaffolde_evo_run:
+        for command in ("git", "sh", "bash", "env"):
+            executable = shutil.which(command)
+            if executable is None:
+                raise ProcessIntegrationError(
+                    f"strict Evo runtime requires host utility {command}"
+                )
+            command_path = Path(executable).absolute()
+            path = command_path.resolve(strict=True)
+            mounts.setdefault(str(path), RuntimeMount(source=path, target=path))
+            mounts.setdefault(
+                str(command_path),
+                RuntimeMount(source=path, target=command_path),
+            )
+        evo_executable = shutil.which("evo")
+        if evo_executable is None:
+            raise ProcessIntegrationError("strict Evo runtime requires the Evo CLI")
+        evo_command = Path(evo_executable).absolute()
+        evo_path = evo_command.resolve(strict=True)
+        # uv/pip tool installs keep their interpreter and packages beside the
+        # entry point. Mount that declared tool environment, never its home.
+        evo_runtime = evo_path.parent.parent
+        mounts.setdefault(
+            str(evo_runtime),
+            RuntimeMount(source=evo_runtime, target=evo_runtime),
+        )
+        mounts.setdefault(
+            str(evo_command),
+            RuntimeMount(source=evo_path, target=evo_command),
+        )
+        git_core = Path("/usr/lib/git-core")
+        if git_core.is_dir():
+            mounts.setdefault(
+                str(git_core),
+                RuntimeMount(source=git_core.resolve(strict=True), target=git_core),
+            )
     return tuple(mounts.values())
+
+
+def strict_worker_runtime_path(*, expose_scaffolde_evo_run: bool = False) -> str:
+    """Return a narrow PATH matching host-declared strict runtime mounts."""
+    directories = {str(Path(sys.executable).resolve(strict=True).parent)}
+    if expose_scaffolde_evo_run:
+        for command in ("evo", "git", "sh", "bash", "env"):
+            executable = shutil.which(command)
+            if executable is None:
+                raise ProcessIntegrationError(
+                    f"strict Evo runtime requires host utility {command}"
+                )
+            directories.add(str(Path(executable).absolute().parent))
+    return os.pathsep.join(sorted(directories))
 
 
 def launch_receipt_digest(receipt: Any) -> str:
@@ -767,6 +965,7 @@ class ParentBrokerAdapter:
         self.child = child
         self.profile = profile
         self.task = task
+        self._cancellation_event = threading.Event()
         self._secret = broker.reveal_secret_for_transport()
         self._launch_receipt_sha256 = broker.launch_receipt_digest
         pinned_tools_json = getattr(
@@ -814,6 +1013,7 @@ class ParentBrokerAdapter:
         self._pending_tool_execution_claims = 0
         self._claims_frozen = False
         self._claim_cleanup_failure: str | None = None
+        self._side_effects_unresolved = False
         self._stop_requested: threading.Event | None = None
         self._operation_lock = threading.Lock()
         if set(self._brokered_dispatch_entries) != set(self.brokered_tool_names):
@@ -846,6 +1046,11 @@ class ParentBrokerAdapter:
     def claim_cleanup_failure(self) -> str | None:
         with self._claim_lock:
             return self._claim_cleanup_failure
+
+    @property
+    def side_effects_unresolved(self) -> bool:
+        with self._claim_lock:
+            return self._side_effects_unresolved
 
     def _freeze_claim_accounting(self, failure: str | None = None) -> None:
         with self._claim_lock:
@@ -952,6 +1157,7 @@ class ParentBrokerAdapter:
         del root_pid
         self._stop_requested = stop_requested
         self.child._owned_process_broker_stop_requested = stop_requested
+        self.child._owned_process_broker_cancellation_event = self._cancellation_event
         while not stop_requested.is_set():
             sequence: int | None = None
             request = None
@@ -1030,6 +1236,7 @@ class ParentBrokerAdapter:
             raise ValueError("timeout_seconds must be finite and non-negative")
         if self._stop_requested is not None:
             self._stop_requested.set()
+        self._cancellation_event.set()
         self.broker.revoke("owned process broker cancellation requested")
         # The process-profile child owns its provider client. Closing that
         # transport is the cancellation path for a blocking model.complete;
@@ -1054,11 +1261,12 @@ class ParentBrokerAdapter:
         if operation_quiesced:
             self._operation_lock.release()
             self._freeze_claim_accounting()
-        else:
-            self._freeze_claim_accounting(
-                "accepted broker operation did not quiesce before the cleanup deadline"
-            )
         return operation_quiesced
+
+    def finalize(self) -> None:
+        """Freeze claims only after the owned runner has proved quiescence."""
+        with self._operation_lock:
+            self._freeze_claim_accounting()
 
     def _dispatch(self, operation: str, body: Any) -> Mapping[str, Any]:
         if not isinstance(body, Mapping):
@@ -1168,6 +1376,11 @@ class ParentBrokerAdapter:
             try:
                 concrete_registry: ToolRegistry = registry
                 with bind_subagent_parent(self.child):
+                    cancellation_kwargs = (
+                        {"cancellation_event": self._cancellation_event}
+                        if name == "scaffolde_evo_run"
+                        else {}
+                    )
                     result = concrete_registry.dispatch_snapshot(
                         self._brokered_dispatch_entries,
                         name,
@@ -1178,6 +1391,7 @@ class ParentBrokerAdapter:
                         session_id=getattr(self.child, "session_id", None),
                         user_task=self.task,
                         enabled_tools=set(self.brokered_tool_names),
+                        **cancellation_kwargs,
                     )
                 result_payload, response_result = _brokered_result_payload(result)
                 result_json = _canonical_bounded_json(
@@ -1186,6 +1400,9 @@ class ParentBrokerAdapter:
                     limit=_MAX_BROKERED_TOOL_RESULT_BYTES,
                 )
                 if result_payload.get("ok") is False:
+                    if result_payload.get("side_effects_unresolved") is True:
+                        with self._claim_lock:
+                            self._side_effects_unresolved = True
                     return {"result": _bounded_failed_tool_result(result_payload)}
                 expected_attestation_binding = _expected_scaffolde_attestation_binding(
                     args,

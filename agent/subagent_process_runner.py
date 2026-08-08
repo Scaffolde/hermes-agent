@@ -36,7 +36,6 @@ _MAX_ARG_BYTES = 128_000
 _DEFAULT_OUTPUT_BYTES = 1_048_576
 _STRICT_WORKER_HOME = Path("/tmp/hermes-worker-home")
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
-_BROKER_THREAD_JOIN_SECONDS = 0.5
 
 
 def _bounded_diagnostic_text(value: object, *, limit: int) -> str:
@@ -475,9 +474,12 @@ def _build_linux_strict_argv(
     )
     argv.extend(("--dir", str(_STRICT_WORKER_HOME)))
     argv.extend(("--dir", str(sandbox_workspace)))
+    argv.extend(("--bind", str(spec.workspace), str(sandbox_workspace)))
+    # A runtime file may intentionally overlay a path inside the writable
+    # workspace (for example a host-owned benchmark authority snapshot). Apply
+    # runtime mounts after the workspace bind so that bind cannot shadow them.
     for mount in spec.runtime_mounts:
         argv.extend(("--ro-bind", str(mount.source), str(mount.target)))
-    argv.extend(("--bind", str(spec.workspace), str(sandbox_workspace)))
     relative_cwd = spec.cwd.resolve(strict=True).relative_to(
         spec.workspace.resolve(strict=True)
     )
@@ -815,16 +817,7 @@ def _terminal_result(
         cleanup=cleanup or CleanupEvidence(requested=False),
         diagnostic=diagnostic,
     )
-    try:
-        _notify(spec.receipt, "on_terminal", state=state, result=result)
-    except Exception as exc:
-        result = dataclasses.replace(
-            result,
-            state=(
-                "CONTAINMENT_FAILED" if spec.backend == "linux-strict" else "FAILED"
-            ),
-            diagnostic=f"receipt callback failed: {type(exc).__name__}",
-        )
+    _notify(spec.receipt, "on_terminal", state=state, result=result)
     return result
 
 
@@ -983,7 +976,6 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
         except OSError:
             pass
         if broker_thread is not None:
-            revocation_deadline = time.monotonic() + _BROKER_THREAD_JOIN_SECONDS
             cancel = getattr(spec.broker, "cancel", None)
             if callable(cancel):
                 cancel_result: list[Any] = []
@@ -1004,13 +996,12 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                     daemon=True,
                 )
                 revocation_thread.start()
-                revocation_thread.join(
-                    timeout=max(0.0, revocation_deadline - time.monotonic())
-                )
-                if revocation_thread.is_alive():
-                    quiesced = False
-                    broker_errors.append("broker revocation deadline expired")
-                elif cancel_errors:
+                # Terminal evidence is immutable.  Once a side-effecting
+                # operation is admitted, cancellation must finish before we
+                # can publish that evidence; a deadline may trigger
+                # cancellation, but it cannot authorize a premature result.
+                revocation_thread.join()
+                if cancel_errors:
                     quiesced = False
                     broker_errors.append(
                         f"broker revocation failed: {type(cancel_errors[0]).__name__}"
@@ -1024,14 +1015,12 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
             # lifecycle result until every accepted operation has either
             # recorded its claim or failed; otherwise a late completion can
             # escape terminal classification and the result hash.
-            broker_thread.join(timeout=max(0.0, revocation_deadline - time.monotonic()))
-            if broker_thread.is_alive():
-                quiesced = False
-                broker_errors.append(
-                    "broker thread did not stop before revocation deadline"
-                )
-            if not broker_thread.is_alive():
-                broker_thread = None
+            broker_thread.join()
+            broker_thread = None
+            finalize = getattr(spec.broker, "finalize", None)
+            if callable(finalize):
+                finalize()
+            quiesced = not cancel_errors
         broker_quiesced = quiesced
 
     try:

@@ -446,6 +446,7 @@ def test_process_brokered_claims_propagate_and_bind_result_hash(monkeypatch, tmp
     class ClaimingAdapter:
         def __init__(self, **_kwargs):
             self.tool_execution_claims = (claim,)
+            self.side_effects_unresolved = False
 
     monkeypatch.setattr(
         "agent.subagent_lifecycle.resolve_execution_profile",
@@ -527,6 +528,7 @@ def test_unquiesced_process_omits_claims_and_final_result_hash(monkeypatch, tmp_
     class ClaimingAdapter:
         def __init__(self, **_kwargs):
             self.tool_execution_claims = (claim,)
+            self.side_effects_unresolved = False
 
     monkeypatch.setattr(
         "agent.subagent_lifecycle.resolve_execution_profile",
@@ -560,6 +562,59 @@ def test_unquiesced_process_omits_claims_and_final_result_hash(monkeypatch, tmp_
     }
 
 
+def test_latched_nested_side_effects_fail_even_after_broker_quiesces(
+    monkeypatch, tmp_path
+):
+    from agent.subagent_process_runner import CleanupEvidence
+
+    parent = SimpleNamespace(
+        session_id="nested-side-effects", enabled_toolsets=["file"]
+    )
+    child = FakeChild("nested-side-effects")
+
+    def build(**_kwargs):
+        from tools.registry import registry
+
+        child._delegate_tool_registry_generation = registry.generation()
+        return child
+
+    class Adapter:
+        def __init__(self, **_kwargs):
+            self.tool_execution_claims = ()
+            self.side_effects_unresolved = True
+
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.resolve_execution_profile",
+        lambda _profile_id: _profile(
+            execution_backend="portable", workspace_root=str(tmp_path)
+        ),
+    )
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.ParentBrokerAdapter", Adapter
+    )
+    monkeypatch.setattr(
+        "agent.subagent_process_runner.run_owned_process",
+        lambda _spec: SimpleNamespace(
+            state="SUCCEEDED",
+            stdout=b'{"iterations":2,"summary":"complete"}',
+            stderr=b"",
+            diagnostic=None,
+            cleanup=CleanupEvidence(broker_quiesced=True),
+        ),
+    )
+
+    service = SubagentLifecycleService(lambda: parent)
+    handle = service.launch(SubagentLaunchRequest(goal="review", profile_id="reviewer"))
+    assert service.wait(handle, timeout_seconds=1).state is SubagentState.FAILED
+    result = service.result(handle)
+    assert result.result_hash is None
+    assert result.tool_execution_summary == {
+        "duration_seconds": 0,
+        "side_effects_unresolved": True,
+    }
+
+
 def test_process_profile_cancel_signals_owned_runner_and_preserves_cleanup_receipt(
     monkeypatch, tmp_path
 ):
@@ -578,6 +633,7 @@ def test_process_profile_cancel_signals_owned_runner_and_preserves_cleanup_recei
     class Adapter:
         def __init__(self, **_kwargs):
             self.tool_execution_claims = ()
+            self.side_effects_unresolved = False
 
     def run(spec):
         runner_started.set()
@@ -631,6 +687,68 @@ def test_process_profile_cancel_signals_owned_runner_and_preserves_cleanup_recei
         "root_reaped=True",
         "process_group_empty=True",
     )
+
+
+def test_process_profile_timeout_preserves_classification_and_receipt(
+    monkeypatch, tmp_path
+):
+    from agent.subagent_process_runner import CleanupEvidence, ProcessRunResult
+
+    parent = SimpleNamespace(session_id="process-timeout", enabled_toolsets=["file"])
+    child = FakeChild("process-timeout")
+
+    def build(**_kwargs):
+        from tools.registry import registry
+
+        child._delegate_tool_registry_generation = registry.generation()
+        return child
+
+    class Adapter:
+        def __init__(self, **_kwargs):
+            self.tool_execution_claims = ()
+            self.side_effects_unresolved = False
+
+    def run(spec):
+        result = ProcessRunResult(
+            backend="portable",
+            confinement="portable-process-unconfined",
+            state="TIMED_OUT",
+            root_pid=4322,
+            returncode=-15,
+            exit_code=None,
+            signal=15,
+            timed_out=True,
+            stdout=b"",
+            stderr=b"",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            cleanup=CleanupEvidence(root_reaped=True, process_group_empty=True),
+        )
+        spec.receipt.on_started(root_pid=result.root_pid)
+        spec.receipt.on_terminal(state=result.state, result=result)
+        return result
+
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.resolve_execution_profile",
+        lambda _profile_id: _profile(
+            execution_backend="portable", workspace_root=str(tmp_path)
+        ),
+    )
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.ParentBrokerAdapter", Adapter
+    )
+    monkeypatch.setattr("agent.subagent_process_runner.run_owned_process", run)
+
+    service = SubagentLifecycleService(lambda: parent)
+    handle = service.launch(
+        SubagentLaunchRequest(goal="timeout", profile_id="reviewer")
+    )
+    assert service.wait(handle, timeout_seconds=1).state is SubagentState.FAILED
+    result = service.result(handle)
+    assert result.error_classification == "TIMEOUT"
+    assert result.execution_receipt is not None
+    assert result.execution_receipt.state.value == "TIMED_OUT"
 
 
 def test_profile_blocked_tools_are_removed_before_exact_freeze(monkeypatch):

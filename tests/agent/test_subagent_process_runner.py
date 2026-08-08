@@ -12,6 +12,7 @@ from typing import Any, cast
 import pytest
 
 import agent.subagent_process_runner as runner_module
+from agent.subagent_execution_receipts import SubagentExecutionRecorder
 from agent.subagent_process_runner import (
     LinuxStrictConfig,
     ProcessRunSpec,
@@ -63,6 +64,39 @@ def _portable_spec(tmp_path: Path, *argv: str, **overrides: Any) -> ProcessRunSp
     }
     values.update(overrides)
     return ProcessRunSpec(**cast(Any, values))
+
+
+def test_socketpair_failure_records_validated_pre_start_terminal_receipt(
+    tmp_path, monkeypatch
+):
+    recorder = SubagentExecutionRecorder(
+        launch_receipt_digest="a" * 64,
+        backend="portable",
+        containment_mode="portable-process-unconfined",
+    )
+
+    class Receipt:
+        def on_created(self, **_kwargs):
+            pass
+
+        def on_started(self, *, root_pid):
+            recorder.mark_started(root_pid=root_pid)
+
+        def on_terminal(self, *, state, result):
+            recorder.mark_pre_start_failed(diagnostics=(result.diagnostic,))
+
+    def fail_socketpair(*_args, **_kwargs):
+        raise OSError(24, "too many open files")
+
+    monkeypatch.setattr(runner_module.socket, "socketpair", fail_socketpair)
+
+    result = run_owned_process(
+        _portable_spec(tmp_path, "-c", "pass", receipt=Receipt())
+    )
+
+    assert result.state == "FAILED"
+    assert recorder.snapshot().state.value == "FAILED"
+    assert recorder.snapshot().started_at is None
 
 
 def test_minimal_environment_drops_credentials_proxies_and_python_paths(monkeypatch):
@@ -374,29 +408,43 @@ def test_runner_cancels_inflight_broker_operation_before_terminalizing(tmp_path)
     assert results[0].state == "SUCCEEDED"
 
 
-def test_runner_bounds_join_when_broker_violates_synchronous_cancel_contract(tmp_path):
+def test_runner_refuses_terminal_result_until_broker_quiesces(tmp_path):
     broker_started = threading.Event()
     release = threading.Event()
+    cancelled = threading.Event()
+    effects = []
 
     class Broker:
         def serve(self, _channel: socket.socket, *, root_pid: int, stop_requested):
             assert root_pid > 0
             broker_started.set()
-            release.wait(timeout=2)
+            assert release.wait(timeout=2)
+            if not cancelled.is_set():
+                effects.append("late-effect")
 
         def cancel(self):
-            pass
+            cancelled.set()
 
-    started = runner_module.time.monotonic()
-    result = run_owned_process(_portable_spec(tmp_path, "-c", "pass", broker=Broker()))
-    elapsed = runner_module.time.monotonic() - started
+    results = []
+    thread = threading.Thread(
+        target=lambda: results.append(
+            run_owned_process(_portable_spec(tmp_path, "-c", "pass", broker=Broker()))
+        )
+    )
+    thread.start()
+    assert broker_started.wait(timeout=1)
+    thread.join(timeout=0.7)
+    assert thread.is_alive()
+    assert results == []
+    assert effects == []
     release.set()
+    thread.join(timeout=2)
 
-    assert broker_started.is_set()
-    assert elapsed < 1.5
-    assert result.state == "FAILED"
-    assert result.cleanup.broker_quiesced is False
-    assert "broker thread did not stop" in (result.diagnostic or "")
+    assert not thread.is_alive()
+    assert len(results) == 1
+    assert results[0].state == "SUCCEEDED"
+    assert results[0].cleanup.broker_quiesced is True
+    assert effects == []
 
 
 def test_runner_rejects_broker_without_synchronous_cancel(tmp_path):
@@ -452,6 +500,8 @@ def test_receipt_terminal_callback_waits_for_broker_quiescence(tmp_path):
     thread.start()
     assert broker_started.wait(timeout=1)
     assert stop_seen.wait(timeout=1)
+    thread.join(timeout=0.7)
+    assert thread.is_alive()
     assert not terminal_called.is_set()
 
     release.set()
@@ -555,6 +605,43 @@ def test_linux_bwrap_inherits_passed_capability_fd_without_fake_option(tmp_path)
     )
     assert "--preserve-fds" not in argv
     assert argv[-2:] == ["--capability-fd", "9"]
+
+
+def test_linux_bwrap_applies_workspace_file_overlays_after_writable_bind(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    snapshot = tmp_path / "config.snapshot"
+    snapshot.write_text("trusted\n", encoding="utf-8")
+    sandbox_workspace = Path("/workspace")
+    target = sandbox_workspace / ".evo" / "run_0001" / "config.json"
+    spec = ProcessRunSpec(
+        executable=sys.executable,
+        argv=("-c", "pass"),
+        cwd=workspace,
+        workspace=workspace,
+        capability_secret=SECRET,
+        runtime_mounts=(RuntimeMount(source=snapshot, target=target),),
+        backend="linux-strict",
+        strict=LinuxStrictConfig(
+            cgroup_parent=tmp_path,
+            sandbox_workspace=sandbox_workspace,
+        ),
+    )
+    argv = _build_linux_strict_argv(spec, "/usr/bin/bwrap", capability_fd=9)
+
+    def sequence_index(values: tuple[str, ...]) -> int:
+        for index in range(len(argv) - len(values) + 1):
+            if tuple(argv[index : index + len(values)]) == values:
+                return index
+        raise AssertionError(f"missing bwrap sequence: {values!r}")
+
+    workspace_bind = sequence_index((
+        "--bind",
+        str(workspace.resolve()),
+        str(sandbox_workspace),
+    ))
+    overlay_bind = sequence_index(("--ro-bind", str(snapshot.resolve()), str(target)))
+    assert workspace_bind < overlay_bind
 
 
 def test_pre_spawn_receipt_callback_failure_refuses_spawn(monkeypatch, tmp_path):

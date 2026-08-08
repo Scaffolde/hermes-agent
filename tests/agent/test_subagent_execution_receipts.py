@@ -170,6 +170,16 @@ def test_pre_spawn_containment_failure_has_no_fake_pid():
     assert receipt.completed_at >= receipt.created_at
 
 
+def test_created_can_transition_directly_to_failed_for_pre_start_errors():
+    receipt = _recorder().mark_pre_start_failed(
+        diagnostics=("socketpair creation failed",),
+    )
+    assert receipt.state is SubagentExecutionState.FAILED
+    assert receipt.root_pid is None
+    assert receipt.started_at is None
+    assert receipt.completed_at >= receipt.created_at
+
+
 def test_started_cannot_be_marked_twice():
     recorder = _recorder()
     recorder.mark_started(root_pid=1)

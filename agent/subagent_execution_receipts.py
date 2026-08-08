@@ -55,31 +55,23 @@ class SubagentExecutionState(str, enum.Enum):
     CONTAINMENT_FAILED = "CONTAINMENT_FAILED"
 
 
-TERMINAL_EXECUTION_STATES = frozenset(
-    {
-        SubagentExecutionState.SUCCEEDED,
-        SubagentExecutionState.FAILED,
-        SubagentExecutionState.CANCELLED,
-        SubagentExecutionState.TIMED_OUT,
-        SubagentExecutionState.CONTAINMENT_FAILED,
-    }
-)
+TERMINAL_EXECUTION_STATES = frozenset({
+    SubagentExecutionState.SUCCEEDED,
+    SubagentExecutionState.FAILED,
+    SubagentExecutionState.CANCELLED,
+    SubagentExecutionState.TIMED_OUT,
+    SubagentExecutionState.CONTAINMENT_FAILED,
+})
 
 
 def _require_hex_digest(value: Any, field: str) -> str:
     if not isinstance(value, str) or not _HEX_DIGEST_RE.match(value):
-        raise ExecutionReceiptError(
-            f"{field} must be a 64-char lowercase hex digest."
-        )
+        raise ExecutionReceiptError(f"{field} must be a 64-char lowercase hex digest.")
     return value
 
 
 def _require_label(value: Any, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or not value.strip()
-        or len(value) > _MAX_LABEL_CHARS
-    ):
+    if not isinstance(value, str) or not value.strip() or len(value) > _MAX_LABEL_CHARS:
         raise ExecutionReceiptError(
             f"{field} must be a non-empty string of at most "
             f"{_MAX_LABEL_CHARS} characters."
@@ -123,10 +115,12 @@ def _require_timestamp(value: Any, field: str) -> float:
 def _optional_bounded_int(value: Any, field: str, low: int, high: int) -> Optional[int]:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
-        raise ExecutionReceiptError(
-            f"{field} must be an integer in [{low}, {high}]."
-        )
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not low <= value <= high
+    ):
+        raise ExecutionReceiptError(f"{field} must be an integer in [{low}, {high}].")
     return value
 
 
@@ -261,6 +255,14 @@ class SubagentExecutionRecorder:
 
     def mark_failed(self, **evidence: Any) -> SubagentExecutionReceipt:
         return self._complete(SubagentExecutionState.FAILED, **evidence)
+
+    def mark_pre_start_failed(self, **evidence: Any) -> SubagentExecutionReceipt:
+        """Record a terminal failure when process start never occurred."""
+        return self._complete(
+            SubagentExecutionState.FAILED,
+            allow_created=True,
+            **evidence,
+        )
 
     def mark_cancelled(self, **evidence: Any) -> SubagentExecutionReceipt:
         return self._complete(SubagentExecutionState.CANCELLED, **evidence)

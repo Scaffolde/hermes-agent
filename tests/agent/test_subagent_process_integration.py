@@ -2,12 +2,15 @@ import dataclasses
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 import socket
 import sys
 import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -17,6 +20,7 @@ from agent.subagent_process_integration import (
     ParentBrokerAdapter,
     ProcessIntegrationError,
     strict_worker_runtime_mounts,
+    strict_worker_runtime_path,
 )
 from agent.subagent_worker_main import (
     BrokerFrameError,
@@ -164,9 +168,74 @@ def _valid_run_attestation() -> dict[str, object]:
             "execution_receipt_hash": "c" * 64,
         },
         "outcome": {"status": "committed", "exit_code": 0},
+        "attempt_execution": {
+            "backend": "linux-strict",
+            "containment_mode": "linux-strict-bwrap-cgroup-v2",
+            "authority_sha256": "d" * 64,
+            "executable_sha256": "e" * 64,
+            "cleanup_sha256": "f" * 64,
+        },
         "evidence_sha256": hashlib.sha256(
             canonical_json({"verified": True}).encode()
         ).hexdigest(),
+    }
+
+
+def _valid_run_result_payload() -> dict[str, Any]:
+    result = {
+        "experiment_id": "exp_1001",
+        "attempt_n": 1,
+        "status": "committed",
+        "exit_code": 0,
+    }
+    cleanup = {
+        "root_reaped": True,
+        "process_group_empty": True,
+        "cgroup_kill_sent": False,
+        "cgroup_empty": True,
+        "cgroup_removed": True,
+        "broker_quiesced": None,
+    }
+    execution_receipt = {
+        "version": 2,
+        "runner": "scaffolde-evo-run",
+        "backend": "linux-strict",
+        "containment_mode": "linux-strict-bwrap-cgroup-v2",
+        "state": "SUCCEEDED",
+        "authority_sha256": "d" * 64,
+        "executable_sha256": "e" * 64,
+        "argv_sha256": "1" * 64,
+        "root_pid": 4242,
+        "exit_code": 0,
+        "timed_out": False,
+        "cancelled": False,
+        "cleanup": cleanup,
+    }
+    evidence = {"verified": True}
+    attestation = _valid_run_attestation()
+    result_hash = hashlib.sha256(canonical_json(result).encode()).hexdigest()
+    receipt_hash = hashlib.sha256(
+        canonical_json(execution_receipt).encode()
+    ).hexdigest()
+    attestation["completion"] = {
+        "result_hash": result_hash,
+        "execution_receipt_hash": receipt_hash,
+    }
+    attestation["attempt_execution"] = {
+        "backend": "linux-strict",
+        "containment_mode": "linux-strict-bwrap-cgroup-v2",
+        "authority_sha256": "d" * 64,
+        "executable_sha256": "e" * 64,
+        "cleanup_sha256": hashlib.sha256(canonical_json(cleanup).encode()).hexdigest(),
+    }
+    return {
+        "ok": True,
+        "broker_attestation": attestation,
+        "completion": {"result_hash": result_hash},
+        "result": result,
+        "execution_receipt": execution_receipt,
+        "execution_receipt_hash": receipt_hash,
+        "evidence": evidence,
     }
 
 
@@ -181,7 +250,7 @@ def test_parent_cancel_has_a_real_deadline_for_an_admitted_operation(tmp_path):
     assert time.monotonic() - started < 0.2
 
 
-def test_parent_cancel_freezes_claim_accounting_when_operation_does_not_quiesce(
+def test_parent_cancel_defers_claim_freeze_until_admitted_operation_quiesces(
     tmp_path,
 ):
     _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
@@ -192,8 +261,10 @@ def test_parent_cancel_freezes_claim_accounting_when_operation_does_not_quiesce(
     finally:
         adapter._operation_lock.release()
 
+    assert adapter.claims_frozen is False
+    assert adapter.claim_cleanup_failure is None
+    adapter.finalize()
     assert adapter.claims_frozen is True
-    assert "did not quiesce" in (adapter.claim_cleanup_failure or "")
     with pytest.raises(ProcessIntegrationError, match="claim accounting is frozen"):
         adapter._record_tool_execution_claim(
             name="scaffolde_evo_agent_dispatch",
@@ -207,6 +278,7 @@ def test_parent_cancel_freezes_claim_accounting_when_operation_does_not_quiesce(
 def test_parent_cancel_reports_quiesced_when_no_operation_is_admitted(tmp_path):
     _broker, adapter, _child, _completions, _digest = _fixture(tmp_path, [])
     assert adapter.cancel(timeout_seconds=0.01) is True
+    assert adapter._cancellation_event.is_set()
 
 
 def test_parent_rejects_provider_schema_not_bound_to_launch_receipt(tmp_path):
@@ -661,22 +733,16 @@ def test_host_run_claim_binds_candidate_launch_schema_and_attestation(
         broker=broker, child=child, profile=old_adapter.profile, task="run attempt"
     )
     adapter.profile.execution_backend = "linux_strict"
-    result_payload = {
-        "ok": True,
-        "broker_attestation": _valid_run_attestation(),
-        "completion": {"result_hash": "b" * 64},
-        "result": {
-            "experiment_id": "exp_1001",
-            "attempt_n": 1,
-            "status": "committed",
-            "exit_code": 0,
-        },
-        "execution_receipt_hash": "c" * 64,
-        "evidence": {"verified": True},
-    }
+    result_payload = _valid_run_result_payload()
+    dispatch_kwargs = []
+
+    def dispatch(*_args, **kwargs):
+        dispatch_kwargs.append(kwargs)
+        return result_payload
+
     monkeypatch.setattr(
         "agent.subagent_process_integration.registry.dispatch_snapshot",
-        lambda *_args, **_kwargs: result_payload,
+        dispatch,
     )
     arguments = {
         "workspace": "/workspace",
@@ -703,7 +769,133 @@ def test_host_run_claim_binds_candidate_launch_schema_and_attestation(
     assert claim.tool_schema_sha256 == process_integration.exact_tool_schema_digest(
         child.tools
     )
-    assert claim.public_attestation_json == canonical_json(_valid_run_attestation())
+    assert claim.public_attestation_json == canonical_json(
+        result_payload["broker_attestation"]
+    )
+    assert dispatch_kwargs[0]["cancellation_event"] is adapter._cancellation_event
+
+
+def test_host_run_claim_rejects_attempt_execution_not_bound_to_host_receipt(
+    tmp_path, monkeypatch
+):
+    broker, old_adapter, child, _completions, _digest = _fixture(tmp_path, [])
+    name = "scaffolde_evo_run"
+    child.tools = [{"type": "function", "function": {"name": name}}]
+    child._delegate_frozen_dispatch_entries = {name: object()}
+    adapter = ParentBrokerAdapter(
+        broker=broker, child=child, profile=old_adapter.profile, task="run attempt"
+    )
+    adapter.profile.execution_backend = "linux_strict"
+    result_payload = _valid_run_result_payload()
+    result_payload["execution_receipt"]["authority_sha256"] = "9" * 64
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: result_payload,
+    )
+
+    with pytest.raises(ProcessIntegrationError, match="host execution receipt"):
+        adapter._dispatch(
+            "tool.execute",
+            {
+                "id": "run-1",
+                "name": name,
+                "arguments": {
+                    "workspace": "/workspace",
+                    "experiment_id": "exp_1001",
+                    "attempt_n": 1,
+                    "timeout_seconds": 30,
+                },
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing_receipt", "receipt_hash", "result_hash", "cleanup_hash"],
+)
+def test_host_run_claim_rejects_unbound_exact_producer_payload(
+    tmp_path, monkeypatch, mutation
+):
+    broker, old_adapter, child, _completions, _digest = _fixture(tmp_path, [])
+    name = "scaffolde_evo_run"
+    child.tools = [{"type": "function", "function": {"name": name}}]
+    child._delegate_frozen_dispatch_entries = {name: object()}
+    adapter = ParentBrokerAdapter(
+        broker=broker, child=child, profile=old_adapter.profile, task="run attempt"
+    )
+    adapter.profile.execution_backend = "linux_strict"
+    result_payload = _valid_run_result_payload()
+    if mutation == "missing_receipt":
+        result_payload.pop("execution_receipt")
+    elif mutation == "receipt_hash":
+        result_payload["execution_receipt_hash"] = "9" * 64
+        result_payload["broker_attestation"]["completion"]["execution_receipt_hash"] = (
+            "9" * 64
+        )
+    elif mutation == "result_hash":
+        result_payload["completion"]["result_hash"] = "9" * 64
+        result_payload["broker_attestation"]["completion"]["result_hash"] = "9" * 64
+    else:
+        result_payload["broker_attestation"]["attempt_execution"]["cleanup_sha256"] = (
+            "9" * 64
+        )
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: result_payload,
+    )
+
+    with pytest.raises(ProcessIntegrationError):
+        adapter._dispatch(
+            "tool.execute",
+            {
+                "id": "run-1",
+                "name": name,
+                "arguments": {
+                    "workspace": "/workspace",
+                    "experiment_id": "exp_1001",
+                    "attempt_n": 1,
+                    "timeout_seconds": 30,
+                },
+            },
+        )
+
+
+def test_host_run_failure_latches_unresolved_side_effects(tmp_path, monkeypatch):
+    broker, old_adapter, child, _completions, _digest = _fixture(tmp_path, [])
+    name = "scaffolde_evo_run"
+    child.tools = [{"type": "function", "function": {"name": name}}]
+    child._delegate_frozen_dispatch_entries = {name: object()}
+    adapter = ParentBrokerAdapter(
+        broker=broker, child=child, profile=old_adapter.profile, task="run attempt"
+    )
+    adapter.profile.execution_backend = "linux_strict"
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "error_code": "evo_run_side_effects_unresolved",
+            "error": "nested containment failed",
+            "side_effects_unresolved": True,
+        },
+    )
+
+    response = adapter._dispatch(
+        "tool.execute",
+        {
+            "id": "run-1",
+            "name": name,
+            "arguments": {
+                "workspace": "/workspace",
+                "experiment_id": "exp_1001",
+                "attempt_n": 1,
+                "timeout_seconds": 30,
+            },
+        },
+    )
+
+    assert response["result"]["ok"] is False
+    assert adapter.side_effects_unresolved is True
+    assert adapter.tool_execution_claims == ()
 
 
 def test_brokered_claim_rejects_attestation_not_bound_to_host_completion(
@@ -1269,6 +1461,32 @@ def test_strict_runtime_mounts_include_importable_worker_handler_modules():
             assert system_root in targets
     assert (repository_root / "tools" / "terminal_tool.py").is_file()
     assert (repository_root / "tools" / "file_tools.py").is_file()
+
+
+def test_strict_evo_profile_mounts_declared_cli_and_system_utilities_only():
+    mounts = strict_worker_runtime_mounts(expose_scaffolde_evo_run=True)
+    sources = {mount.source for mount in mounts}
+    targets = {mount.target for mount in mounts}
+
+    evo = Path(shutil.which("evo") or "").resolve(strict=True)
+    git = Path(shutil.which("git") or "").resolve(strict=True)
+    assert any(evo == source or evo.is_relative_to(source) for source in sources)
+    assert git in sources
+    assert Path("/") not in targets
+    assert Path("/usr/bin") not in targets
+    environment = {"PATH": strict_worker_runtime_path(expose_scaffolde_evo_run=True)}
+    assert (
+        subprocess.run(
+            ["evo", "--version"], env=environment, capture_output=True, check=False
+        ).returncode
+        == 0
+    )
+    assert (
+        subprocess.run(
+            ["git", "--version"], env=environment, capture_output=True, check=False
+        ).returncode
+        == 0
+    )
 
 
 def test_parent_dispatch_error_returns_authenticated_rejection(tmp_path, monkeypatch):
