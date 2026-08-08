@@ -135,10 +135,24 @@ def agent_env():
     os.environ["HERMES_HOME"] = os.path.join(test_home, ".hermes")
 
     # Import fresh so the patched conversation_loop is exercised even when the
-    # module was imported earlier in the same worker.
-    for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
+    # module was imported earlier in the same worker.  Preserve module identity
+    # for later tests: several test modules import functions at collection time,
+    # so permanently replacing ``agent.*`` leaves those functions attached to a
+    # different module than the one later monkeypatches target.
+    def is_reload_target(name: str) -> bool:
+        return (
+            name == "run_agent"
+            or name in {"agent", "tools"}
+            or name.startswith("agent.")
+            or name.startswith("tools.")
+            or name.startswith("hermes_")
+        )
+
+    saved_modules = {
+        name: module for name, module in sys.modules.items() if is_reload_target(name)
+    }
+    for name in saved_modules:
+        del sys.modules[name]
     from run_agent import AIAgent
 
     agent = AIAgent(
@@ -153,12 +167,23 @@ def agent_env():
     try:
         yield agent, _MockHandler
     finally:
+        agent.close()
+        fresh_logging = sys.modules.get("hermes_logging")
+        reset_logging = getattr(fresh_logging, "_reset_queued_handlers", None)
+        if callable(reset_logging):
+            reset_logging()
         srv.shutdown()
+        srv.server_close()
+        t.join(timeout=1)
         shutil.rmtree(test_home, ignore_errors=True)
         if prev_home is None:
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = prev_home
+        for name in list(sys.modules):
+            if is_reload_target(name):
+                del sys.modules[name]
+        sys.modules.update(saved_modules)
 
 
 def _tool_results(handler) -> list[str]:
