@@ -347,6 +347,23 @@ def test_provider_effective_tool_schema_digest_preserves_transmitted_order():
     ]) != process_integration.exact_tool_schema_digest([second, first])
 
 
+def test_brokered_workspace_resolves_relative_to_pinned_worker_root(tmp_path):
+    child = tmp_path / "child"
+    child.mkdir()
+    profile = SimpleNamespace(
+        workspace_root=str(tmp_path), execution_backend="linux_strict"
+    )
+
+    assert process_integration._require_exact_brokered_workspace(
+        {"workspace": "."}, profile
+    ) == str(tmp_path.resolve())
+    for workspace in ("..", "child"):
+        with pytest.raises(ProcessIntegrationError, match="does not match"):
+            process_integration._require_exact_brokered_workspace(
+                {"workspace": workspace}, profile
+            )
+
+
 def test_parent_binds_session_and_completion_to_provider_effective_tool_schema(
     tmp_path,
 ):
@@ -789,8 +806,9 @@ def test_nested_dispatch_records_only_digests_and_safe_public_attestation(
         claim.tool_name = "changed"
 
 
+@pytest.mark.parametrize("worker_workspace", ["/workspace", "."])
 def test_host_run_claim_binds_candidate_launch_schema_and_attestation(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, worker_workspace
 ):
     broker, old_adapter, child, _completions, digest = _fixture(tmp_path, [])
     name = "scaffolde_evo_run"
@@ -817,7 +835,7 @@ def test_host_run_claim_binds_candidate_launch_schema_and_attestation(
         dispatch,
     )
     arguments = {
-        "workspace": "/workspace",
+        "workspace": worker_workspace,
         "experiment_id": "exp_1001",
         "attempt_n": 1,
         "timeout_seconds": 30,

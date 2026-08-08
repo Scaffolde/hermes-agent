@@ -307,7 +307,10 @@ def _require_exact_brokered_workspace(
     ):
         return str(expected)
     try:
-        supplied = Path(raw_workspace).expanduser().resolve(strict=True)
+        supplied_path = Path(raw_workspace).expanduser()
+        if not supplied_path.is_absolute():
+            supplied_path = expected / supplied_path
+        supplied = supplied_path.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise ProcessIntegrationError(
             "Brokered Scaffolde workspace is unavailable."
