@@ -99,7 +99,8 @@ dependencies = [
   "psutil==7.2.2",
   # Cross-process locking for projected runtime plugins. Scaffolde's Evo
   # dispatch adapter uses this on every platform for workspace and annotation
-  # mutation lanes, so it cannot rely on the Windows-only logging dependency.
+  # mutation lanes. Keep it direct and exact so fresh lean Linux installs do
+  # not rely on optional or Windows-only transitive dependencies.
   "portalocker==3.2.0",
   # Browser CDP supervisor + browser_dialog import this directly. Keep core
   # so browser tool discovery doesn't fail on lean installs.
