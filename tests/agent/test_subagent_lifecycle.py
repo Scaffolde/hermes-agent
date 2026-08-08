@@ -586,6 +586,9 @@ def test_latched_nested_side_effects_fail_even_after_broker_quiesces(
         def __init__(self, **_kwargs):
             self.tool_execution_claims = ()
             self.side_effects_unresolved = True
+            self.unresolved_operation_label = (
+                "tool.execute:scaffolde_evo_agent_dispatch:model.complete"
+            )
 
     monkeypatch.setattr(
         "agent.subagent_lifecycle.resolve_execution_profile",
@@ -616,6 +619,9 @@ def test_latched_nested_side_effects_fail_even_after_broker_quiesces(
     assert result.tool_execution_summary == {
         "duration_seconds": 0,
         "side_effects_unresolved": True,
+        "active_operation": (
+            "tool.execute:scaffolde_evo_agent_dispatch:model.complete"
+        ),
     }
 
 

@@ -1084,6 +1084,7 @@ class ParentBrokerAdapter:
         self._claims_frozen = False
         self._claim_cleanup_failure: str | None = None
         self._side_effects_unresolved = False
+        self._unresolved_operation_label: str | None = None
         self._stop_requested: threading.Event | None = None
         self._operation_lock = threading.Lock()
         self._operation_state_lock = threading.Lock()
@@ -1123,6 +1124,11 @@ class ParentBrokerAdapter:
     def side_effects_unresolved(self) -> bool:
         with self._claim_lock:
             return self._side_effects_unresolved
+
+    @property
+    def unresolved_operation_label(self) -> str | None:
+        with self._claim_lock:
+            return self._unresolved_operation_label
 
     @property
     def active_operation_label(self) -> str | None:
@@ -1472,10 +1478,13 @@ class ParentBrokerAdapter:
                 "scaffolde_evo_run",
             }
             prior_side_effects_unresolved = False
+            prior_unresolved_operation_label: str | None = None
             if side_effecting:
                 with self._claim_lock:
                     prior_side_effects_unresolved = self._side_effects_unresolved
+                    prior_unresolved_operation_label = self._unresolved_operation_label
                     self._side_effects_unresolved = True
+                    self._unresolved_operation_label = f"tool.execute:{name}"
             try:
                 concrete_registry: ToolRegistry = registry
                 with bind_subagent_parent(self.child):
@@ -1506,12 +1515,33 @@ class ParentBrokerAdapter:
                     with self._claim_lock:
                         if result_payload.get("side_effects_unresolved") is True:
                             self._side_effects_unresolved = True
+                            completion = result_payload.get("completion")
+                            nested_operation = (
+                                completion.get("active_operation")
+                                if isinstance(completion, Mapping)
+                                else None
+                            )
+                            if (
+                                isinstance(nested_operation, str)
+                                and 1 <= len(nested_operation) <= 128
+                                and all(
+                                    character.isascii()
+                                    and (character.isalnum() or character in "._:-")
+                                    for character in nested_operation
+                                )
+                            ):
+                                label = f"tool.execute:{name}:{nested_operation}"
+                                if len(label) <= 128:
+                                    self._unresolved_operation_label = label
                         elif (
                             side_effecting
                             and result_payload.get("side_effects_unresolved") is False
                         ):
                             self._side_effects_unresolved = (
                                 prior_side_effects_unresolved
+                            )
+                            self._unresolved_operation_label = (
+                                prior_unresolved_operation_label
                             )
                     return {"result": _bounded_failed_tool_result(result_payload)}
                 expected_attestation_binding = _expected_scaffolde_attestation_binding(
@@ -1536,6 +1566,9 @@ class ParentBrokerAdapter:
                 if side_effecting:
                     with self._claim_lock:
                         self._side_effects_unresolved = prior_side_effects_unresolved
+                        self._unresolved_operation_label = (
+                            prior_unresolved_operation_label
+                        )
                 return {"result": _json_safe(response_result)}
             finally:
                 if not claim_recorded:

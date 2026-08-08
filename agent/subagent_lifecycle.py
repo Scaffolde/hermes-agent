@@ -1357,6 +1357,10 @@ class SubagentLifecycleService:
                 active_operation = _safe_operation_label(
                     result.cleanup.broker_active_operation
                 )
+                if active_operation is None:
+                    active_operation = _safe_operation_label(
+                        adapter.unresolved_operation_label
+                    )
                 if active_operation is not None:
                     raw_result["active_operation"] = active_operation
             if brokered_tool_claims:
