@@ -46,6 +46,22 @@ def test_packaging_declared_as_core_dependency():
     )
 
 
+def test_portalocker_declared_as_core_dependency():
+    """Host-projected plugins must not depend on incidental lock packages.
+
+    ``portalocker`` was present in ``uv.lock`` only through Windows and optional
+    dependency chains. A fresh lean Linux sync therefore omitted it, allowing
+    lock-using plugins to load before failing closed on their first operation.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    core = data["project"]["dependencies"]
+    names = {_distribution_name(dep) for dep in core}
+    assert "portalocker" in names, (
+        "portalocker is required by host-projected runtime plugins and must be "
+        "a declared core dependency, not an optional or platform-only transitive"
+    )
+
+
 def test_faster_whisper_is_not_a_base_dependency():
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     deps = data["project"]["dependencies"]

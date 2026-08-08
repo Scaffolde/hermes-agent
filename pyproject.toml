@@ -115,6 +115,11 @@ dependencies = [
   # imports win32security/win32file/etc. directly — declare pywin32 rather than
   # relying on the concurrent-log-handler → portalocker transitive chain.
   "pywin32>=306,<312; sys_platform == 'win32'",
+  # Host-projected plugins use cross-process locks on every platform. Keep
+  # portalocker direct: its existing lockfile entries are otherwise reachable
+  # only through platform/optional transitive dependencies, so a fresh lean
+  # Linux install can load the plugin but fail closed on its first lock.
+  "portalocker>=2.8.0,<4",
   # Image resize recovery for the vision tools. Pillow shrinks oversized images
   # (>5 MB or >8000px) at embed time; without it the byte AND pixel-dimension
   # shrink paths no-op, so an oversized image bakes into immutable history and
