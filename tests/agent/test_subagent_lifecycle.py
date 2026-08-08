@@ -547,7 +547,10 @@ def test_unquiesced_process_omits_claims_and_final_result_hash(monkeypatch, tmp_
             stdout=b"",
             stderr=b"",
             diagnostic="broker operation did not quiesce",
-            cleanup=CleanupEvidence(broker_quiesced=False),
+            cleanup=CleanupEvidence(
+                broker_quiesced=False,
+                broker_active_operation="model.complete",
+            ),
         ),
     )
 
@@ -559,6 +562,7 @@ def test_unquiesced_process_omits_claims_and_final_result_hash(monkeypatch, tmp_
     assert result.tool_execution_summary == {
         "duration_seconds": 0,
         "side_effects_unresolved": True,
+        "active_operation": "model.complete",
     }
 
 

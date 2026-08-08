@@ -292,6 +292,38 @@ def test_parent_cancel_reports_quiesced_when_no_operation_is_admitted(tmp_path):
     assert adapter._cancellation_event.is_set()
 
 
+@pytest.mark.parametrize(
+    ("operation", "body", "expected"),
+    [
+        ("model.complete", {"messages": []}, "model.complete"),
+        (
+            "tool.execute",
+            {
+                "id": "call-1",
+                "name": "scaffolde_evo_agent_dispatch",
+                "arguments": {},
+            },
+            "tool.execute:scaffolde_evo_agent_dispatch",
+        ),
+    ],
+)
+def test_parent_labels_only_the_current_admitted_operation(
+    tmp_path, monkeypatch, operation, body, expected
+):
+    _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+
+    def inspect_dispatch(actual_operation, actual_body):
+        assert actual_operation == operation
+        assert actual_body == body
+        assert adapter.active_operation_label == expected
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter, "_dispatch", inspect_dispatch)
+
+    assert adapter._dispatch_admitted(operation, body) == {"ok": True}
+    assert adapter.active_operation_label is None
+
+
 def test_parent_rejects_provider_schema_not_bound_to_launch_receipt(tmp_path):
     broker, old_adapter, child, _completions, _digest = _fixture(tmp_path, [])
 

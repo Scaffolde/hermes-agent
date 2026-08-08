@@ -58,6 +58,19 @@ _MAX_RESULT_CHARS = 32_000
 _TERMINAL_RETENTION_SECONDS = 3_600
 
 
+def _safe_operation_label(value: Any) -> str | None:
+    if (
+        isinstance(value, str)
+        and 0 < len(value) <= 128
+        and all(
+            character.isascii() and (character.isalnum() or character in "._:-")
+            for character in value
+        )
+    ):
+        return value
+    return None
+
+
 class SubagentLifecycleError(ValueError):
     """A request cannot be safely accepted by the public lifecycle API."""
 
@@ -1038,6 +1051,9 @@ class SubagentLifecycleService:
             )
             if side_effects_unresolved:
                 tool_execution_summary["side_effects_unresolved"] = True
+                active_operation = _safe_operation_label(raw.get("active_operation"))
+                if active_operation is not None:
+                    tool_execution_summary["active_operation"] = active_operation
             result = SubagentResult(
                 record.handle,
                 state,
@@ -1338,6 +1354,11 @@ class SubagentLifecycleService:
             }
             if side_effects_unresolved:
                 raw_result["side_effects_unresolved"] = True
+                active_operation = _safe_operation_label(
+                    result.cleanup.broker_active_operation
+                )
+                if active_operation is not None:
+                    raw_result["active_operation"] = active_operation
             if brokered_tool_claims:
                 raw_result["brokered_tool_claims"] = brokered_tool_claims
             return raw_result

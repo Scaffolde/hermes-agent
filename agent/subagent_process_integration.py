@@ -1086,6 +1086,8 @@ class ParentBrokerAdapter:
         self._side_effects_unresolved = False
         self._stop_requested: threading.Event | None = None
         self._operation_lock = threading.Lock()
+        self._operation_state_lock = threading.Lock()
+        self._active_operation_label: str | None = None
         if set(self._brokered_dispatch_entries) != set(self.brokered_tool_names):
             raise ProcessIntegrationError("host-brokered frozen handler is unavailable")
 
@@ -1121,6 +1123,28 @@ class ParentBrokerAdapter:
     def side_effects_unresolved(self) -> bool:
         with self._claim_lock:
             return self._side_effects_unresolved
+
+    @property
+    def active_operation_label(self) -> str | None:
+        with self._operation_state_lock:
+            return self._active_operation_label
+
+    def _dispatch_admitted(
+        self, operation: str, body: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        label = operation
+        if operation == "tool.execute":
+            name = body.get("name")
+            if isinstance(name, str) and name in self.brokered_tool_names:
+                label = f"{operation}:{name}"
+        with self._operation_lock:
+            with self._operation_state_lock:
+                self._active_operation_label = label
+            try:
+                return self._dispatch(operation, body)
+            finally:
+                with self._operation_state_lock:
+                    self._active_operation_label = None
 
     def _freeze_claim_accounting(self, failure: str | None = None) -> None:
         with self._claim_lock:
@@ -1240,8 +1264,7 @@ class ParentBrokerAdapter:
             try:
                 request = self.broker.validate(envelope)
                 sequence = request.sequence
-                with self._operation_lock:
-                    body = self._dispatch(request.operation, request.body)
+                body = self._dispatch_admitted(request.operation, request.body)
                 response = {"sequence": sequence, "ok": True, "body": body}
             except Exception as exc:
                 if sequence is None:

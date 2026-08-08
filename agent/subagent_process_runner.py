@@ -117,6 +117,7 @@ class CleanupEvidence:
     cgroup_empty: bool | None = None
     cgroup_removed: bool | None = None
     broker_quiesced: bool | None = None
+    broker_active_operation: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -974,10 +975,12 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
     broker_errors: list[str] = []
     broker_thread: threading.Thread | None = None
     broker_quiesced = False
+    broker_active_operation: str | None = None
     broker_finalization_attempted = False
 
     def quiesce_broker() -> None:
-        nonlocal broker_thread, broker_quiesced, broker_finalization_attempted
+        nonlocal broker_thread, broker_quiesced, broker_active_operation
+        nonlocal broker_finalization_attempted
         if broker_finalization_attempted:
             return
         broker_finalization_attempted = True
@@ -1027,8 +1030,28 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                     )
                 elif cancel_result == [False]:
                     quiesced = False
+                    active_operation = None
+                    try:
+                        candidate = getattr(spec.broker, "active_operation_label", None)
+                    except Exception:
+                        candidate = None
+                    if (
+                        isinstance(candidate, str)
+                        and 0 < len(candidate) <= 128
+                        and all(
+                            character.isascii()
+                            and (character.isalnum() or character in "._:-")
+                            for character in candidate
+                        )
+                    ):
+                        active_operation = candidate
+                        broker_active_operation = candidate
+                    operation_detail = (
+                        f" {active_operation}" if active_operation is not None else ""
+                    )
                     broker_errors.append(
-                        "broker revocation deadline expired before admitted operation quiesced"
+                        "broker revocation deadline expired before admitted operation"
+                        f"{operation_detail} quiesced"
                     )
             # Host-brokered operations may have side effects. Never finalize a
             # lifecycle result until every accepted operation has either
@@ -1135,7 +1158,11 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                 cgroup_removed=cgroup_evidence.cgroup_removed,
             )
         quiesce_broker()
-        cleanup = dataclasses.replace(cleanup, broker_quiesced=broker_quiesced)
+        cleanup = dataclasses.replace(
+            cleanup,
+            broker_quiesced=broker_quiesced,
+            broker_active_operation=broker_active_operation,
+        )
 
         returncode = process.returncode
         state, diagnostic = _classify_terminal_state(
@@ -1181,7 +1208,11 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                 cgroup_removed=cgroup_evidence.cgroup_removed,
             )
         quiesce_broker()
-        cleanup = dataclasses.replace(cleanup, broker_quiesced=broker_quiesced)
+        cleanup = dataclasses.replace(
+            cleanup,
+            broker_quiesced=broker_quiesced,
+            broker_active_operation=broker_active_operation,
+        )
         state = "CONTAINMENT_FAILED" if spec.backend == "linux-strict" else "FAILED"
         return _terminal_result(
             spec=spec,
@@ -1202,7 +1233,11 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                 kill_grace_seconds=spec.kill_grace_seconds,
             )
         quiesce_broker()
-        cleanup = dataclasses.replace(cleanup, broker_quiesced=broker_quiesced)
+        cleanup = dataclasses.replace(
+            cleanup,
+            broker_quiesced=broker_quiesced,
+            broker_active_operation=broker_active_operation,
+        )
         return ProcessRunResult(
             backend=spec.backend,
             confinement=confinement,
