@@ -395,6 +395,7 @@ def test_runner_bounds_join_when_broker_violates_synchronous_cancel_contract(tmp
     assert broker_started.is_set()
     assert elapsed < 1.5
     assert result.state == "FAILED"
+    assert result.cleanup.broker_quiesced is False
     assert "broker thread did not stop" in (result.diagnostic or "")
 
 
@@ -670,6 +671,22 @@ def test_broker_failure_supersedes_cancellation_terminal_state():
 
     assert state == "FAILED"
     assert diagnostic == "broker callback failed"
+
+
+def test_late_cancellation_cannot_relabel_observed_timeout():
+    state, diagnostic = _classify_terminal_state(
+        returncode=-signal.SIGKILL,
+        timed_out=True,
+        broker_failed=False,
+        cleanup=runner_module.CleanupEvidence(
+            root_reaped=True,
+            process_group_empty=True,
+        ),
+        cancellation_requested=True,
+    )
+
+    assert state == "TIMED_OUT"
+    assert diagnostic is None
 
 
 def test_late_cancellation_does_not_relabel_completed_process(tmp_path, monkeypatch):

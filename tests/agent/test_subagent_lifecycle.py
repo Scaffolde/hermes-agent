@@ -1,5 +1,6 @@
 """Contract tests for the public plugin subagent lifecycle API."""
 
+import copy
 import dataclasses
 import hashlib
 import json
@@ -23,6 +24,7 @@ from agent.subagent_lifecycle import (
 )
 from agent.subagent_execution_profiles import ResolvedExecutionProfile
 from agent.subagent_process_integration import BrokeredToolExecutionClaim
+from agent.subagent_tool_boundary import exact_tool_schema_digest
 
 
 class FakeChild:
@@ -59,6 +61,9 @@ class FakeChild:
 
     def close(self):
         self.closed = True
+
+    def _build_api_kwargs(self, messages, *, tools_for_api):
+        return {"messages": messages, "tools": tools_for_api}
 
 
 def _profile(**overrides):
@@ -377,7 +382,47 @@ def test_profile_launch_is_host_resolved_and_receipted(monkeypatch):
     assert result.result_hash
 
 
+def test_process_launch_receipt_pins_provider_effective_schema(monkeypatch, tmp_path):
+    child = FakeChild("provider-schema")
+    effective_tools = copy.deepcopy(child.tools)
+    effective_tools[0]["function"]["parameters"] = {
+        "type": "object",
+        "additionalProperties": False,
+    }
+    child._build_api_kwargs = lambda messages, *, tools_for_api: {
+        "messages": messages,
+        "tools": copy.deepcopy(effective_tools),
+    }
+    profile = _profile(execution_backend="portable", workspace_root=str(tmp_path))
+    from tools.registry import registry
+
+    monkeypatch.setattr(
+        registry,
+        "snapshot_dispatch_entries_with_generation",
+        lambda names, **_kwargs: (
+            child._delegate_tool_registry_generation,
+            {name: object() for name in names},
+        ),
+    )
+
+    receipt = SubagentLifecycleService._enforce_profile_contract(
+        child,
+        profile,
+        SubagentLaunchRequest(goal="review", profile_id="reviewer"),
+        None,
+        1.0,
+    )
+
+    assert receipt.tool_schema_digest == exact_tool_schema_digest(effective_tools)
+    assert (
+        json.loads(getattr(child, "_delegate_provider_effective_tools_json"))
+        == effective_tools
+    )
+
+
 def test_process_brokered_claims_propagate_and_bind_result_hash(monkeypatch, tmp_path):
+    from agent.subagent_process_runner import CleanupEvidence
+
     parent = SimpleNamespace(session_id="process-claims", enabled_toolsets=["file"])
     child = FakeChild("process-claims")
     claim = BrokeredToolExecutionClaim(
@@ -419,6 +464,7 @@ def test_process_brokered_claims_propagate_and_bind_result_hash(monkeypatch, tmp
             stdout=b'{"iterations":2,"summary":"complete"}',
             stderr=b"",
             diagnostic=None,
+            cleanup=CleanupEvidence(broker_quiesced=True),
         ),
     )
 
@@ -455,6 +501,63 @@ def test_process_brokered_claims_propagate_and_bind_result_hash(monkeypatch, tmp
         json.dumps(payload, sort_keys=True, default=str).encode()
     ).hexdigest()
     assert tampered_hash != result.result_hash
+
+
+def test_unquiesced_process_omits_claims_and_final_result_hash(monkeypatch, tmp_path):
+    from agent.subagent_process_runner import CleanupEvidence
+
+    parent = SimpleNamespace(session_id="process-unquiesced", enabled_toolsets=["file"])
+    child = FakeChild("process-unquiesced")
+    claim = BrokeredToolExecutionClaim(
+        sequence=1,
+        tool_name="scaffolde_evo_run",
+        arguments_sha256="a" * 64,
+        result_sha256="b" * 64,
+        public_attestation_json='{"status":"untrusted-late"}',
+        launch_receipt_sha256="c" * 64,
+        tool_schema_sha256="d" * 64,
+    )
+
+    def build(**_kwargs):
+        from tools.registry import registry
+
+        child._delegate_tool_registry_generation = registry.generation()
+        return child
+
+    class ClaimingAdapter:
+        def __init__(self, **_kwargs):
+            self.tool_execution_claims = (claim,)
+
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.resolve_execution_profile",
+        lambda _profile_id: _profile(
+            execution_backend="portable", workspace_root=str(tmp_path)
+        ),
+    )
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.ParentBrokerAdapter", ClaimingAdapter
+    )
+    monkeypatch.setattr(
+        "agent.subagent_process_runner.run_owned_process",
+        lambda _spec: SimpleNamespace(
+            state="FAILED",
+            stdout=b"",
+            stderr=b"",
+            diagnostic="broker operation did not quiesce",
+            cleanup=CleanupEvidence(broker_quiesced=False),
+        ),
+    )
+
+    service = SubagentLifecycleService(lambda: parent)
+    handle = service.launch(SubagentLaunchRequest(goal="review", profile_id="reviewer"))
+    assert service.wait(handle, timeout_seconds=1).state is SubagentState.FAILED
+    result = service.result(handle)
+    assert result.result_hash is None
+    assert result.tool_execution_summary == {
+        "duration_seconds": 0,
+        "side_effects_unresolved": True,
+    }
 
 
 def test_process_profile_cancel_signals_owned_runner_and_preserves_cleanup_receipt(

@@ -687,7 +687,36 @@ class SubagentLifecycleService:
             child._execution_profile = profile
             child._delegate_frozen_tool_names = frozenset(profile.expected_tool_names)
             child._delegate_frozen_dispatch_entries = dispatch_entries
-            schema_digest = tool_schema_digest(getattr(child, "tools", None))
+            if profile.execution_backend == "in_process":
+                schema_digest = tool_schema_digest(getattr(child, "tools", None))
+            else:
+                from agent.subagent_broker_protocol import canonical_json
+                from agent.subagent_tool_boundary import exact_tool_schema_digest
+
+                try:
+                    provider_kwargs = child._build_api_kwargs(
+                        [], tools_for_api=copy.deepcopy(child.tools)
+                    )
+                    provider_tools = provider_kwargs.get("tools")
+                    if not isinstance(provider_tools, list) or not all(
+                        isinstance(tool, Mapping) for tool in provider_tools
+                    ):
+                        raise TypeError("provider tools are not a list of mappings")
+                    provider_names = {
+                        tool.get("function", {}).get("name")
+                        for tool in provider_tools
+                        if isinstance(tool.get("function"), Mapping)
+                    }
+                    if provider_names != set(actual):
+                        raise ValueError("provider tool names changed")
+                    provider_tools_json = canonical_json(provider_tools)
+                    pinned_provider_tools = json.loads(provider_tools_json)
+                    schema_digest = exact_tool_schema_digest(pinned_provider_tools)
+                except Exception as exc:
+                    raise SubagentLifecycleError(
+                        "Provider-effective exact tool schema could not be pinned before launch."
+                    ) from exc
+                child._delegate_provider_effective_tools_json = provider_tools_json
         return SubagentLaunchReceipt(
             receipt_version=1,
             profile_id=profile.profile_id,
@@ -1004,6 +1033,11 @@ class SubagentLifecycleService:
                 tool_execution_summary["brokered_tool_claims"] = raw[
                     "brokered_tool_claims"
                 ]
+            side_effects_unresolved = bool(
+                isinstance(raw, dict) and raw.get("side_effects_unresolved") is True
+            )
+            if side_effects_unresolved:
+                tool_execution_summary["side_effects_unresolved"] = True
             result = SubagentResult(
                 record.handle,
                 state,
@@ -1063,12 +1097,13 @@ class SubagentLifecycleService:
         if payload.get("execution_receipt") is None:
             payload.pop("execution_receipt", None)
             payload.pop("execution_receipt_hash", None)
-        result = dataclasses.replace(
-            result,
-            result_hash=hashlib.sha256(
-                json.dumps(payload, sort_keys=True, default=str).encode()
-            ).hexdigest(),
-        )
+        if not result.tool_execution_summary.get("side_effects_unresolved"):
+            result = dataclasses.replace(
+                result,
+                result_hash=hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, default=str).encode()
+                ).hexdigest(),
+            )
         with _REGISTRY.lock:
             record.agent = None
             record.result = result
@@ -1147,6 +1182,10 @@ class SubagentLifecycleService:
                     f"root_reaped={result.cleanup.root_reaped}",
                     f"process_group_empty={result.cleanup.process_group_empty}",
                 ]
+                if result.cleanup.broker_quiesced is not None:
+                    observed_cleanup.append(
+                        f"broker_quiesced={result.cleanup.broker_quiesced}"
+                    )
                 if result.cleanup.cgroup_empty is not None:
                     observed_cleanup.append(
                         f"cgroup_empty={result.cleanup.cgroup_empty}"
@@ -1188,6 +1227,7 @@ class SubagentLifecycleService:
             child=record.agent,
             profile=profile,
             task=goal,
+            expected_tool_schema_sha256=record.receipt.tool_schema_digest,
         )
         workspace = Path(profile.workspace_root)
         backend = (
@@ -1224,8 +1264,11 @@ class SubagentLifecycleService:
         )
         result = run_owned_process(spec)
         broker.close("owned process completed")
-        brokered_tool_claims = tuple(
-            claim.to_dict() for claim in adapter.tool_execution_claims
+        side_effects_unresolved = result.cleanup.broker_quiesced is False
+        brokered_tool_claims = (
+            tuple(claim.to_dict() for claim in adapter.tool_execution_claims)
+            if not side_effects_unresolved
+            else ()
         )
         if result.state != "SUCCEEDED":
             worker_errors = [result.diagnostic] if result.diagnostic else []
@@ -1251,6 +1294,8 @@ class SubagentLifecycleService:
                 "api_calls": 0,
                 "duration_seconds": 0,
             }
+            if side_effects_unresolved:
+                raw_result["side_effects_unresolved"] = True
             if brokered_tool_claims:
                 raw_result["brokered_tool_claims"] = brokered_tool_claims
             return raw_result

@@ -755,7 +755,13 @@ class ParentBrokerAdapter:
     """Authenticate worker frames and perform only three host-owned operations."""
 
     def __init__(
-        self, *, broker: SubagentBroker, child: Any, profile: Any, task: str
+        self,
+        *,
+        broker: SubagentBroker,
+        child: Any,
+        profile: Any,
+        task: str,
+        expected_tool_schema_sha256: str | None = None,
     ) -> None:
         self.broker = broker
         self.child = child
@@ -763,8 +769,33 @@ class ParentBrokerAdapter:
         self.task = task
         self._secret = broker.reveal_secret_for_transport()
         self._launch_receipt_sha256 = broker.launch_receipt_digest
-        self._effective_tools = self._provider_effective_tools()
+        pinned_tools_json = getattr(
+            child, "_delegate_provider_effective_tools_json", None
+        )
+        if pinned_tools_json is None:
+            self._effective_tools = self._current_provider_effective_tools()
+        else:
+            try:
+                self._effective_tools = json.loads(pinned_tools_json)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ProcessIntegrationError(
+                    "pinned provider-effective tool schema is malformed"
+                ) from exc
         self._tool_schema_sha256 = exact_tool_schema_digest(self._effective_tools)
+        if (
+            expected_tool_schema_sha256 is not None
+            and self._tool_schema_sha256 != expected_tool_schema_sha256
+        ):
+            raise ProcessIntegrationError(
+                "provider-effective tool schema does not match the launch receipt"
+            )
+        if (
+            exact_tool_schema_digest(self._current_provider_effective_tools())
+            != self._tool_schema_sha256
+        ):
+            raise ProcessIntegrationError(
+                "provider-effective tool schema changed after launch receipt"
+            )
         try:
             self.local_tool_names, self.brokered_tool_names = classify_evo_tools(
                 child._delegate_frozen_dispatch_entries
@@ -781,12 +812,14 @@ class ParentBrokerAdapter:
         self._tool_execution_claims: tuple[BrokeredToolExecutionClaim, ...] = ()
         self._tool_execution_claim_bytes = 2  # Canonical JSON list brackets.
         self._pending_tool_execution_claims = 0
+        self._claims_frozen = False
+        self._claim_cleanup_failure: str | None = None
         self._stop_requested: threading.Event | None = None
         self._operation_lock = threading.Lock()
         if set(self._brokered_dispatch_entries) != set(self.brokered_tool_names):
             raise ProcessIntegrationError("host-brokered frozen handler is unavailable")
 
-    def _provider_effective_tools(self) -> list[Mapping[str, Any]]:
+    def _current_provider_effective_tools(self) -> list[Mapping[str, Any]]:
         kwargs = self.child._build_api_kwargs(
             [], tools_for_api=copy.deepcopy(self.child.tools)
         )
@@ -804,8 +837,29 @@ class ParentBrokerAdapter:
         with self._claim_lock:
             return self._tool_execution_claims
 
+    @property
+    def claims_frozen(self) -> bool:
+        with self._claim_lock:
+            return self._claims_frozen
+
+    @property
+    def claim_cleanup_failure(self) -> str | None:
+        with self._claim_lock:
+            return self._claim_cleanup_failure
+
+    def _freeze_claim_accounting(self, failure: str | None = None) -> None:
+        with self._claim_lock:
+            self._claims_frozen = True
+            self._pending_tool_execution_claims = 0
+            if failure is not None and self._claim_cleanup_failure is None:
+                self._claim_cleanup_failure = failure
+
     def _reserve_claim_capacity(self) -> None:
         with self._claim_lock:
+            if self._claims_frozen:
+                raise ProcessIntegrationError(
+                    "brokered tool claim accounting is frozen"
+                )
             if (
                 len(self._tool_execution_claims) + self._pending_tool_execution_claims
                 >= _MAX_BROKERED_TOOL_CLAIMS
@@ -827,6 +881,8 @@ class ParentBrokerAdapter:
 
     def _release_claim_capacity(self) -> None:
         with self._claim_lock:
+            if self._claims_frozen:
+                return
             if self._pending_tool_execution_claims <= 0:
                 raise ProcessIntegrationError(
                     "brokered tool claim reservation is unavailable"
@@ -842,6 +898,10 @@ class ParentBrokerAdapter:
         public_attestation_json: str,
     ) -> None:
         with self._claim_lock:
+            if self._claims_frozen:
+                raise ProcessIntegrationError(
+                    "brokered tool claim accounting is frozen"
+                )
             if self._pending_tool_execution_claims <= 0:
                 raise ProcessIntegrationError(
                     "brokered tool claim reservation is unavailable"
@@ -970,6 +1030,7 @@ class ParentBrokerAdapter:
             raise ValueError("timeout_seconds must be finite and non-negative")
         if self._stop_requested is not None:
             self._stop_requested.set()
+        self.broker.revoke("owned process broker cancellation requested")
         # The process-profile child owns its provider client. Closing that
         # transport is the cancellation path for a blocking model.complete;
         # lifecycle-aware tool handlers are cancelled by the broker stop event
@@ -992,6 +1053,11 @@ class ParentBrokerAdapter:
         operation_quiesced = self._operation_lock.acquire(timeout=timeout_seconds)
         if operation_quiesced:
             self._operation_lock.release()
+            self._freeze_claim_accounting()
+        else:
+            self._freeze_claim_accounting(
+                "accepted broker operation did not quiesce before the cleanup deadline"
+            )
         return operation_quiesced
 
     def _dispatch(self, operation: str, body: Any) -> Mapping[str, Any]:
@@ -1000,6 +1066,13 @@ class ParentBrokerAdapter:
         if operation == "session.start":
             if body:
                 raise ProcessIntegrationError("session.start body must be empty")
+            if (
+                exact_tool_schema_digest(self._current_provider_effective_tools())
+                != self._tool_schema_sha256
+            ):
+                raise ProcessIntegrationError(
+                    "provider-effective tool schema changed after launch"
+                )
             return {
                 "protocol": self.profile.protocol_text,
                 "task": self.task,
@@ -1054,7 +1127,7 @@ class ParentBrokerAdapter:
             if name not in self.brokered_tool_names:
                 raise ProcessIntegrationError("tool is not host-brokered")
             if (
-                exact_tool_schema_digest(self._provider_effective_tools())
+                exact_tool_schema_digest(self._current_provider_effective_tools())
                 != self._tool_schema_sha256
             ):
                 raise ProcessIntegrationError(
@@ -1083,7 +1156,7 @@ class ParentBrokerAdapter:
             else:
                 dispatch_args = dict(args)
             arguments_json = _canonical_bounded_json(
-                args,
+                dispatch_args,
                 field="arguments",
                 limit=_MAX_BROKERED_TOOL_ARGUMENT_BYTES,
             )

@@ -105,6 +105,7 @@ class CleanupEvidence:
     cgroup_kill_sent: bool = False
     cgroup_empty: bool | None = None
     cgroup_removed: bool | None = None
+    broker_quiesced: bool | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -629,6 +630,7 @@ def _monitor_process(
     term_attempted = False
     kill_attempted = False
     cancellation_observed = False
+    terminal_trigger: Literal["timeout", "cancellation"] | None = None
     group_id = process.pid
     drain_deadline: float | None = None
     try:
@@ -639,14 +641,26 @@ def _monitor_process(
             cancellation_requested = bool(
                 cancellation_event is not None and cancellation_event.is_set()
             )
-            if cancellation_requested and (returncode is None or group_exists):
+            if (
+                terminal_trigger is None
+                and cancellation_requested
+                and now < deadline
+                and (returncode is None or group_exists)
+            ):
+                terminal_trigger = "cancellation"
                 cancellation_observed = True
-            if cancellation_requested and group_exists and not term_attempted:
+            if returncode is None and now >= deadline and terminal_trigger is None:
+                terminal_trigger = "timeout"
+                timed_out = True
+            if (
+                terminal_trigger == "cancellation"
+                and group_exists
+                and not term_attempted
+            ):
                 term_attempted = True
                 term_sent = _signal_process_group(group_id, signal.SIGTERM)
                 term_deadline = now + term_grace_seconds
-            elif returncode is None and now >= deadline and not term_attempted:
-                timed_out = True
+            elif terminal_trigger == "timeout" and group_exists and not term_attempted:
                 term_attempted = True
                 term_sent = _signal_process_group(group_id, signal.SIGTERM)
                 term_deadline = now + term_grace_seconds
@@ -830,10 +844,10 @@ def _classify_terminal_state(
         return "FAILED", "process group was not empty"
     if broker_failed:
         return "FAILED", "broker callback failed"
-    if cancellation_requested:
-        return "CANCELLED", None
     if timed_out:
         return "TIMED_OUT", None
+    if cancellation_requested:
+        return "CANCELLED", None
     if returncode == 0 and cleanup.process_group_empty:
         return "SUCCEEDED", None
     return "FAILED", None
@@ -955,11 +969,14 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
     broker_errors: list[str] = []
     broker_thread: threading.Thread | None = None
     broker_quiesced = False
+    broker_finalization_attempted = False
 
     def quiesce_broker() -> None:
-        nonlocal broker_thread, broker_quiesced
-        if broker_quiesced:
+        nonlocal broker_thread, broker_quiesced, broker_finalization_attempted
+        if broker_finalization_attempted:
             return
+        broker_finalization_attempted = True
+        quiesced = True
         stop_requested.set()
         try:
             host_channel.shutdown(socket.SHUT_RDWR)
@@ -991,12 +1008,15 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                     timeout=max(0.0, revocation_deadline - time.monotonic())
                 )
                 if revocation_thread.is_alive():
+                    quiesced = False
                     broker_errors.append("broker revocation deadline expired")
                 elif cancel_errors:
+                    quiesced = False
                     broker_errors.append(
                         f"broker revocation failed: {type(cancel_errors[0]).__name__}"
                     )
                 elif cancel_result == [False]:
+                    quiesced = False
                     broker_errors.append(
                         "broker revocation deadline expired before admitted operation quiesced"
                     )
@@ -1006,11 +1026,13 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
             # escape terminal classification and the result hash.
             broker_thread.join(timeout=max(0.0, revocation_deadline - time.monotonic()))
             if broker_thread.is_alive():
+                quiesced = False
                 broker_errors.append(
                     "broker thread did not stop before revocation deadline"
                 )
-            broker_thread = None
-        broker_quiesced = True
+            if not broker_thread.is_alive():
+                broker_thread = None
+        broker_quiesced = quiesced
 
     try:
         process = subprocess.Popen(
@@ -1098,6 +1120,7 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                 cgroup_removed=cgroup_evidence.cgroup_removed,
             )
         quiesce_broker()
+        cleanup = dataclasses.replace(cleanup, broker_quiesced=broker_quiesced)
 
         returncode = process.returncode
         state, diagnostic = _classify_terminal_state(
@@ -1143,6 +1166,7 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                 cgroup_removed=cgroup_evidence.cgroup_removed,
             )
         quiesce_broker()
+        cleanup = dataclasses.replace(cleanup, broker_quiesced=broker_quiesced)
         state = "CONTAINMENT_FAILED" if spec.backend == "linux-strict" else "FAILED"
         return _terminal_result(
             spec=spec,
@@ -1162,6 +1186,8 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                 term_grace_seconds=spec.term_grace_seconds,
                 kill_grace_seconds=spec.kill_grace_seconds,
             )
+        quiesce_broker()
+        cleanup = dataclasses.replace(cleanup, broker_quiesced=broker_quiesced)
         return ProcessRunResult(
             backend=spec.backend,
             confinement=confinement,

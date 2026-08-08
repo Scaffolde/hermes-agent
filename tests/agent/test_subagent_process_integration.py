@@ -181,9 +181,45 @@ def test_parent_cancel_has_a_real_deadline_for_an_admitted_operation(tmp_path):
     assert time.monotonic() - started < 0.2
 
 
+def test_parent_cancel_freezes_claim_accounting_when_operation_does_not_quiesce(
+    tmp_path,
+):
+    _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    adapter._reserve_claim_capacity()
+    assert adapter._operation_lock.acquire(timeout=0.1)
+    try:
+        assert adapter.cancel(timeout_seconds=0.01) is False
+    finally:
+        adapter._operation_lock.release()
+
+    assert adapter.claims_frozen is True
+    assert "did not quiesce" in (adapter.claim_cleanup_failure or "")
+    with pytest.raises(ProcessIntegrationError, match="claim accounting is frozen"):
+        adapter._record_tool_execution_claim(
+            name="scaffolde_evo_agent_dispatch",
+            arguments_sha256="a" * 64,
+            result_sha256="b" * 64,
+            public_attestation_json="{}",
+        )
+    assert adapter.tool_execution_claims == ()
+
+
 def test_parent_cancel_reports_quiesced_when_no_operation_is_admitted(tmp_path):
     _broker, adapter, _child, _completions, _digest = _fixture(tmp_path, [])
     assert adapter.cancel(timeout_seconds=0.01) is True
+
+
+def test_parent_rejects_provider_schema_not_bound_to_launch_receipt(tmp_path):
+    broker, old_adapter, child, _completions, _digest = _fixture(tmp_path, [])
+
+    with pytest.raises(ProcessIntegrationError, match="launch receipt"):
+        ParentBrokerAdapter(
+            broker=broker,
+            child=child,
+            profile=old_adapter.profile,
+            task="schema mismatch",
+            expected_tool_schema_sha256="f" * 64,
+        )
 
 
 def test_parent_binds_session_and_completion_to_provider_effective_tool_schema(
@@ -226,6 +262,16 @@ def test_parent_binds_session_and_completion_to_provider_effective_tool_schema(
         "tool_schema_digest"
     ] == process_integration.exact_tool_schema_digest(effective_tools)
     assert completions.kwargs["tools"] == effective_tools
+
+
+def test_session_start_rejects_provider_schema_drift_after_adapter_construction(
+    tmp_path,
+):
+    _broker, adapter, child, _completions, _digest = _fixture(tmp_path, [])
+    child.tools[0]["function"]["parameters"]["additionalProperties"] = False
+
+    with pytest.raises(ProcessIntegrationError, match="schema changed after launch"):
+        adapter._dispatch("session.start", {})
 
 
 def test_worker_loop_success_uses_authenticated_broker_and_non_streaming(tmp_path):
@@ -614,6 +660,7 @@ def test_host_run_claim_binds_candidate_launch_schema_and_attestation(
     adapter = ParentBrokerAdapter(
         broker=broker, child=child, profile=old_adapter.profile, task="run attempt"
     )
+    adapter.profile.execution_backend = "linux_strict"
     result_payload = {
         "ok": True,
         "broker_attestation": _valid_run_attestation(),
@@ -632,11 +679,12 @@ def test_host_run_claim_binds_candidate_launch_schema_and_attestation(
         lambda *_args, **_kwargs: result_payload,
     )
     arguments = {
-        "workspace": str(tmp_path),
+        "workspace": "/workspace",
         "experiment_id": "exp_1001",
         "attempt_n": 1,
         "timeout_seconds": 30,
     }
+    host_effective_arguments = {**arguments, "workspace": str(tmp_path.resolve())}
 
     response = adapter._dispatch(
         "tool.execute",
@@ -647,6 +695,10 @@ def test_host_run_claim_binds_candidate_launch_schema_and_attestation(
     claim = adapter.tool_execution_claims[0]
     assert claim.sequence == 1
     assert claim.tool_name == name
+    assert (
+        claim.arguments_sha256
+        == hashlib.sha256(canonical_json(host_effective_arguments).encode()).hexdigest()
+    )
     assert claim.launch_receipt_sha256 == digest
     assert claim.tool_schema_sha256 == process_integration.exact_tool_schema_digest(
         child.tools
