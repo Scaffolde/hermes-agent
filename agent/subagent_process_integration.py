@@ -51,6 +51,11 @@ _MAX_RESERVED_CLAIM_BYTES = 24 * 1024
 _MAX_SCOPED_READ_FILE_BYTES = 16 * 1024 * 1024
 _MAX_SCOPED_READ_OUTPUT_CHARS = 100_000
 _DEFAULT_CANCELLATION_QUIESCE_SECONDS = 0.5
+_CONTAINMENT_REASONS = frozenset({
+    "broker-operation-deadline",
+    "broker-revocation-deadline",
+    "broker-revocation-failed",
+})
 _STRICT_EVO_SYSTEM_COMMANDS = (
     "git",
     "sh",
@@ -1530,6 +1535,16 @@ class ParentBrokerAdapter:
                                 lifecycle_stage = completion.get("lifecycle_stage")
                                 if isinstance(lifecycle_stage, str):
                                     nested_operation = f"stage:{lifecycle_stage}"
+                            if nested_operation is None and isinstance(
+                                completion, Mapping
+                            ):
+                                containment_reason = completion.get(
+                                    "containment_reason"
+                                )
+                                if containment_reason in _CONTAINMENT_REASONS:
+                                    nested_operation = (
+                                        f"containment:{containment_reason}"
+                                    )
                             if (
                                 isinstance(nested_operation, str)
                                 and 1 <= len(nested_operation) <= 128

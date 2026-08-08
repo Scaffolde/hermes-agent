@@ -981,7 +981,19 @@ def test_host_run_claim_rejects_unbound_exact_producer_payload(
         )
 
 
-def test_host_run_failure_latches_unresolved_side_effects(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("completion", "expected_suffix"),
+    [
+        ({"lifecycle_stage": "owned-process-runner"}, "stage:owned-process-runner"),
+        (
+            {"containment_reason": "broker-revocation-failed"},
+            "containment:broker-revocation-failed",
+        ),
+    ],
+)
+def test_host_run_failure_latches_unresolved_side_effects(
+    tmp_path, monkeypatch, completion, expected_suffix
+):
     broker, old_adapter, child, _completions, _digest = _fixture(tmp_path, [])
     name = "scaffolde_evo_run"
     child.tools = [{"type": "function", "function": {"name": name}}]
@@ -997,7 +1009,7 @@ def test_host_run_failure_latches_unresolved_side_effects(tmp_path, monkeypatch)
             "error_code": "evo_run_side_effects_unresolved",
             "error": "nested containment failed",
             "side_effects_unresolved": True,
-            "completion": {"lifecycle_stage": "owned-process-runner"},
+            "completion": completion,
         },
     )
 
@@ -1019,7 +1031,7 @@ def test_host_run_failure_latches_unresolved_side_effects(tmp_path, monkeypatch)
     assert adapter.side_effects_unresolved is True
     assert (
         adapter.unresolved_operation_label
-        == "tool.execute:scaffolde_evo_run:stage:owned-process-runner"
+        == f"tool.execute:scaffolde_evo_run:{expected_suffix}"
     )
     assert adapter.tool_execution_claims == ()
 
