@@ -1377,11 +1377,11 @@ class SubagentLifecycleService:
             if side_effects_unresolved:
                 raw_result["side_effects_unresolved"] = True
                 active_operation = _safe_operation_label(
-                    result.cleanup.broker_active_operation
+                    getattr(adapter, "unresolved_operation_label", None)
                 )
                 if active_operation is None:
                     active_operation = _safe_operation_label(
-                        adapter.unresolved_operation_label
+                        result.cleanup.broker_active_operation
                     )
                 if active_operation is not None:
                     raw_result["active_operation"] = active_operation
