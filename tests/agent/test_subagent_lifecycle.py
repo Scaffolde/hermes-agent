@@ -2,6 +2,7 @@
 
 import dataclasses
 import hashlib
+import json
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -21,6 +22,7 @@ from agent.subagent_lifecycle import (
     get_active_subagent_parent,
 )
 from agent.subagent_execution_profiles import ResolvedExecutionProfile
+from agent.subagent_process_integration import BrokeredToolExecutionClaim
 
 
 class FakeChild:
@@ -371,7 +373,158 @@ def test_profile_launch_is_host_resolved_and_receipted(monkeypatch):
     publish_context_start.assert_called_once_with()
     result = service.result(handle)
     assert result.launch_receipt == receipt
+    assert result.tool_execution_summary == {"duration_seconds": 0}
     assert result.result_hash
+
+
+def test_process_brokered_claims_propagate_and_bind_result_hash(monkeypatch, tmp_path):
+    parent = SimpleNamespace(session_id="process-claims", enabled_toolsets=["file"])
+    child = FakeChild("process-claims")
+    claim = BrokeredToolExecutionClaim(
+        tool_name="scaffolde_evo_agent_dispatch",
+        arguments_sha256=hashlib.sha256(b'{"agent":"reviewer"}').hexdigest(),
+        result_sha256=hashlib.sha256(
+            b'{"broker_attestation":{"status":"verified"},"summary":"private"}'
+        ).hexdigest(),
+        public_attestation_json='{"status":"verified"}',
+    )
+
+    def build(**_kwargs):
+        from tools.registry import registry
+
+        child._delegate_tool_registry_generation = registry.generation()
+        return child
+
+    class ClaimingAdapter:
+        def __init__(self, **_kwargs):
+            self.tool_execution_claims = (claim,)
+
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.resolve_execution_profile",
+        lambda _profile_id: _profile(
+            execution_backend="portable", workspace_root=str(tmp_path)
+        ),
+    )
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.ParentBrokerAdapter", ClaimingAdapter
+    )
+    monkeypatch.setattr(
+        "agent.subagent_process_runner.run_owned_process",
+        lambda _spec: SimpleNamespace(
+            state="SUCCEEDED",
+            stdout=b'{"iterations":2,"summary":"complete"}',
+            stderr=b"",
+            diagnostic=None,
+        ),
+    )
+
+    service = SubagentLifecycleService(lambda: parent)
+    handle = service.launch(SubagentLaunchRequest(goal="review", profile_id="reviewer"))
+    assert service.wait(handle, timeout_seconds=1).state is SubagentState.SUCCEEDED
+    result = service.result(handle)
+    assert result.tool_execution_summary == {
+        "duration_seconds": 0,
+        "brokered_tool_claims": (claim.to_dict(),),
+    }
+    with pytest.raises(TypeError):
+        result.tool_execution_summary["brokered_tool_claims"][0][
+            "public_attestation_json"
+        ] = '{"status":"tampered"}'
+    serialized_result = json.dumps(dataclasses.asdict(result), sort_keys=True)
+    assert "arguments_json" not in serialized_result
+    assert "result_json" not in serialized_result
+    assert "private" not in serialized_result
+
+    payload = dataclasses.asdict(result)
+    payload.pop("result_hash")
+    payload.pop("execution_receipt")
+    payload.pop("execution_receipt_hash")
+    expected_hash = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    assert result.result_hash == expected_hash
+
+    payload["tool_execution_summary"]["brokered_tool_claims"][0][
+        "public_attestation_json"
+    ] = '{"status":"tampered"}'
+    tampered_hash = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    assert tampered_hash != result.result_hash
+
+
+def test_process_profile_cancel_signals_owned_runner_and_preserves_cleanup_receipt(
+    monkeypatch, tmp_path
+):
+    from agent.subagent_process_runner import CleanupEvidence, ProcessRunResult
+
+    parent = SimpleNamespace(session_id="process-cancel", enabled_toolsets=["file"])
+    child = FakeChild("process-cancel")
+    runner_started = threading.Event()
+
+    def build(**_kwargs):
+        from tools.registry import registry
+
+        child._delegate_tool_registry_generation = registry.generation()
+        return child
+
+    class Adapter:
+        def __init__(self, **_kwargs):
+            self.tool_execution_claims = ()
+
+    def run(spec):
+        runner_started.set()
+        assert spec.cancellation_event.wait(timeout=1)
+        result = ProcessRunResult(
+            backend="portable",
+            confinement="portable-process-unconfined",
+            state="CANCELLED",
+            root_pid=4321,
+            returncode=-15,
+            exit_code=None,
+            signal=15,
+            timed_out=False,
+            stdout=b"",
+            stderr=b"",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            cleanup=CleanupEvidence(
+                term_sent=True,
+                root_reaped=True,
+                process_group_empty=True,
+            ),
+        )
+        spec.receipt.on_started(root_pid=result.root_pid)
+        spec.receipt.on_terminal(state=result.state, result=result)
+        return result
+
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.resolve_execution_profile",
+        lambda _profile_id: _profile(
+            execution_backend="portable", workspace_root=str(tmp_path)
+        ),
+    )
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.ParentBrokerAdapter", Adapter
+    )
+    monkeypatch.setattr("agent.subagent_process_runner.run_owned_process", run)
+
+    service = SubagentLifecycleService(lambda: parent)
+    handle = service.launch(SubagentLaunchRequest(goal="review", profile_id="reviewer"))
+    assert runner_started.wait(timeout=1)
+
+    assert service.cancel(handle, reason="stop process profile").accepted is True
+    assert service.wait(handle, timeout_seconds=1).state is SubagentState.CANCELLED
+    result = service.result(handle)
+    assert result.terminal_state is SubagentState.CANCELLED
+    assert result.execution_receipt is not None
+    assert result.execution_receipt.state.value == "CANCELLED"
+    assert result.execution_receipt.observed_cleanup == (
+        "root_reaped=True",
+        "process_group_empty=True",
+    )
 
 
 def test_profile_blocked_tools_are_removed_before_exact_freeze(monkeypatch):

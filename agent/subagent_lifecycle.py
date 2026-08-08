@@ -8,6 +8,7 @@ sessions; plugins must obtain it from ``PluginContext.subagent_lifecycle``.
 from __future__ import annotations
 
 import contextvars
+import copy
 import dataclasses
 import enum
 import hashlib
@@ -21,6 +22,7 @@ import time
 from contextlib import contextmanager
 from concurrent.futures import Future, TimeoutError
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
 
 from agent.interrupt_compat import request_hard_interrupt
@@ -168,6 +170,48 @@ class SubagentResult:
     execution_receipt_hash: Optional[str] = None
 
 
+class _ImmutableResultMapping(Mapping[str, Any]):
+    __slots__ = ("_data",)
+
+    def __init__(self, values: Mapping[str, Any]) -> None:
+        self._data = MappingProxyType(dict(values))
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, Any]:
+        return copy.deepcopy(dict(self._data), memo)
+
+
+def _freeze_result_tree(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return _ImmutableResultMapping({
+            str(key): _freeze_result_tree(item) for key, item in value.items()
+        })
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_result_tree(item) for item in value)
+    return value
+
+
+def _plain_result_tree(value: Any) -> Any:
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _plain_result_tree(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+        }
+    if isinstance(value, Mapping):
+        return {str(key): _plain_result_tree(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_result_tree(item) for item in value]
+    return value
+
+
 @dataclasses.dataclass(frozen=True)
 class SubagentReconnectResult:
     connected: bool
@@ -191,6 +235,9 @@ class _Record:
     timeout_override: Optional[float] = None
     start_gate: Optional[threading.Event] = None
     launch_committed: bool = True
+    cancellation_event: threading.Event = dataclasses.field(
+        default_factory=threading.Event
+    )
 
 
 class _Registry:
@@ -728,12 +775,48 @@ class SubagentLifecycleService:
             )
         future = record.future
         if future is not None:
-            try:
-                future.result(timeout=timeout_seconds)
-            except TimeoutError:
-                return SubagentTerminalState(record.handle, record.state, False, True)
-            except Exception:
-                pass
+            active_parent = get_active_subagent_parent()
+            broker_stop = getattr(
+                active_parent, "_owned_process_broker_stop_requested", None
+            )
+            deadline = (
+                time.monotonic() + timeout_seconds
+                if timeout_seconds is not None
+                else None
+            )
+            broker_cancelled = False
+            while True:
+                if (
+                    not broker_cancelled
+                    and broker_stop is not None
+                    and broker_stop.is_set()
+                ):
+                    self.cancel(handle, reason="Parent broker operation cancelled")
+                    broker_cancelled = True
+                remaining = (
+                    None if deadline is None else max(0.0, deadline - time.monotonic())
+                )
+                if remaining == 0.0:
+                    return SubagentTerminalState(
+                        record.handle, record.state, False, True
+                    )
+                wait_for = (
+                    min(0.05, remaining)
+                    if remaining is not None
+                    else (0.05 if broker_stop is not None else None)
+                )
+                try:
+                    future.result(timeout=wait_for)
+                    break
+                except TimeoutError:
+                    if deadline is None:
+                        continue
+                    if time.monotonic() >= deadline:
+                        return SubagentTerminalState(
+                            record.handle, record.state, False, True
+                        )
+                except Exception:
+                    break
         with _REGISTRY.lock:
             return SubagentTerminalState(
                 record.handle, record.state, record.result is not None
@@ -749,6 +832,12 @@ class SubagentLifecycleService:
                     False, already_terminal=True, state=record.state
                 )
             agent = record.agent
+            process_profile = (
+                record.execution_profile is not None
+                and record.execution_profile.execution_backend != "in_process"
+            )
+            if process_profile:
+                record.cancellation_event.set()
             record.state = SubagentState.CANCEL_REQUESTED
             record.updated_at = time.time()
         if agent is None:
@@ -760,10 +849,12 @@ class SubagentLifecycleService:
                 agent, f"Lifecycle cancellation requested: {reason[:500]}"
             )
         except Exception:
+            if process_profile:
+                return SubagentCancelResult(True, state=SubagentState.CANCEL_REQUESTED)
             return SubagentCancelResult(
                 False, unsupported=True, state=SubagentState.CANCEL_REQUESTED
             )
-        if not accepted:
+        if not accepted and not process_profile:
             return SubagentCancelResult(
                 False, unsupported=True, state=SubagentState.CANCEL_REQUESTED
             )
@@ -899,6 +990,20 @@ class SubagentLifecycleService:
             summary = raw.get("summary") if isinstance(raw, dict) else None
             summary = str(summary)[:_MAX_RESULT_CHARS] if summary is not None else None
             error = raw.get("error") if isinstance(raw, dict) else None
+            tool_execution_summary = (
+                {"duration_seconds": raw.get("duration_seconds", 0)}
+                if isinstance(raw, dict)
+                else {}
+            )
+            if (
+                profile is not None
+                and profile.execution_backend != "in_process"
+                and isinstance(raw, dict)
+                and raw.get("brokered_tool_claims")
+            ):
+                tool_execution_summary["brokered_tool_claims"] = raw[
+                    "brokered_tool_claims"
+                ]
             result = SubagentResult(
                 record.handle,
                 state,
@@ -913,11 +1018,7 @@ class SubagentLifecycleService:
                 usage_metadata={"api_calls": raw.get("api_calls", 0)}
                 if isinstance(raw, dict)
                 else {},
-                tool_execution_summary={
-                    "duration_seconds": raw.get("duration_seconds", 0)
-                }
-                if isinstance(raw, dict)
-                else {},
+                tool_execution_summary=tool_execution_summary,
                 launch_receipt=receipt_payload,
                 execution_receipt=record.execution_receipt,
                 execution_receipt_hash=(
@@ -927,6 +1028,10 @@ class SubagentLifecycleService:
                 ),
             )
         except Exception as exc:
+            tool_execution_summary = {}
+            brokered_tool_claims = getattr(exc, "_brokered_tool_claims", ())
+            if brokered_tool_claims:
+                tool_execution_summary["brokered_tool_claims"] = brokered_tool_claims
             result = SubagentResult(
                 record.handle,
                 SubagentState.FAILED,
@@ -935,6 +1040,7 @@ class SubagentLifecycleService:
                 completed_at=time.time(),
                 error_classification=type(exc).__name__,
                 error_message=str(exc)[:_MAX_RESULT_CHARS],
+                tool_execution_summary=tool_execution_summary,
                 launch_receipt=receipt_payload,
                 execution_receipt=record.execution_receipt,
                 execution_receipt_hash=(
@@ -943,7 +1049,12 @@ class SubagentLifecycleService:
                     else None
                 ),
             )
-        payload = dataclasses.asdict(result)
+        result = dataclasses.replace(
+            result,
+            usage_metadata=_freeze_result_tree(result.usage_metadata),
+            tool_execution_summary=_freeze_result_tree(result.tool_execution_summary),
+        )
+        payload = _plain_result_tree(result)
         payload.pop("result_hash", None)
         if payload.get("launch_receipt") is None:
             # Legacy launches keep their pre-profile hash input byte-for-byte;
@@ -1098,6 +1209,7 @@ class SubagentLifecycleService:
             launch_receipt_digest=digest,
             backend=backend,
             timeout_seconds=profile.timeout_seconds or 300.0,
+            cancellation_event=record.cancellation_event,
             broker=adapter,
             receipt=ReceiptAdapter(),
             runtime_mounts=runtime_mounts,
@@ -1112,6 +1224,9 @@ class SubagentLifecycleService:
         )
         result = run_owned_process(spec)
         broker.close("owned process completed")
+        brokered_tool_claims = tuple(
+            claim.to_dict() for claim in adapter.tool_execution_claims
+        )
         if result.state != "SUCCEEDED":
             worker_errors = [result.diagnostic] if result.diagnostic else []
             if result.stderr:
@@ -1130,29 +1245,39 @@ class SubagentLifecycleService:
                     worker_errors.append(
                         f"worker stderr: {' '.join(diagnostic.split())[:1000]}"
                     )
-            return {
-                "status": "error",
+            raw_result: dict[str, Any] = {
+                "status": ("interrupted" if result.state == "CANCELLED" else "error"),
                 "error": "; ".join(worker_errors) or result.state,
                 "api_calls": 0,
                 "duration_seconds": 0,
             }
+            if brokered_tool_claims:
+                raw_result["brokered_tool_claims"] = brokered_tool_claims
+            return raw_result
         try:
             payload = json.loads(result.stdout)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise SubagentLifecycleError(
-                "worker returned malformed bounded JSON"
-            ) from exc
+            error = SubagentLifecycleError("worker returned malformed bounded JSON")
+            if brokered_tool_claims:
+                error._brokered_tool_claims = brokered_tool_claims
+            raise error from exc
         if not isinstance(payload, Mapping) or set(payload) != {
             "summary",
             "iterations",
         }:
-            raise SubagentLifecycleError("worker result has an invalid shape")
-        return {
+            error = SubagentLifecycleError("worker result has an invalid shape")
+            if brokered_tool_claims:
+                error._brokered_tool_claims = brokered_tool_claims
+            raise error
+        raw_result = {
             "status": "completed",
             "summary": payload["summary"],
             "api_calls": payload["iterations"],
             "duration_seconds": 0,
         }
+        if brokered_tool_claims:
+            raw_result["brokered_tool_claims"] = brokered_tool_claims
+        return raw_result
 
     @staticmethod
     def _capability(

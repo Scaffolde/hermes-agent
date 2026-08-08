@@ -5,6 +5,7 @@ import os
 import signal
 import socket
 import sys
+import threading
 from pathlib import Path
 from typing import Any, cast
 
@@ -191,6 +192,50 @@ def test_deadline_reaps_owned_descendant_process_group(tmp_path):
     assert result.cleanup.process_group_empty is True
 
 
+@pytest.mark.live_system_guard_bypass
+def test_explicit_cancellation_terminates_and_reaps_process_group(tmp_path):
+    cancellation_requested = threading.Event()
+    started = threading.Event()
+    results = []
+
+    class Receipt:
+        def on_created(self, **_kwargs):
+            pass
+
+        def on_started(self, **_kwargs):
+            started.set()
+
+        def on_terminal(self, *, state, result):
+            assert state == "CANCELLED"
+            assert result.cleanup.root_reaped is True
+            assert result.cleanup.process_group_empty is True
+
+    thread = threading.Thread(
+        target=lambda: results.append(
+            run_owned_process(
+                _portable_spec(
+                    tmp_path,
+                    "-c",
+                    "import time; time.sleep(30)",
+                    cancellation_event=cancellation_requested,
+                    receipt=Receipt(),
+                )
+            )
+        )
+    )
+    thread.start()
+    assert started.wait(timeout=1)
+
+    cancellation_requested.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert len(results) == 1
+    assert results[0].state == "CANCELLED"
+    assert results[0].timed_out is False
+    assert results[0].cleanup.term_sent is True
+
+
 def test_monitor_is_bounded_even_when_group_signals_fail(monkeypatch):
     class FakeProcess:
         pid = 91919
@@ -240,6 +285,9 @@ def test_runner_bootstraps_secret_over_fd_and_broker_uses_authenticated_frames(
             send_authenticated_frame(channel, {"operation": "ping"}, SECRET)
             observed.append(read_authenticated_frame(channel, SECRET))
 
+        def cancel(self):
+            pass
+
     result = run_owned_process(
         _portable_spec(
             tmp_path,
@@ -252,6 +300,123 @@ def test_runner_bootstraps_secret_over_fd_and_broker_uses_authenticated_frames(
     assert result.state == "SUCCEEDED"
     assert observed[0] == result.root_pid
     assert observed[1] == {"ok": True, "operation": "pong"}
+
+
+def test_runner_cancels_inflight_broker_operation_before_terminalizing(tmp_path):
+    broker_started = threading.Event()
+    release = threading.Event()
+    cancel_called = threading.Event()
+    results = []
+
+    class Broker:
+        def serve(self, _channel: socket.socket, *, root_pid: int, stop_requested):
+            assert root_pid > 0
+            broker_started.set()
+            assert release.wait(timeout=2)
+
+        def cancel(self):
+            cancel_called.set()
+            release.set()
+
+    thread = threading.Thread(
+        target=lambda: results.append(
+            run_owned_process(_portable_spec(tmp_path, "-c", "pass", broker=Broker()))
+        )
+    )
+    thread.start()
+    assert broker_started.wait(timeout=1)
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert cancel_called.is_set()
+    assert len(results) == 1
+    assert results[0].state == "SUCCEEDED"
+
+
+def test_runner_bounds_join_when_broker_violates_synchronous_cancel_contract(tmp_path):
+    broker_started = threading.Event()
+    release = threading.Event()
+
+    class Broker:
+        def serve(self, _channel: socket.socket, *, root_pid: int, stop_requested):
+            assert root_pid > 0
+            broker_started.set()
+            release.wait(timeout=2)
+
+        def cancel(self):
+            pass
+
+    started = runner_module.time.monotonic()
+    result = run_owned_process(_portable_spec(tmp_path, "-c", "pass", broker=Broker()))
+    elapsed = runner_module.time.monotonic() - started
+    release.set()
+
+    assert broker_started.is_set()
+    assert elapsed < 1.5
+    assert result.state == "FAILED"
+    assert "broker thread did not stop" in (result.diagnostic or "")
+
+
+def test_runner_rejects_broker_without_synchronous_cancel(tmp_path):
+    class Broker:
+        def serve(self, _channel: socket.socket, *, root_pid: int, stop_requested):
+            pass
+
+    with pytest.raises(ValueError, match="synchronous cancellation"):
+        run_owned_process(_portable_spec(tmp_path, "-c", "pass", broker=Broker()))
+
+
+def test_receipt_terminal_callback_waits_for_broker_quiescence(tmp_path):
+    broker_started = threading.Event()
+    stop_seen = threading.Event()
+    release = threading.Event()
+    terminal_called = threading.Event()
+    results = []
+
+    class Broker:
+        def serve(self, _channel: socket.socket, *, root_pid: int, stop_requested):
+            assert root_pid > 0
+            broker_started.set()
+            assert stop_requested.wait(timeout=2)
+            stop_seen.set()
+            assert release.wait(timeout=2)
+
+        def cancel(self):
+            assert release.wait(timeout=2)
+
+    class Receipt:
+        def on_created(self, **_kwargs):
+            pass
+
+        def on_started(self, **_kwargs):
+            pass
+
+        def on_terminal(self, **_kwargs):
+            terminal_called.set()
+
+    thread = threading.Thread(
+        target=lambda: results.append(
+            run_owned_process(
+                _portable_spec(
+                    tmp_path,
+                    "-c",
+                    "pass",
+                    broker=Broker(),
+                    receipt=Receipt(),
+                )
+            )
+        )
+    )
+    thread.start()
+    assert broker_started.wait(timeout=1)
+    assert stop_seen.wait(timeout=1)
+    assert not terminal_called.is_set()
+
+    release.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert terminal_called.is_set()
+    assert len(results) == 1
 
 
 def test_receipt_callback_observes_created_started_and_terminal(tmp_path):

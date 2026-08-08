@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
+import math
+import os
+import re
 import socket
+import stat
 import sys
 import threading
 from collections.abc import Mapping
@@ -13,6 +18,10 @@ from types import MappingProxyType
 from typing import Any
 
 from agent.subagent_broker_protocol import SubagentBroker, canonical_json
+from agent.subagent_execution_profiles import (
+    ExecutionProfileError,
+    resolve_execution_profile,
+)
 from agent.subagent_worker_main import (
     BrokerFrameError,
     read_authenticated_frame,
@@ -31,11 +40,526 @@ class ProcessIntegrationError(RuntimeError):
     pass
 
 
+_MAX_BROKERED_TOOL_CLAIMS = 80
+_MAX_BROKERED_TOOL_ARGUMENT_BYTES = 16 * 1024
+_MAX_BROKERED_TOOL_RESULT_BYTES = 64 * 1024
+_MAX_BROKERED_TOOL_ATTESTATION_BYTES = 8 * 1024
+_MAX_BROKERED_TOOL_CLAIM_BYTES = 128 * 1024
+_MAX_RESERVED_CLAIM_BYTES = 24 * 1024
+_MAX_SCOPED_READ_FILE_BYTES = 16 * 1024 * 1024
+_MAX_SCOPED_READ_OUTPUT_CHARS = 100_000
+_SENSITIVE_CLAIM_KEYS = frozenset({
+    "access_token",
+    "api_key",
+    "apikey",
+    "auth",
+    "authorization",
+    "bearer",
+    "capability_secret",
+    "client_secret",
+    "credential",
+    "credentials",
+    "id_token",
+    "jwt",
+    "key",
+    "password",
+    "passwd",
+    "private_key",
+    "refresh_token",
+    "secret",
+    "token",
+})
+_RAW_MODEL_MESSAGE_KEYS = frozenset({
+    "conversation_history",
+    "messages",
+    "model_messages",
+    "raw_message",
+    "raw_messages",
+    "raw_model_messages",
+})
+_MODEL_MESSAGE_ROLES = frozenset({
+    "assistant",
+    "developer",
+    "system",
+    "tool",
+    "user",
+})
+_FORBIDDEN_CLAIM_KEY_FINGERPRINTS = frozenset(
+    "".join(character for character in key if character.isalnum())
+    for key in (_SENSITIVE_CLAIM_KEYS | _RAW_MODEL_MESSAGE_KEYS)
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class BrokeredToolExecutionClaim:
+    """Bounded immutable evidence for one host-successful tool execution."""
+
+    tool_name: str
+    arguments_sha256: str
+    result_sha256: str
+    public_attestation_json: str
+
+    def to_dict(self) -> dict[str, str]:
+        return dataclasses.asdict(self)
+
+
+def _contains_forbidden_claim_shape(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        normalized_items = {
+            key.lower().replace("-", "_"): item
+            for key, item in value.items()
+            if isinstance(key, str)
+        }
+        normalized_keys = set(normalized_items)
+        key_fingerprints = {
+            "".join(character for character in key if character.isalnum())
+            for key in normalized_keys
+        }
+        if key_fingerprints & _FORBIDDEN_CLAIM_KEY_FINGERPRINTS:
+            return True
+        if (
+            "role" in normalized_keys
+            and "content" in normalized_keys
+            and str(normalized_items["role"]).lower() in _MODEL_MESSAGE_ROLES
+        ):
+            return True
+        return any(_contains_forbidden_claim_shape(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_forbidden_claim_shape(item) for item in value)
+    return False
+
+
+def _strict_json_tree(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("canonical JSON numbers must be finite")
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_strict_json_tree(item) for item in value]
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("canonical JSON mapping keys must be strings")
+        return {key: _strict_json_tree(item) for key, item in value.items()}
+    raise TypeError(f"unsupported canonical JSON type: {type(value).__name__}")
+
+
+def _canonical_bounded_json(value: Any, *, field: str, limit: int) -> str:
+    try:
+        encoded = canonical_json(_strict_json_tree(value))
+    except (TypeError, ValueError) as exc:
+        raise ProcessIntegrationError(
+            f"brokered tool {field} is not canonical JSON"
+        ) from exc
+    if len(encoded.encode("utf-8")) > limit:
+        raise ProcessIntegrationError(f"brokered tool {field} exceeds its byte bound")
+    return encoded
+
+
+def _workspace_relative_parts(raw_path: str, root: Path) -> tuple[str, ...]:
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_absolute():
+        try:
+            candidate = candidate.relative_to(root)
+        except ValueError as exc:
+            raise ProcessIntegrationError(
+                "Brokered read_file path escapes the profile workspace."
+            ) from exc
+    parts = tuple(part for part in candidate.parts if part not in {"", "."})
+    if not parts or any(part == ".." for part in parts):
+        raise ProcessIntegrationError(
+            "Brokered read_file path escapes or omits the profile workspace target."
+        )
+    return parts
+
+
+def _secure_workspace_file_bytes(raw_path: str, workspace_root: str) -> bytes:
+    """Read a regular file beneath root using no-follow component opens."""
+    if os.open not in os.supports_dir_fd or not getattr(os, "O_NOFOLLOW", 0):
+        raise ProcessIntegrationError(
+            "Secure brokered read_file is unavailable on this platform."
+        )
+    root = Path(workspace_root).expanduser().resolve(strict=True)
+    parts = _workspace_relative_parts(raw_path, root)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    nofollow_flag = getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(root, os.O_RDONLY | directory_flag | nofollow_flag)
+    try:
+        for index, part in enumerate(parts):
+            flags = os.O_RDONLY | nofollow_flag
+            if index < len(parts) - 1:
+                flags |= directory_flag
+            next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ProcessIntegrationError(
+                "Brokered read_file target is not a regular file."
+            )
+        if metadata.st_size > _MAX_SCOPED_READ_FILE_BYTES:
+            raise ProcessIntegrationError(
+                "Brokered read_file target exceeds the secure read byte bound."
+            )
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            content = stream.read(_MAX_SCOPED_READ_FILE_BYTES + 1)
+        if len(content) > _MAX_SCOPED_READ_FILE_BYTES:
+            raise ProcessIntegrationError(
+                "Brokered read_file target exceeds the secure read byte bound."
+            )
+        return content
+    except OSError as exc:
+        raise ProcessIntegrationError(
+            "Brokered read_file path escapes or is unavailable under the profile workspace."
+        ) from exc
+    finally:
+        os.close(descriptor)
+
+
+def _workspace_scoped_read_result(
+    arguments: Mapping[str, Any], workspace_root: str
+) -> str:
+    raw_path = arguments.get("path")
+    offset = arguments.get("offset", 1)
+    limit = arguments.get("limit", 2000)
+    if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+        raise ProcessIntegrationError(
+            "Brokered read_file requires a non-empty path string."
+        )
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 1:
+        raise ProcessIntegrationError(
+            "Brokered read_file offset must be a positive integer."
+        )
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or limit < 1
+        or limit > 2000
+    ):
+        raise ProcessIntegrationError(
+            "Brokered read_file limit must be an integer from 1 through 2000."
+        )
+    content = _secure_workspace_file_bytes(raw_path, workspace_root)
+    if b"\x00" in content[:1000]:
+        raise ProcessIntegrationError("Brokered read_file target is binary.")
+    try:
+        text = content.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ProcessIntegrationError(
+            "Brokered read_file target is not UTF-8 text."
+        ) from exc
+    lines = text.splitlines()
+    total_lines = len(lines)
+    page = lines[offset - 1 : offset - 1 + limit]
+    numbered = "\n".join(
+        f"{line_number}|{line}" for line_number, line in enumerate(page, start=offset)
+    )
+    if len(numbered) > _MAX_SCOPED_READ_OUTPUT_CHARS:
+        numbered = numbered[:_MAX_SCOPED_READ_OUTPUT_CHARS]
+        truncated_by_chars = True
+    else:
+        truncated_by_chars = False
+    from agent.redact import redact_sensitive_text
+
+    result: dict[str, Any] = {
+        "content": redact_sensitive_text(numbered, file_read=True),
+        "total_lines": total_lines,
+        "file_size": len(content),
+        "truncated": truncated_by_chars or total_lines > offset - 1 + len(page),
+    }
+    if result["truncated"]:
+        result["next_offset"] = offset + len(page)
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _expected_scaffolde_attestation_binding(
+    arguments: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    role = arguments.get("role")
+    profile_ids = {
+        "candidate-worker": "scaffolde-evo-candidate-v1",
+        "verifier": "scaffolde-evo-verifier-v1",
+        "benchmark-reviewer": "scaffolde-evo-benchmark-reviewer-v1",
+    }
+    profile_id = profile_ids.get(role) if isinstance(role, str) else None
+    if profile_id is None:
+        raise ProcessIntegrationError("brokered dispatch role is invalid")
+    try:
+        profile = resolve_execution_profile(profile_id)
+    except ExecutionProfileError as exc:
+        raise ProcessIntegrationError(
+            "brokered dispatch profile could not be resolved"
+        ) from exc
+
+    if role == "candidate-worker":
+        expected_request = {"parent_node": arguments.get("parent_node")}
+    elif role == "verifier":
+        expected_request = {
+            "experiment_id": arguments.get("experiment_id"),
+            "phase": arguments.get("phase"),
+            "attempt_n": arguments.get("attempt_n"),
+        }
+    else:
+        expected_request = {
+            "experiment_id": arguments.get("experiment_id"),
+            "mode": arguments.get("mode", "review-experiment"),
+            "attempt_n": arguments.get("attempt_n"),
+        }
+    if not all(value is not None for value in expected_request.values()):
+        raise ProcessIntegrationError(
+            "brokered dispatch request identity is incomplete"
+        )
+    return MappingProxyType({
+        "role": role,
+        "profile_id": profile_id,
+        "protocol_sha256": profile.protocol_sha256,
+        "request": MappingProxyType(expected_request),
+    })
+
+
+def _canonical_public_attestation_json(
+    value: Any, *, expected_binding: Mapping[str, Any]
+) -> str:
+    if not isinstance(value, Mapping):
+        raise ProcessIntegrationError(
+            "brokered tool result must contain exactly one top-level "
+            "broker_attestation mapping"
+        )
+    expected_keys = {
+        "version",
+        "role",
+        "profile_id",
+        "protocol_sha256",
+        "ok",
+        "request",
+        "completion",
+        "outcome",
+        "evidence_sha256",
+    }
+    if set(value) != expected_keys:
+        raise ProcessIntegrationError(
+            "brokered tool public attestation does not match the Scaffolde schema"
+        )
+    if isinstance(value.get("version"), bool) or value.get("version") != 1:
+        raise ProcessIntegrationError(
+            "brokered tool public attestation has an invalid version"
+        )
+    if value.get("ok") is not True:
+        raise ProcessIntegrationError(
+            "brokered tool public attestation does not attest success"
+        )
+    role = value.get("role")
+    profile_id = value.get("profile_id")
+    request = value.get("request")
+    role_contracts = {
+        "candidate-worker": (
+            "scaffolde-evo-candidate-v1",
+            {"parent_node"},
+        ),
+        "verifier": (
+            "scaffolde-evo-verifier-v1",
+            {"experiment_id", "phase", "attempt_n"},
+        ),
+        "benchmark-reviewer": (
+            "scaffolde-evo-benchmark-reviewer-v1",
+            {
+                "experiment_id",
+                "mode",
+                "attempt_n",
+            },
+        ),
+    }
+    role_contract = role_contracts.get(role) if isinstance(role, str) else None
+    if (
+        role_contract is None
+        or profile_id != role_contract[0]
+        or not isinstance(request, Mapping)
+    ):
+        raise ProcessIntegrationError(
+            "brokered tool public attestation has an invalid role, profile, or request"
+        )
+    if set(request) != role_contract[1]:
+        raise ProcessIntegrationError(
+            "brokered tool public attestation request does not match its profile"
+        )
+    if (
+        role != expected_binding["role"]
+        or profile_id != expected_binding["profile_id"]
+        or value.get("protocol_sha256") != expected_binding["protocol_sha256"]
+    ):
+        raise ProcessIntegrationError(
+            "brokered tool public attestation does not match the host binding"
+        )
+    expected_request = expected_binding["request"]
+    if any(request.get(key) != item for key, item in expected_request.items()):
+        raise ProcessIntegrationError(
+            "brokered tool public attestation does not match the dispatched request"
+        )
+    node_field = "parent_node" if "parent_node" in request else "experiment_id"
+    node_id = request.get(node_field)
+    if not isinstance(node_id, str) or not re.fullmatch(r"exp_\d{4,}", node_id):
+        raise ProcessIntegrationError(
+            "brokered tool public attestation has an invalid experiment identity"
+        )
+    if role == "verifier":
+        if request.get("phase") not in {"pre", "post"}:
+            raise ProcessIntegrationError(
+                "brokered tool public attestation has an invalid verifier phase"
+            )
+    elif role == "benchmark-reviewer":
+        if request.get("mode") != "review-experiment":
+            raise ProcessIntegrationError(
+                "brokered tool public attestation has an invalid reviewer mode"
+            )
+    if "attempt_n" in request and (
+        isinstance(request.get("attempt_n"), bool)
+        or not isinstance(request.get("attempt_n"), int)
+        or request["attempt_n"] < 1
+    ):
+        raise ProcessIntegrationError(
+            "brokered tool public attestation has an invalid attempt number"
+        )
+    outcome = value.get("outcome")
+    if role == "candidate-worker":
+        outcome_valid = (
+            isinstance(outcome, Mapping)
+            and set(outcome) == {"validated"}
+            and outcome.get("validated") is True
+        )
+    elif role == "verifier":
+        outcome_valid = (
+            isinstance(outcome, Mapping)
+            and set(outcome) == {"passed", "verdict"}
+            and isinstance(outcome.get("passed"), bool)
+            and outcome.get("verdict") in {"pass", "warn", "fail"}
+            and outcome.get("passed") is (outcome.get("verdict") != "fail")
+        )
+    else:
+        outcome_valid = (
+            isinstance(outcome, Mapping)
+            and set(outcome) == {"reviewed"}
+            and outcome.get("reviewed") is True
+        )
+    if not outcome_valid:
+        raise ProcessIntegrationError(
+            "brokered tool public attestation has an invalid role outcome"
+        )
+    for field in ("protocol_sha256", "evidence_sha256"):
+        digest = value.get(field)
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ProcessIntegrationError(
+                f"brokered tool public attestation has an invalid {field}"
+            )
+    completion = value.get("completion")
+    if not isinstance(completion, Mapping) or set(completion) != {
+        "result_hash",
+        "execution_receipt_hash",
+    }:
+        raise ProcessIntegrationError(
+            "brokered tool public attestation has an invalid completion binding"
+        )
+    for field in ("result_hash", "execution_receipt_hash"):
+        digest = completion.get(field)
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ProcessIntegrationError(
+                f"brokered tool public attestation has an invalid completion {field}"
+            )
+    encoded = _canonical_bounded_json(
+        value,
+        field="public attestation",
+        limit=_MAX_BROKERED_TOOL_ATTESTATION_BYTES,
+    )
+    if _contains_forbidden_claim_shape(value):
+        raise ProcessIntegrationError(
+            "brokered tool public attestation contains forbidden sensitive data"
+        )
+    from agent.redact import redact_sensitive_text
+
+    if (
+        redact_sensitive_text(encoded, force=True, redact_url_credentials=True)
+        != encoded
+    ):
+        raise ProcessIntegrationError(
+            "brokered tool public attestation contains forbidden sensitive data"
+        )
+    return encoded
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ProcessIntegrationError(
+                "brokered tool result contains a duplicate JSON key"
+            )
+        value[key] = item
+    return value
+
+
+def _reject_non_finite_json_constant(_value: str) -> None:
+    raise ProcessIntegrationError("brokered tool result is not canonical JSON")
+
+
+def _brokered_result_payload(result: Any) -> tuple[Mapping[str, Any], Any]:
+    if isinstance(result, str):
+        try:
+            payload = json.loads(
+                result,
+                object_pairs_hook=_reject_duplicate_json_keys,
+                parse_constant=_reject_non_finite_json_constant,
+            )
+        except json.JSONDecodeError as exc:
+            raise ProcessIntegrationError(
+                "brokered tool result is malformed JSON"
+            ) from exc
+        response_result = result
+    elif isinstance(result, Mapping):
+        payload = result
+        response_result = result
+    else:
+        raise ProcessIntegrationError(
+            "brokered tool result must be a JSON string or mapping"
+        )
+    if not isinstance(payload, Mapping):
+        raise ProcessIntegrationError(
+            "brokered tool result must contain exactly one top-level "
+            "broker_attestation mapping"
+        )
+    if payload.get("ok") is False:
+        if "broker_attestation" in payload:
+            raise ProcessIntegrationError(
+                "failed brokered tool result must not contain a broker_attestation"
+            )
+        return payload, response_result
+    attestation = payload.get("broker_attestation")
+    if "broker_attestation" not in payload or not isinstance(attestation, Mapping):
+        raise ProcessIntegrationError(
+            "brokered tool result must contain exactly one top-level "
+            "broker_attestation mapping"
+        )
+    return payload, response_result
+
+
 def _bounded_diagnostic_text(value: object, *, limit: int) -> str:
     printable = "".join(
         character if character.isprintable() else " " for character in str(value)
     )
     return " ".join(printable.split())[:limit]
+
+
+def _bounded_failed_tool_result(payload: Mapping[str, Any]) -> dict[str, Any]:
+    from agent.redact import redact_sensitive_text
+
+    error_code = _bounded_diagnostic_text(
+        payload.get("error_code") or "brokered_tool_failed", limit=80
+    )
+    error = _bounded_diagnostic_text(
+        payload.get("error") or "Brokered tool failed", limit=500
+    )
+    return {
+        "ok": False,
+        "error_code": error_code,
+        "error": redact_sensitive_text(error, force=True, redact_url_credentials=True),
+    }
 
 
 def strict_worker_runtime_mounts() -> tuple[Any, ...]:
@@ -136,8 +660,94 @@ class ParentBrokerAdapter:
                 for name in self.brokered_tool_names
             })
         )
+        self._claim_lock = threading.Lock()
+        self._tool_execution_claims: tuple[BrokeredToolExecutionClaim, ...] = ()
+        self._tool_execution_claim_bytes = 2  # Canonical JSON list brackets.
+        self._pending_tool_execution_claims = 0
+        self._stop_requested: threading.Event | None = None
+        self._operation_lock = threading.Lock()
         if set(self._brokered_dispatch_entries) != set(self.brokered_tool_names):
             raise ProcessIntegrationError("host-brokered frozen handler is unavailable")
+
+    @property
+    def tool_execution_claims(self) -> tuple[BrokeredToolExecutionClaim, ...]:
+        with self._claim_lock:
+            return self._tool_execution_claims
+
+    def _reserve_claim_capacity(self) -> None:
+        with self._claim_lock:
+            if (
+                len(self._tool_execution_claims) + self._pending_tool_execution_claims
+                >= _MAX_BROKERED_TOOL_CLAIMS
+            ):
+                raise ProcessIntegrationError(
+                    "brokered tool claim count exceeds its bound"
+                )
+            reserved_bytes = (self._pending_tool_execution_claims + 1) * (
+                _MAX_RESERVED_CLAIM_BYTES + 1
+            )
+            if (
+                self._tool_execution_claim_bytes + reserved_bytes
+                > _MAX_BROKERED_TOOL_CLAIM_BYTES
+            ):
+                raise ProcessIntegrationError(
+                    "brokered tool claims exceed their aggregate byte bound"
+                )
+            self._pending_tool_execution_claims += 1
+
+    def _release_claim_capacity(self) -> None:
+        with self._claim_lock:
+            if self._pending_tool_execution_claims <= 0:
+                raise ProcessIntegrationError(
+                    "brokered tool claim reservation is unavailable"
+                )
+            self._pending_tool_execution_claims -= 1
+
+    def _record_tool_execution_claim(
+        self,
+        *,
+        name: str,
+        arguments_sha256: str,
+        result_sha256: str,
+        public_attestation_json: str,
+    ) -> None:
+        claim = BrokeredToolExecutionClaim(
+            tool_name=name,
+            arguments_sha256=arguments_sha256,
+            result_sha256=result_sha256,
+            public_attestation_json=public_attestation_json,
+        )
+        claim_bytes = len(canonical_json(claim.to_dict()).encode("utf-8"))
+        if claim_bytes > _MAX_RESERVED_CLAIM_BYTES:
+            raise ProcessIntegrationError(
+                "brokered tool claim exceeds its reserved byte bound"
+            )
+        with self._claim_lock:
+            if self._pending_tool_execution_claims <= 0:
+                raise ProcessIntegrationError(
+                    "brokered tool claim reservation is unavailable"
+                )
+            if len(self._tool_execution_claims) >= _MAX_BROKERED_TOOL_CLAIMS:
+                raise ProcessIntegrationError(
+                    "brokered tool claim count exceeds its bound"
+                )
+            separator_bytes = 1 if self._tool_execution_claims else 0
+            remaining_reserved_bytes = (self._pending_tool_execution_claims - 1) * (
+                _MAX_RESERVED_CLAIM_BYTES + 1
+            )
+            if (
+                self._tool_execution_claim_bytes
+                + separator_bytes
+                + claim_bytes
+                + remaining_reserved_bytes
+                > _MAX_BROKERED_TOOL_CLAIM_BYTES
+            ):
+                raise ProcessIntegrationError(
+                    "brokered tool claims exceed their aggregate byte bound"
+                )
+            self._tool_execution_claims = (*self._tool_execution_claims, claim)
+            self._tool_execution_claim_bytes += separator_bytes + claim_bytes
+            self._pending_tool_execution_claims -= 1
 
     def serve(
         self,
@@ -147,6 +757,8 @@ class ParentBrokerAdapter:
         stop_requested: threading.Event,
     ) -> None:
         del root_pid
+        self._stop_requested = stop_requested
+        self.child._owned_process_broker_stop_requested = stop_requested
         while not stop_requested.is_set():
             sequence: int | None = None
             request = None
@@ -159,7 +771,8 @@ class ParentBrokerAdapter:
             try:
                 request = self.broker.validate(envelope)
                 sequence = request.sequence
-                body = self._dispatch(request.operation, request.body)
+                with self._operation_lock:
+                    body = self._dispatch(request.operation, request.body)
                 response = {"sequence": sequence, "ok": True, "body": body}
             except Exception as exc:
                 if sequence is None:
@@ -175,6 +788,16 @@ class ParentBrokerAdapter:
                             safe_parts.append(f"{key}={safe_value}")
                     if safe_parts:
                         error = f"{error}: {'; '.join(safe_parts)}"
+                elif isinstance(exc, ProcessIntegrationError):
+                    from agent.redact import redact_sensitive_text
+
+                    detail = redact_sensitive_text(
+                        _bounded_diagnostic_text(exc, limit=500),
+                        force=True,
+                        redact_url_credentials=True,
+                    )
+                    if detail:
+                        error = f"{error}: {detail}"
                 if (
                     request is not None
                     and request.operation == "model.complete"
@@ -201,6 +824,33 @@ class ParentBrokerAdapter:
                     "body": {"error": error},
                 }
             send_authenticated_frame(channel, response, self._secret)
+
+    def cancel(self) -> None:
+        """Revoke broker admission and propagate cancellation to nested work."""
+        if self._stop_requested is not None:
+            self._stop_requested.set()
+        # The process-profile child owns its provider client. Closing that
+        # transport is the cancellation path for a blocking model.complete;
+        # lifecycle-aware tool handlers are cancelled by the broker stop event
+        # observed in SubagentLifecycleService.wait().
+        try:
+            close_client = getattr(getattr(self.child, "client", None), "close", None)
+            if callable(close_client):
+                close_client()
+        except Exception:
+            pass
+        try:
+            from agent.interrupt_compat import request_hard_interrupt
+
+            request_hard_interrupt(self.child, "Owned process broker cancelled")
+        except Exception:
+            pass
+        # Do not return to the runner until an admitted operation has either
+        # persisted its claim or failed. The runner's subsequent timed join is
+        # therefore only bounding broker-thread bookkeeping, never host side
+        # effects or claim publication.
+        with self._operation_lock:
+            pass
 
     def _dispatch(self, operation: str, body: Any) -> Mapping[str, Any]:
         if not isinstance(body, Mapping):
@@ -252,16 +902,70 @@ class ParentBrokerAdapter:
                 )
             if name not in self.brokered_tool_names:
                 raise ProcessIntegrationError("tool is not host-brokered")
-            concrete_registry: ToolRegistry = registry
-            with bind_subagent_parent(self.child):
-                result = concrete_registry.dispatch_snapshot(
-                    self._brokered_dispatch_entries,
-                    name,
-                    dict(args),
-                    task_id=str(getattr(self.child, "_subagent_id", "") or "process"),
-                    session_id=getattr(self.child, "session_id", None),
-                    user_task=self.task,
-                    enabled_tools=set(self.brokered_tool_names),
+            if name == "read_file":
+                try:
+                    result = _workspace_scoped_read_result(
+                        args, self.profile.workspace_root
+                    )
+                except ProcessIntegrationError:
+                    return {
+                        "result": {
+                            "ok": False,
+                            "error_code": "workspace_path_invalid",
+                            "error": "read_file path must be available under the profile workspace",
+                        }
+                    }
+                return {"result": result}
+            arguments_json = _canonical_bounded_json(
+                args,
+                field="arguments",
+                limit=_MAX_BROKERED_TOOL_ARGUMENT_BYTES,
+            )
+            arguments_sha256 = hashlib.sha256(
+                arguments_json.encode("utf-8")
+            ).hexdigest()
+            self._reserve_claim_capacity()
+            claim_recorded = False
+            try:
+                concrete_registry: ToolRegistry = registry
+                with bind_subagent_parent(self.child):
+                    result = concrete_registry.dispatch_snapshot(
+                        self._brokered_dispatch_entries,
+                        name,
+                        dict(args),
+                        task_id=str(
+                            getattr(self.child, "_subagent_id", "") or "process"
+                        ),
+                        session_id=getattr(self.child, "session_id", None),
+                        user_task=self.task,
+                        enabled_tools=set(self.brokered_tool_names),
+                    )
+                result_payload, response_result = _brokered_result_payload(result)
+                result_json = _canonical_bounded_json(
+                    result_payload,
+                    field="result",
+                    limit=_MAX_BROKERED_TOOL_RESULT_BYTES,
                 )
-            return {"result": _json_safe(result)}
+                if result_payload.get("ok") is False:
+                    return {"result": _bounded_failed_tool_result(result_payload)}
+                expected_attestation_binding = _expected_scaffolde_attestation_binding(
+                    args
+                )
+                public_attestation_json = _canonical_public_attestation_json(
+                    result_payload["broker_attestation"],
+                    expected_binding=expected_attestation_binding,
+                )
+                self._record_tool_execution_claim(
+                    name=name,
+                    arguments_sha256=arguments_sha256,
+                    result_sha256=hashlib.sha256(
+                        result_json.encode("utf-8")
+                    ).hexdigest(),
+                    public_attestation_json=public_attestation_json,
+                )
+                claim_recorded = True
+                return {"result": _json_safe(response_result)}
+            finally:
+                if not claim_recorded:
+                    self._release_claim_capacity()
         raise ProcessIntegrationError("unsupported broker operation")

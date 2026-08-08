@@ -1,14 +1,17 @@
+import dataclasses
 import hashlib
+import json
+import os
 import socket
 import sys
 import threading
-import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from agent.subagent_broker_protocol import BrokerGrant, SubagentBroker
+import agent.subagent_process_integration as process_integration
+from agent.subagent_broker_protocol import BrokerGrant, SubagentBroker, canonical_json
 from agent.subagent_process_integration import (
     ParentBrokerAdapter,
     ProcessIntegrationError,
@@ -20,6 +23,27 @@ from agent.subagent_worker_main import (
     run_worker_loop,
 )
 from agent.subagent_process_runner import ProcessRunSpec, run_owned_process
+
+
+@pytest.fixture(autouse=True)
+def _resolved_scaffolde_profiles(monkeypatch):
+    monkeypatch.setattr(
+        process_integration,
+        "resolve_execution_profile",
+        lambda profile_id: SimpleNamespace(
+            profile_id=profile_id,
+            protocol_sha256="a" * 64,
+        ),
+    )
+
+
+def _valid_broker_arguments() -> dict[str, object]:
+    return {
+        "role": "verifier",
+        "experiment_id": "exp_1001",
+        "phase": "post",
+        "attempt_n": 1,
+    }
 
 
 def _fixture(tmp_path: Path, responses):
@@ -71,6 +95,43 @@ def _fixture(tmp_path: Path, responses):
     return broker, adapter, child, completions, launch_digest
 
 
+def _brokered_fixture(tmp_path: Path):
+    broker, old_adapter, child, completions, digest = _fixture(tmp_path, [])
+    name = "scaffolde_evo_agent_dispatch"
+    child.tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+    ]
+    child._delegate_frozen_dispatch_entries = {name: object()}
+    adapter = ParentBrokerAdapter(
+        broker=broker, child=child, profile=old_adapter.profile, task="nested task"
+    )
+    return broker, adapter, child, completions, digest
+
+
+def _valid_broker_attestation() -> dict[str, object]:
+    return {
+        "version": 1,
+        "role": "verifier",
+        "profile_id": "scaffolde-evo-verifier-v1",
+        "protocol_sha256": "a" * 64,
+        "ok": True,
+        "request": {
+            "experiment_id": "exp_1001",
+            "phase": "post",
+            "attempt_n": 1,
+        },
+        "completion": {
+            "result_hash": "b" * 64,
+            "execution_receipt_hash": "c" * 64,
+        },
+        "outcome": {"passed": True, "verdict": "pass"},
+        "evidence_sha256": "d" * 64,
+    }
+
+
 def test_worker_loop_success_uses_authenticated_broker_and_non_streaming(tmp_path):
     normalized = SimpleNamespace(
         content="finished", finish_reason="stop", reasoning=None, tool_calls=[]
@@ -110,11 +171,15 @@ def test_parent_never_dispatches_worker_local_tool(tmp_path, monkeypatch):
     )
     with pytest.raises(ProcessIntegrationError, match="not host-brokered"):
         adapter._dispatch(
-            "tool.execute", {"id": "1", "name": "read_file", "arguments": {}}
+            "tool.execute",
+            {"id": "1", "name": "terminal", "arguments": {"command": "pwd"}},
         )
 
 
 def test_worker_loop_executes_exact_tool_call_then_finishes(tmp_path, monkeypatch):
+    target = tmp_path / "notes" / "a.md"
+    target.parent.mkdir()
+    target.write_text("file contents")
     call = SimpleNamespace(
         id="call-1",
         function=SimpleNamespace(name="read_file", arguments='{"path":"notes/a.md"}'),
@@ -128,17 +193,18 @@ def test_worker_loop_executes_exact_tool_call_then_finishes(tmp_path, monkeypatc
         ),
     ]
     broker, adapter, _child, _completions, digest = _fixture(tmp_path, responses)
-    local_calls = []
     monkeypatch.setattr(
         "agent.subagent_worker_main._dispatch_local",
-        lambda snapshot, name, arguments: (
-            local_calls.append((snapshot, name, arguments, __import__("os").getpid()))
-            or "file contents"
+        lambda *_args, **_kwargs: pytest.fail(
+            "brokered reads must not execute locally"
         ),
     )
+
     monkeypatch.setattr(
         "agent.subagent_process_integration.registry.dispatch_snapshot",
-        lambda *_args, **_kwargs: pytest.fail("parent registry dispatch must not run"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "secure brokered reads must not reopen through the registry"
+        ),
     )
     host, worker = socket.socketpair()
     stop = threading.Event()
@@ -154,13 +220,77 @@ def test_worker_loop_executes_exact_tool_call_then_finishes(tmp_path, monkeypatc
         launch_receipt_digest=digest,
     )
     assert result == {"summary": "reviewed", "iterations": 2}
-    assert local_calls and local_calls[0][1] == "read_file"
-    assert local_calls[0][3] == __import__("os").getpid()
+    assert "1|file contents" in str(_completions.kwargs["messages"][-1]["content"])
+    assert adapter.tool_execution_claims == ()
     stop.set()
     worker.shutdown(socket.SHUT_RDWR)
     thread.join(timeout=1)
     worker.close()
     host.close()
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("read_file", {"path": "../outside.txt"}),
+        ("read_file", {"path": "missing.txt"}),
+    ],
+)
+def test_brokered_reads_reject_escape_and_unavailable_paths(
+    tmp_path, monkeypatch, name, arguments
+):
+    _broker, old_adapter, child, _completions, _digest = _fixture(tmp_path, [])
+    child.tools = [{"type": "function", "function": {"name": name, "parameters": {}}}]
+    child._delegate_frozen_dispatch_entries = {name: object()}
+    adapter = ParentBrokerAdapter(
+        broker=old_adapter.broker,
+        child=child,
+        profile=old_adapter.profile,
+        task=old_adapter.task,
+    )
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: pytest.fail(
+            "rejected paths must not reach the registry"
+        ),
+    )
+    assert adapter._dispatch(
+        "tool.execute", {"id": "read-1", "name": name, "arguments": arguments}
+    ) == {
+        "result": {
+            "ok": False,
+            "error_code": "workspace_path_invalid",
+            "error": "read_file path must be available under the profile workspace",
+        }
+    }
+
+
+def test_brokered_read_rejects_symlink_escape(tmp_path, monkeypatch):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("private")
+    (tmp_path / "escape").symlink_to(outside, target_is_directory=True)
+    _broker, adapter, _child, _completions, _digest = _fixture(tmp_path, [])
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: pytest.fail(
+            "symlink escapes must not reach the registry"
+        ),
+    )
+    assert adapter._dispatch(
+        "tool.execute",
+        {
+            "id": "read-1",
+            "name": "read_file",
+            "arguments": {"path": "escape/secret.txt"},
+        },
+    ) == {
+        "result": {
+            "ok": False,
+            "error_code": "workspace_path_invalid",
+            "error": "read_file path must be available under the profile workspace",
+        }
+    }
 
 
 def test_unknown_frozen_tool_never_reaches_live_registry(tmp_path, monkeypatch):
@@ -290,19 +420,19 @@ def test_real_worker_terminal_executes_below_worker_not_parent_broker(
     assert str(os.getpid()) not in str(tool_message["content"])
 
 
-def test_nested_dispatch_is_parent_brokered_from_frozen_entry(tmp_path, monkeypatch):
-    broker, old_adapter, child, _completions, _digest = _fixture(tmp_path, [])
-    name = "scaffolde_evo_agent_dispatch"
-    child.tools = [
-        {
-            "type": "function",
-            "function": {"name": name, "parameters": {"type": "object"}},
-        }
-    ]
-    child._delegate_frozen_dispatch_entries = {name: object()}
-    frozen_entry = object()
-    child._delegate_frozen_dispatch_entries = {name: frozen_entry}
+def test_nested_dispatch_records_only_digests_and_safe_public_attestation(
+    tmp_path, monkeypatch
+):
+    _broker, adapter, child, _completions, _digest = _brokered_fixture(tmp_path)
+    name = next(iter(child._delegate_frozen_dispatch_entries))
+    frozen_entry = child._delegate_frozen_dispatch_entries[name]
     observed = []
+    result_payload = {
+        "status": "completed",
+        "private_output": {"api_key": "sk-tes...alue"},
+        "broker_attestation": _valid_broker_attestation(),
+    }
+    result_text = json.dumps(result_payload, indent=2)
 
     def dispatch(snapshot, tool_name, args, **kwargs):
         from agent.subagent_lifecycle import get_active_subagent_parent
@@ -314,20 +444,445 @@ def test_nested_dispatch_is_parent_brokered_from_frozen_entry(tmp_path, monkeypa
             get_active_subagent_parent(),
             kwargs,
         ))
-        return "nested"
+        return result_text
 
     monkeypatch.setattr(
         "agent.subagent_process_integration.registry.dispatch_snapshot", dispatch
     )
-    adapter = ParentBrokerAdapter(
-        broker=broker, child=child, profile=old_adapter.profile, task="nested task"
-    )
+    arguments = {
+        **_valid_broker_arguments(),
+        "api_key": "«redacted:sk-…»",
+        "task": "private delegated task",
+    }
     assert adapter._dispatch(
         "tool.execute",
-        {"id": "nested-1", "name": name, "arguments": {"agent": "reviewer"}},
-    ) == {"result": "nested"}
+        {"id": "nested-1", "name": name, "arguments": arguments},
+    ) == {"result": result_text}
     assert dict(observed[0][0]) == {name: frozen_entry}
-    assert observed[0][1:4] == (name, {"agent": "reviewer"}, child)
+    assert observed[0][1:4] == (name, arguments, child)
+
+    claims = adapter.tool_execution_claims
+    assert len(claims) == 1
+    claim = claims[0]
+    assert claim.tool_name == name
+    assert (
+        claim.arguments_sha256
+        == hashlib.sha256(canonical_json(arguments).encode()).hexdigest()
+    )
+    assert (
+        claim.result_sha256
+        == hashlib.sha256(canonical_json(result_payload).encode()).hexdigest()
+    )
+    assert claim.public_attestation_json == canonical_json(
+        result_payload["broker_attestation"]
+    )
+    assert set(claim.to_dict()) == {
+        "tool_name",
+        "arguments_sha256",
+        "result_sha256",
+        "public_attestation_json",
+    }
+    persisted_claim = canonical_json(claim.to_dict())
+    assert "private delegated task" not in persisted_claim
+    assert "private-result-value" not in persisted_claim
+    assert not hasattr(claim, "arguments_json")
+    assert not hasattr(claim, "result_json")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        claim.tool_name = "changed"
+
+
+def test_failed_nested_dispatch_returns_bounded_error_without_claim(
+    tmp_path, monkeypatch
+):
+    name = "scaffolde_evo_agent_dispatch"
+    _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "error_code": "specialist_result_invalid",
+            "error": "specialist returned malformed output",
+            "unvalidated_execution_receipt": {"private": "must-not-cross"},
+        },
+    )
+
+    assert adapter._dispatch(
+        "tool.execute",
+        {"id": "nested-1", "name": name, "arguments": _valid_broker_arguments()},
+    ) == {
+        "result": {
+            "ok": False,
+            "error_code": "specialist_result_invalid",
+            "error": "specialist returned malformed output",
+        }
+    }
+    assert adapter.tool_execution_claims == ()
+
+
+def test_invalid_nested_arguments_reach_host_validation_without_a_claim(
+    tmp_path, monkeypatch
+):
+    name = "scaffolde_evo_agent_dispatch"
+    _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    observed = []
+
+    def reject_invalid_arguments(_snapshot, _name, arguments, **_kwargs):
+        observed.append(arguments)
+        return {
+            "ok": False,
+            "error_code": "attempt_binding_required",
+            "error": "attempt_n must be explicit",
+        }
+
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        reject_invalid_arguments,
+    )
+    arguments = {"role": "verifier", "experiment_id": "exp_1001", "phase": "post"}
+
+    assert adapter._dispatch(
+        "tool.execute",
+        {"id": "nested-1", "name": name, "arguments": arguments},
+    ) == {
+        "result": {
+            "ok": False,
+            "error_code": "attempt_binding_required",
+            "error": "attempt_n must be explicit",
+        }
+    }
+    assert observed == [arguments]
+    assert adapter.tool_execution_claims == ()
+
+
+@pytest.mark.parametrize(
+    ("result", "error"),
+    [
+        ({}, "exactly one top-level broker_attestation mapping"),
+        ('{"status":"completed"}', "exactly one top-level broker_attestation"),
+        (
+            {"broker_attestation": []},
+            "exactly one top-level broker_attestation mapping",
+        ),
+        (
+            '{"broker_attestation":{"status":"ok"},'
+            '"broker_attestation":{"status":"duplicate"}}',
+            "duplicate JSON key",
+        ),
+        ("not-json", "malformed JSON"),
+        (object(), "JSON string or mapping"),
+        (
+            {"broker_attestation": {"api_key": "not-recordable"}},
+            "does not match the Scaffolde schema",
+        ),
+        (
+            {"broker_attestation": {"clientSecret": "not-recordable"}},
+            "does not match the Scaffolde schema",
+        ),
+        (
+            {"broker_attestation": {"messages": [{"role": "user", "content": "raw"}]}},
+            "does not match the Scaffolde schema",
+        ),
+        (
+            {"broker_attestation": {"evidence": object()}},
+            "not canonical JSON",
+        ),
+        (
+            {
+                "broker_attestation": {
+                    "evidence": "opaque-live-credential-value-1234567890"
+                }
+            },
+            "does not match the Scaffolde schema",
+        ),
+    ],
+)
+def test_brokered_claim_rejects_missing_malformed_or_unsafe_attestation(
+    tmp_path, monkeypatch, result, error
+):
+    name = "scaffolde_evo_agent_dispatch"
+    _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: result,
+    )
+
+    with pytest.raises(ProcessIntegrationError, match=error):
+        adapter._dispatch(
+            "tool.execute",
+            {"id": "nested-1", "name": name, "arguments": _valid_broker_arguments()},
+        )
+    assert adapter.tool_execution_claims == ()
+
+
+def test_brokered_claim_rejects_oversized_arguments_before_execution(
+    tmp_path, monkeypatch
+):
+    name = "scaffolde_evo_agent_dispatch"
+    _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    monkeypatch.setattr(process_integration, "_MAX_BROKERED_TOOL_ARGUMENT_BYTES", 16)
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot", pytest.fail
+    )
+
+    with pytest.raises(ProcessIntegrationError, match="exceeds its byte bound"):
+        adapter._dispatch(
+            "tool.execute",
+            {"id": "nested-1", "name": name, "arguments": {"task": "x" * 32}},
+        )
+    assert adapter.tool_execution_claims == ()
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_brokered_claim_rejects_non_finite_json_numbers(tmp_path, monkeypatch, value):
+    name = "scaffolde_evo_agent_dispatch"
+    _broker, argument_adapter, _child, _completions, _digest = _brokered_fixture(
+        tmp_path
+    )
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot", pytest.fail
+    )
+
+    with pytest.raises(ProcessIntegrationError, match="not canonical JSON"):
+        argument_adapter._dispatch(
+            "tool.execute",
+            {"id": "nested-1", "name": name, "arguments": {"score": value}},
+        )
+    assert argument_adapter.tool_execution_claims == ()
+
+    _broker, result_adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: {
+            "score": value,
+            "broker_attestation": {"status": "completed"},
+        },
+    )
+
+    with pytest.raises(ProcessIntegrationError, match="not canonical JSON"):
+        result_adapter._dispatch(
+            "tool.execute",
+            {"id": "nested-1", "name": name, "arguments": _valid_broker_arguments()},
+        )
+    assert result_adapter.tool_execution_claims == ()
+
+
+def test_brokered_claim_rejects_oversized_result_and_public_attestation(
+    tmp_path, monkeypatch
+):
+    name = "scaffolde_evo_agent_dispatch"
+    result = {
+        "output": "x" * 64,
+        "broker_attestation": {"status": "completed"},
+    }
+    _broker, result_adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    monkeypatch.setattr(process_integration, "_MAX_BROKERED_TOOL_RESULT_BYTES", 32)
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: result,
+    )
+
+    with pytest.raises(ProcessIntegrationError, match="result exceeds its byte bound"):
+        result_adapter._dispatch(
+            "tool.execute",
+            {"id": "nested-1", "name": name, "arguments": _valid_broker_arguments()},
+        )
+    assert result_adapter.tool_execution_claims == ()
+
+    monkeypatch.setattr(
+        process_integration, "_MAX_BROKERED_TOOL_RESULT_BYTES", 64 * 1024
+    )
+    monkeypatch.setattr(process_integration, "_MAX_BROKERED_TOOL_ATTESTATION_BYTES", 32)
+    _broker, attestation_adapter, _child, _completions, _digest = _brokered_fixture(
+        tmp_path
+    )
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: {"broker_attestation": _valid_broker_attestation()},
+    )
+
+    with pytest.raises(
+        ProcessIntegrationError, match="public attestation exceeds its byte bound"
+    ):
+        attestation_adapter._dispatch(
+            "tool.execute",
+            {"id": "nested-1", "name": name, "arguments": _valid_broker_arguments()},
+        )
+    assert attestation_adapter.tool_execution_claims == ()
+
+
+def test_brokered_public_attestation_enforces_canonical_schema_byte_bound(
+    tmp_path, monkeypatch
+):
+    name = "scaffolde_evo_agent_dispatch"
+    body = {
+        "id": "nested-1",
+        "name": name,
+        "arguments": _valid_broker_arguments(),
+    }
+    exact_attestation = _valid_broker_attestation()
+    exact_size = len(canonical_json(exact_attestation).encode())
+    monkeypatch.setattr(
+        process_integration, "_MAX_BROKERED_TOOL_ATTESTATION_BYTES", exact_size
+    )
+    _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: {"broker_attestation": exact_attestation},
+    )
+
+    adapter._dispatch("tool.execute", body)
+    assert len(adapter.tool_execution_claims) == 1
+    assert (
+        len(adapter.tool_execution_claims[0].public_attestation_json.encode())
+        == exact_size
+    )
+
+    monkeypatch.setattr(
+        process_integration, "_MAX_BROKERED_TOOL_ATTESTATION_BYTES", exact_size - 1
+    )
+    _broker, bounded_adapter, _child, _completions, _digest = _brokered_fixture(
+        tmp_path
+    )
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: {"broker_attestation": exact_attestation},
+    )
+
+    with pytest.raises(ProcessIntegrationError, match="exceeds its byte bound"):
+        bounded_adapter._dispatch("tool.execute", body)
+    assert bounded_adapter.tool_execution_claims == ()
+
+
+def test_brokered_claims_enforce_aggregate_byte_bound(tmp_path, monkeypatch):
+    name = "scaffolde_evo_agent_dispatch"
+    _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: {
+            "summary": "bounded",
+            "broker_attestation": _valid_broker_attestation(),
+        },
+    )
+    body = {
+        "id": "nested-1",
+        "name": name,
+        "arguments": _valid_broker_arguments(),
+    }
+    adapter._dispatch("tool.execute", body)
+    first_claim = adapter.tool_execution_claims[0]
+    first_size = len(canonical_json(first_claim.to_dict()).encode())
+    monkeypatch.setattr(
+        process_integration, "_MAX_BROKERED_TOOL_CLAIM_BYTES", first_size * 2 - 1
+    )
+
+    with pytest.raises(ProcessIntegrationError, match="aggregate byte bound"):
+        adapter._dispatch("tool.execute", body)
+    assert adapter.tool_execution_claims == (first_claim,)
+
+
+def test_brokered_claim_count_reservation_is_race_safe(tmp_path, monkeypatch):
+    name = "scaffolde_evo_agent_dispatch"
+    _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    monkeypatch.setattr(process_integration, "_MAX_BROKERED_TOOL_CLAIMS", 1)
+    entered = threading.Event()
+    release = threading.Event()
+    outcomes = []
+
+    def dispatch(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(timeout=1)
+        return {"broker_attestation": _valid_broker_attestation()}
+
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot", dispatch
+    )
+    body = {
+        "id": "nested-1",
+        "name": name,
+        "arguments": _valid_broker_arguments(),
+    }
+
+    def invoke():
+        try:
+            outcomes.append(adapter._dispatch("tool.execute", body))
+        except Exception as exc:  # pragma: no cover - assertion reports below
+            outcomes.append(exc)
+
+    thread = threading.Thread(target=invoke)
+    thread.start()
+    assert entered.wait(timeout=1)
+    try:
+        with pytest.raises(ProcessIntegrationError, match="count exceeds"):
+            adapter._dispatch("tool.execute", body)
+    finally:
+        release.set()
+        thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert outcomes == [{"result": {"broker_attestation": _valid_broker_attestation()}}]
+    assert len(adapter.tool_execution_claims) == 1
+
+
+def test_brokered_claim_aggregate_bound_is_race_safe(tmp_path, monkeypatch):
+    name = "scaffolde_evo_agent_dispatch"
+    result = {"broker_attestation": _valid_broker_attestation()}
+    body = {
+        "id": "nested-1",
+        "name": name,
+        "arguments": _valid_broker_arguments(),
+    }
+    _broker, probe, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: result,
+    )
+    probe._dispatch("tool.execute", body)
+    claim_size = len(canonical_json(probe.tool_execution_claims[0].to_dict()).encode())
+    monkeypatch.setattr(process_integration, "_MAX_RESERVED_CLAIM_BYTES", claim_size)
+    monkeypatch.setattr(
+        process_integration, "_MAX_BROKERED_TOOL_CLAIM_BYTES", 3 + claim_size
+    )
+
+    _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    outcomes = []
+    dispatch_count = 0
+
+    def dispatch(*_args, **_kwargs):
+        nonlocal dispatch_count
+        dispatch_count += 1
+        entered.set()
+        assert release.wait(timeout=1)
+        return result
+
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot", dispatch
+    )
+
+    def invoke():
+        try:
+            adapter._dispatch("tool.execute", body)
+            outcomes.append("recorded")
+        except Exception as exc:  # pragma: no cover - assertion reports below
+            outcomes.append(exc)
+
+    thread = threading.Thread(target=invoke)
+    thread.start()
+    assert entered.wait(timeout=1)
+    try:
+        invoke()
+    finally:
+        release.set()
+        thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert outcomes.count("recorded") == 1
+    errors = [outcome for outcome in outcomes if isinstance(outcome, Exception)]
+    assert len(errors) == 1
+    assert "aggregate byte bound" in str(errors[0])
+    assert dispatch_count == 1
+    assert len(adapter.tool_execution_claims) == 1
 
 
 def test_worker_local_dispatch_cannot_broaden_to_ambient_registry(monkeypatch):
@@ -359,7 +914,10 @@ def test_parent_dispatch_error_returns_authenticated_rejection(tmp_path, monkeyp
     name = "scaffolde_evo_agent_dispatch"
     call = SimpleNamespace(
         id="nested-error",
-        function=SimpleNamespace(name=name, arguments='{"agent":"reviewer"}'),
+        function=SimpleNamespace(
+            name=name,
+            arguments=json.dumps(_valid_broker_arguments()),
+        ),
     )
     responses = [
         SimpleNamespace(
@@ -402,3 +960,4 @@ def test_parent_dispatch_error_returns_authenticated_rejection(tmp_path, monkeyp
     worker.shutdown(socket.SHUT_RDWR)
     thread.join(timeout=1)
     assert not thread.is_alive()
+    assert adapter.tool_execution_claims == ()

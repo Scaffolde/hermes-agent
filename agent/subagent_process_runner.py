@@ -36,6 +36,7 @@ _MAX_ARG_BYTES = 128_000
 _DEFAULT_OUTPUT_BYTES = 1_048_576
 _STRICT_WORKER_HOME = Path("/tmp/hermes-worker-home")
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+_BROKER_THREAD_JOIN_SECONDS = 0.5
 
 
 def _bounded_diagnostic_text(value: object, *, limit: int) -> str:
@@ -55,6 +56,10 @@ class BrokerCallbacks(Protocol):
         root_pid: int,
         stop_requested: threading.Event,
     ) -> None: ...
+
+    def cancel(self) -> None:
+        """Synchronously revoke any accepted host operation."""
+        ...
 
 
 class ReceiptCallbacks(Protocol):
@@ -139,6 +144,9 @@ class ProcessRunSpec:
     term_grace_seconds: float = 2.0
     kill_grace_seconds: float = 2.0
     max_output_bytes: int = _DEFAULT_OUTPUT_BYTES
+    cancellation_event: threading.Event | None = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
     broker: BrokerCallbacks | None = dataclasses.field(
         default=None, repr=False, compare=False
     )
@@ -251,6 +259,8 @@ def _validate_spec(spec: ProcessRunSpec) -> None:
         raise ValueError("capability_secret must contain 32-128 bytes")
     if not spec.capability_id or not spec.launch_receipt_digest:
         raise ValueError("capability bootstrap authority is required")
+    if spec.broker is not None and not callable(getattr(spec.broker, "cancel", None)):
+        raise ValueError("broker must provide synchronous cancellation")
     if spec.capability_fd_arg is not None and (
         not spec.capability_fd_arg or "\x00" in spec.capability_fd_arg
     ):
@@ -593,6 +603,7 @@ def _monitor_process(
     term_grace_seconds: float,
     kill_grace_seconds: float,
     max_output_bytes: int,
+    cancellation_event: threading.Event | None = None,
 ) -> tuple[bytes, bytes, bool, bool, bool]:
     stdout = bytearray()
     stderr = bytearray()
@@ -624,7 +635,14 @@ def _monitor_process(
             now = time.monotonic()
             returncode = process.poll()
             group_exists = _process_group_exists(group_id)
-            if returncode is None and now >= deadline and not term_attempted:
+            cancellation_requested = bool(
+                cancellation_event is not None and cancellation_event.is_set()
+            )
+            if cancellation_requested and group_exists and not term_attempted:
+                term_attempted = True
+                term_sent = _signal_process_group(group_id, signal.SIGTERM)
+                term_deadline = now + term_grace_seconds
+            elif returncode is None and now >= deadline and not term_attempted:
                 timed_out = True
                 term_attempted = True
                 term_sent = _signal_process_group(group_id, signal.SIGTERM)
@@ -798,9 +816,12 @@ def _classify_terminal_state(
     timed_out: bool,
     broker_failed: bool,
     cleanup: CleanupEvidence,
+    cancellation_requested: bool = False,
 ) -> tuple[str, str | None]:
     if cleanup.cgroup_empty is False:
         return "CONTAINMENT_FAILED", "dedicated cgroup was not empty after cleanup"
+    if cancellation_requested:
+        return "CANCELLED", None
     if timed_out:
         return "TIMED_OUT", None
     if broker_failed:
@@ -925,6 +946,33 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
     stop_requested = threading.Event()
     broker_errors: list[str] = []
     broker_thread: threading.Thread | None = None
+    broker_quiesced = False
+
+    def quiesce_broker() -> None:
+        nonlocal broker_thread, broker_quiesced
+        if broker_quiesced:
+            return
+        stop_requested.set()
+        try:
+            host_channel.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        if broker_thread is not None:
+            cancel = getattr(spec.broker, "cancel", None)
+            if callable(cancel):
+                cancel()
+            # Host-brokered operations may have side effects. Never finalize a
+            # lifecycle result until every accepted operation has either
+            # recorded its claim or failed; otherwise a late completion can
+            # escape terminal classification and the result hash.
+            broker_thread.join(timeout=_BROKER_THREAD_JOIN_SECONDS)
+            if broker_thread.is_alive():
+                broker_errors.append(
+                    "broker thread did not stop after synchronous operation revocation"
+                )
+            broker_thread = None
+        broker_quiesced = True
+
     try:
         process = subprocess.Popen(
             argv,
@@ -986,6 +1034,7 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                 term_grace_seconds=spec.term_grace_seconds,
                 kill_grace_seconds=spec.kill_grace_seconds,
                 max_output_bytes=spec.max_output_bytes,
+                cancellation_event=spec.cancellation_event,
             )
         )
         cleanup = _cleanup_process_group(
@@ -1004,13 +1053,7 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                 cgroup_empty=cgroup_evidence.cgroup_empty,
                 cgroup_removed=cgroup_evidence.cgroup_removed,
             )
-        stop_requested.set()
-        try:
-            host_channel.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        if broker_thread is not None:
-            broker_thread.join(timeout=0.2)
+        quiesce_broker()
 
         returncode = process.returncode
         state, diagnostic = _classify_terminal_state(
@@ -1018,6 +1061,9 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
             timed_out=timed_out,
             broker_failed=bool(broker_errors),
             cleanup=cleanup,
+            cancellation_requested=bool(
+                spec.cancellation_event is not None and spec.cancellation_event.is_set()
+            ),
         )
         if broker_errors and diagnostic == "broker callback failed":
             diagnostic = f"{diagnostic}: {broker_errors[0]}"
@@ -1054,6 +1100,7 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                 cgroup_empty=cgroup_evidence.cgroup_empty,
                 cgroup_removed=cgroup_evidence.cgroup_removed,
             )
+        quiesce_broker()
         state = "CONTAINMENT_FAILED" if spec.backend == "linux-strict" else "FAILED"
         return _terminal_result(
             spec=spec,
@@ -1104,7 +1151,7 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
             diagnostic=f"post-spawn callback/bootstrap failed: {type(exc).__name__}",
         )
     finally:
-        stop_requested.set()
+        quiesce_broker()
         try:
             child_channel.close()
         except OSError:
