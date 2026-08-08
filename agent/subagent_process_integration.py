@@ -52,6 +52,7 @@ _MAX_SCOPED_READ_FILE_BYTES = 16 * 1024 * 1024
 _MAX_SCOPED_READ_OUTPUT_CHARS = 100_000
 _DEFAULT_CANCELLATION_QUIESCE_SECONDS = 0.5
 _CONTAINMENT_REASONS = frozenset({
+    "broker-callback-failed",
     "broker-operation-deadline",
     "broker-revocation-deadline",
     "broker-revocation-failed",
@@ -1535,13 +1536,15 @@ class ParentBrokerAdapter:
                                 lifecycle_stage = completion.get("lifecycle_stage")
                                 if isinstance(lifecycle_stage, str):
                                     nested_operation = f"stage:{lifecycle_stage}"
-                            if nested_operation is None and isinstance(
-                                completion, Mapping
-                            ):
+                            if isinstance(completion, Mapping):
                                 containment_reason = completion.get(
                                     "containment_reason"
                                 )
-                                if containment_reason in _CONTAINMENT_REASONS:
+                                if (
+                                    containment_reason in _CONTAINMENT_REASONS
+                                    and nested_operation
+                                    in {None, f"tool.execute:{name}"}
+                                ):
                                     nested_operation = (
                                         f"containment:{containment_reason}"
                                     )

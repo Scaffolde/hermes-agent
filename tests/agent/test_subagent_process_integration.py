@@ -986,7 +986,10 @@ def test_host_run_claim_rejects_unbound_exact_producer_payload(
     [
         ({"lifecycle_stage": "owned-process-runner"}, "stage:owned-process-runner"),
         (
-            {"containment_reason": "broker-revocation-failed"},
+            {
+                "active_operation": "tool.execute:scaffolde_evo_run",
+                "containment_reason": "broker-revocation-failed",
+            },
             "containment:broker-revocation-failed",
         ),
     ],
