@@ -380,7 +380,7 @@ def run_worker_loop(
         )
     local_handlers = _freeze_local_handlers(local_names, schemas)
     limit = session["max_iterations"]
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 32:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 64:
         raise BrokerFrameError("max_iterations is outside the worker bound")
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": session["protocol"]},

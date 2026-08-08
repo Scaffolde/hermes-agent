@@ -87,6 +87,26 @@ def test_process_profile_requires_canonical_non_root_workspace(hermes_home, tmp_
     assert profile.workspace_root == str(workspace.resolve())
     assert profile.max_process_iterations == 3
 
+    bounded = resolve_execution_profile(
+        "reviewer",
+        config=_profile_config(
+            execution_backend="portable",
+            workspace_root=str(workspace),
+            max_process_iterations=64,
+        ),
+    )
+    assert bounded.max_process_iterations == 64
+
+    with pytest.raises(ExecutionProfileError, match=r"\[1, 64\]"):
+        resolve_execution_profile(
+            "reviewer",
+            config=_profile_config(
+                execution_backend="portable",
+                workspace_root=str(workspace),
+                max_process_iterations=65,
+            ),
+        )
+
     with pytest.raises(ExecutionProfileError, match="require an absolute"):
         resolve_execution_profile(
             "reviewer",

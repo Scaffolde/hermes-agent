@@ -30,7 +30,7 @@ from typing import Any, Mapping, Optional
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _MAX_PROTOCOL_BYTES = 32_000  # Must fit the lifecycle context budget.
 _MAX_TIMEOUT_SECONDS = 86_400.0
-_MAX_PROCESS_ITERATIONS = 32
+_MAX_PROCESS_ITERATIONS = 64
 _VALID_EXECUTION_BACKENDS = frozenset({"in_process", "portable", "linux_strict"})
 _VALID_ROLES = frozenset({"leaf", "orchestrator"})
 UNSAFE_EXACT_PROFILE_TOOL_NAMES = frozenset(
