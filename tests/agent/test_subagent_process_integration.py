@@ -1489,6 +1489,18 @@ def test_strict_evo_profile_mounts_declared_cli_and_system_utilities_only():
     )
 
 
+def test_strict_evo_runtime_does_not_overlay_cli_inside_covered_prefix(tmp_path):
+    from agent.subagent_process_runner import RuntimeMount
+
+    prefix = tmp_path / "usr-local"
+    command = prefix / "bin" / "evo"
+    command.parent.mkdir(parents=True)
+    command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    mount = RuntimeMount(source=prefix, target=prefix)
+
+    assert process_integration._runtime_target_is_covered({str(prefix): mount}, command)
+
+
 def test_parent_dispatch_error_returns_authenticated_rejection(tmp_path, monkeypatch):
     name = "scaffolde_evo_agent_dispatch"
     call = SimpleNamespace(

@@ -872,10 +872,11 @@ def strict_worker_runtime_mounts(
             str(evo_runtime),
             RuntimeMount(source=evo_runtime, target=evo_runtime),
         )
-        mounts.setdefault(
-            str(evo_command),
-            RuntimeMount(source=evo_path, target=evo_command),
-        )
+        if not _runtime_target_is_covered(mounts, evo_command):
+            mounts.setdefault(
+                str(evo_command),
+                RuntimeMount(source=evo_path, target=evo_command),
+            )
         git_core = Path("/usr/lib/git-core")
         if git_core.is_dir():
             mounts.setdefault(
@@ -883,6 +884,17 @@ def strict_worker_runtime_mounts(
                 RuntimeMount(source=git_core.resolve(strict=True), target=git_core),
             )
     return tuple(mounts.values())
+
+
+def _runtime_target_is_covered(mounts: Mapping[str, Any], target: Path) -> bool:
+    """Return whether an identical-path directory mount already exposes target."""
+
+    return any(
+        mount.source == mount.target
+        and mount.source.is_dir()
+        and target.is_relative_to(mount.target)
+        for mount in mounts.values()
+    )
 
 
 def strict_worker_runtime_path(*, expose_scaffolde_evo_run: bool = False) -> str:
