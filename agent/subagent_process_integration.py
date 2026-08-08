@@ -48,6 +48,7 @@ _MAX_BROKERED_TOOL_CLAIM_BYTES = 128 * 1024
 _MAX_RESERVED_CLAIM_BYTES = 24 * 1024
 _MAX_SCOPED_READ_FILE_BYTES = 16 * 1024 * 1024
 _MAX_SCOPED_READ_OUTPUT_CHARS = 100_000
+_DEFAULT_CANCELLATION_QUIESCE_SECONDS = 0.5
 _SENSITIVE_CLAIM_KEYS = frozenset({
     "access_token",
     "api_key",
@@ -825,8 +826,16 @@ class ParentBrokerAdapter:
                 }
             send_authenticated_frame(channel, response, self._secret)
 
-    def cancel(self) -> None:
-        """Revoke broker admission and propagate cancellation to nested work."""
+    def cancel(
+        self, *, timeout_seconds: float = _DEFAULT_CANCELLATION_QUIESCE_SECONDS
+    ) -> bool:
+        """Revoke admission and wait only briefly for accepted host work."""
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds < 0
+        ):
+            raise ValueError("timeout_seconds must be finite and non-negative")
         if self._stop_requested is not None:
             self._stop_requested.set()
         # The process-profile child owns its provider client. Closing that
@@ -845,12 +854,13 @@ class ParentBrokerAdapter:
             request_hard_interrupt(self.child, "Owned process broker cancelled")
         except Exception:
             pass
-        # Do not return to the runner until an admitted operation has either
-        # persisted its claim or failed. The runner's subsequent timed join is
-        # therefore only bounding broker-thread bookkeeping, never host side
-        # effects or claim publication.
-        with self._operation_lock:
-            pass
+        # An admitted host operation can be blocked in provider/plugin code that
+        # Python cannot forcibly stop. Never let revocation wait on that lock
+        # forever: False tells the owned runner to terminalize fail-closed.
+        operation_quiesced = self._operation_lock.acquire(timeout=timeout_seconds)
+        if operation_quiesced:
+            self._operation_lock.release()
+        return operation_quiesced
 
     def _dispatch(self, operation: str, body: Any) -> Mapping[str, Any]:
         if not isinstance(body, Mapping):

@@ -57,8 +57,8 @@ class BrokerCallbacks(Protocol):
         stop_requested: threading.Event,
     ) -> None: ...
 
-    def cancel(self) -> None:
-        """Synchronously revoke any accepted host operation."""
+    def cancel(self) -> bool | None:
+        """Revoke accepted host operations, reporting whether they quiesced."""
         ...
 
 
@@ -604,7 +604,7 @@ def _monitor_process(
     kill_grace_seconds: float,
     max_output_bytes: int,
     cancellation_event: threading.Event | None = None,
-) -> tuple[bytes, bytes, bool, bool, bool]:
+) -> tuple[bytes, bytes, bool, bool, bool, bool]:
     stdout = bytearray()
     stderr = bytearray()
     stdout_truncated = False
@@ -628,6 +628,7 @@ def _monitor_process(
     kill_sent = False
     term_attempted = False
     kill_attempted = False
+    cancellation_observed = False
     group_id = process.pid
     drain_deadline: float | None = None
     try:
@@ -638,6 +639,8 @@ def _monitor_process(
             cancellation_requested = bool(
                 cancellation_event is not None and cancellation_event.is_set()
             )
+            if cancellation_requested and (returncode is None or group_exists):
+                cancellation_observed = True
             if cancellation_requested and group_exists and not term_attempted:
                 term_attempted = True
                 term_sent = _signal_process_group(group_id, signal.SIGTERM)
@@ -717,6 +720,7 @@ def _monitor_process(
         timed_out,
         stdout_truncated,
         stderr_truncated,
+        cancellation_observed,
     )
 
 
@@ -820,12 +824,12 @@ def _classify_terminal_state(
 ) -> tuple[str, str | None]:
     if cleanup.cgroup_empty is False:
         return "CONTAINMENT_FAILED", "dedicated cgroup was not empty after cleanup"
+    if broker_failed:
+        return "FAILED", "broker callback failed"
     if cancellation_requested:
         return "CANCELLED", None
     if timed_out:
         return "TIMED_OUT", None
-    if broker_failed:
-        return "FAILED", "broker callback failed"
     if returncode == 0 and cleanup.process_group_empty:
         return "SUCCEEDED", None
     return "FAILED", None
@@ -958,17 +962,48 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
         except OSError:
             pass
         if broker_thread is not None:
+            revocation_deadline = time.monotonic() + _BROKER_THREAD_JOIN_SECONDS
             cancel = getattr(spec.broker, "cancel", None)
             if callable(cancel):
-                cancel()
+                cancel_result: list[Any] = []
+                cancel_errors: list[BaseException] = []
+
+                def revoke_broker() -> None:
+                    try:
+                        cancel_result.append(cancel())
+                    except BaseException as exc:
+                        cancel_errors.append(exc)
+
+                revocation_thread = threading.Thread(
+                    target=revoke_broker,
+                    name=(
+                        f"hermes-broker-revocation-"
+                        f"{process.pid if process is not None else 'bootstrap'}"
+                    ),
+                    daemon=True,
+                )
+                revocation_thread.start()
+                revocation_thread.join(
+                    timeout=max(0.0, revocation_deadline - time.monotonic())
+                )
+                if revocation_thread.is_alive():
+                    broker_errors.append("broker revocation deadline expired")
+                elif cancel_errors:
+                    broker_errors.append(
+                        f"broker revocation failed: {type(cancel_errors[0]).__name__}"
+                    )
+                elif cancel_result == [False]:
+                    broker_errors.append(
+                        "broker revocation deadline expired before admitted operation quiesced"
+                    )
             # Host-brokered operations may have side effects. Never finalize a
             # lifecycle result until every accepted operation has either
             # recorded its claim or failed; otherwise a late completion can
             # escape terminal classification and the result hash.
-            broker_thread.join(timeout=_BROKER_THREAD_JOIN_SECONDS)
+            broker_thread.join(timeout=max(0.0, revocation_deadline - time.monotonic()))
             if broker_thread.is_alive():
                 broker_errors.append(
-                    "broker thread did not stop after synchronous operation revocation"
+                    "broker thread did not stop before revocation deadline"
                 )
             broker_thread = None
         broker_quiesced = True
@@ -1027,15 +1062,20 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
             )
             broker_thread.start()
 
-        stdout, stderr, timed_out, stdout_truncated, stderr_truncated = (
-            _monitor_process(
-                process,
-                timeout_seconds=spec.timeout_seconds,
-                term_grace_seconds=spec.term_grace_seconds,
-                kill_grace_seconds=spec.kill_grace_seconds,
-                max_output_bytes=spec.max_output_bytes,
-                cancellation_event=spec.cancellation_event,
-            )
+        (
+            stdout,
+            stderr,
+            timed_out,
+            stdout_truncated,
+            stderr_truncated,
+            cancellation_observed,
+        ) = _monitor_process(
+            process,
+            timeout_seconds=spec.timeout_seconds,
+            term_grace_seconds=spec.term_grace_seconds,
+            kill_grace_seconds=spec.kill_grace_seconds,
+            max_output_bytes=spec.max_output_bytes,
+            cancellation_event=spec.cancellation_event,
         )
         cleanup = _cleanup_process_group(
             process,
@@ -1061,9 +1101,7 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
             timed_out=timed_out,
             broker_failed=bool(broker_errors),
             cleanup=cleanup,
-            cancellation_requested=bool(
-                spec.cancellation_event is not None and spec.cancellation_event.is_set()
-            ),
+            cancellation_requested=cancellation_observed,
         )
         if broker_errors and diagnostic == "broker callback failed":
             diagnostic = f"{diagnostic}: {broker_errors[0]}"

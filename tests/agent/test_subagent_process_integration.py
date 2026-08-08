@@ -5,6 +5,7 @@ import os
 import socket
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -130,6 +131,22 @@ def _valid_broker_attestation() -> dict[str, object]:
         "outcome": {"passed": True, "verdict": "pass"},
         "evidence_sha256": "d" * 64,
     }
+
+
+def test_parent_cancel_has_a_real_deadline_for_an_admitted_operation(tmp_path):
+    _broker, adapter, _child, _completions, _digest = _fixture(tmp_path, [])
+    assert adapter._operation_lock.acquire(timeout=0.1)
+    started = time.monotonic()
+    try:
+        assert adapter.cancel(timeout_seconds=0.01) is False
+    finally:
+        adapter._operation_lock.release()
+    assert time.monotonic() - started < 0.2
+
+
+def test_parent_cancel_reports_quiesced_when_no_operation_is_admitted(tmp_path):
+    _broker, adapter, _child, _completions, _digest = _fixture(tmp_path, [])
+    assert adapter.cancel(timeout_seconds=0.01) is True
 
 
 def test_worker_loop_success_uses_authenticated_broker_and_non_streaming(tmp_path):

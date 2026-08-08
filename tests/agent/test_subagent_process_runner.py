@@ -258,14 +258,19 @@ def test_monitor_is_bounded_even_when_group_signals_fail(monkeypatch):
     )
     started = runner_module.time.monotonic()
 
-    _stdout, _stderr, timed_out, _stdout_truncated, _stderr_truncated = (
-        runner_module._monitor_process(
-            cast(Any, process),
-            timeout_seconds=0.02,
-            term_grace_seconds=0.02,
-            kill_grace_seconds=0.02,
-            max_output_bytes=128,
-        )
+    (
+        _stdout,
+        _stderr,
+        timed_out,
+        _stdout_truncated,
+        _stderr_truncated,
+        _cancellation_observed,
+    ) = runner_module._monitor_process(
+        cast(Any, process),
+        timeout_seconds=0.02,
+        term_grace_seconds=0.02,
+        kill_grace_seconds=0.02,
+        max_output_bytes=128,
     )
 
     assert timed_out is True
@@ -468,7 +473,7 @@ def test_portable_spawn_is_argv_only_new_session_closed_fds(monkeypatch, tmp_pat
     monkeypatch.setattr(
         runner_module,
         "_monitor_process",
-        lambda *a, **k: (b"", b"", False, False, False),
+        lambda *a, **k: (b"", b"", False, False, False, False),
     )
     monkeypatch.setattr(
         runner_module,
@@ -613,6 +618,44 @@ def test_strict_cleanup_failure_supersedes_timeout_terminal_state():
 
     assert state == "CONTAINMENT_FAILED"
     assert diagnostic == "dedicated cgroup was not empty after cleanup"
+
+
+def test_broker_failure_supersedes_cancellation_terminal_state():
+    state, diagnostic = _classify_terminal_state(
+        returncode=-signal.SIGTERM,
+        timed_out=False,
+        broker_failed=True,
+        cleanup=runner_module.CleanupEvidence(
+            root_reaped=True,
+            process_group_empty=True,
+        ),
+        cancellation_requested=True,
+    )
+
+    assert state == "FAILED"
+    assert diagnostic == "broker callback failed"
+
+
+def test_late_cancellation_does_not_relabel_completed_process(tmp_path, monkeypatch):
+    cancellation_requested = threading.Event()
+    original_cleanup = runner_module._cleanup_process_group
+
+    def cleanup_then_cancel(*args, **kwargs):
+        evidence = original_cleanup(*args, **kwargs)
+        cancellation_requested.set()
+        return evidence
+
+    monkeypatch.setattr(runner_module, "_cleanup_process_group", cleanup_then_cancel)
+    result = run_owned_process(
+        _portable_spec(
+            tmp_path,
+            "-c",
+            "pass",
+            cancellation_event=cancellation_requested,
+        )
+    )
+
+    assert result.state == "SUCCEEDED"
 
 
 def test_strict_argv_validation_precedes_cgroup_and_worker_spawn(monkeypatch, tmp_path):
