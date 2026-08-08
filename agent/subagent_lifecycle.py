@@ -1233,7 +1233,7 @@ class SubagentLifecycleService:
                     observed_cleanup.append(
                         f"cgroup_removed={result.cleanup.cgroup_removed}"
                     )
-                diagnostics = [result.diagnostic] if result.diagnostic else []
+                diagnostics = []
                 if result.stderr:
                     stderr_lines = [
                         line.strip()
@@ -1250,6 +1250,8 @@ class SubagentLifecycleService:
                         diagnostics.append(
                             f"worker stderr: {' '.join(diagnostic.split())[:1000]}"
                         )
+                if result.diagnostic:
+                    diagnostics.append(result.diagnostic)
                 containment_evidence = [result.confinement]
                 if backend == "linux-strict":
                     runtime_policy = {
