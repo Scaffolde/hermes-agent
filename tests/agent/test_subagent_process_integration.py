@@ -211,8 +211,19 @@ def _valid_run_result_payload() -> dict[str, Any]:
         "cancelled": False,
         "cleanup": cleanup,
     }
-    evidence = {"verified": True}
+    evidence = {
+        "argv_sha256": "1" * 64,
+        "before_node_sha256": "2" * 64,
+        "after_node_sha256": "3" * 64,
+        "stdout_sha256": "4" * 64,
+        "stderr_sha256": "5" * 64,
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+    }
     attestation = _valid_run_attestation()
+    attestation["evidence_sha256"] = hashlib.sha256(
+        canonical_json(evidence).encode()
+    ).hexdigest()
     result_hash = hashlib.sha256(canonical_json(result).encode()).hexdigest()
     receipt_hash = hashlib.sha256(
         canonical_json(execution_receipt).encode()
@@ -292,6 +303,16 @@ def test_parent_rejects_provider_schema_not_bound_to_launch_receipt(tmp_path):
             task="schema mismatch",
             expected_tool_schema_sha256="f" * 64,
         )
+
+
+def test_provider_effective_tool_schema_digest_preserves_transmitted_order():
+    first = {"type": "function", "function": {"name": "first"}}
+    second = {"type": "function", "function": {"name": "second"}}
+
+    assert process_integration.exact_tool_schema_digest([
+        first,
+        second,
+    ]) != process_integration.exact_tool_schema_digest([second, first])
 
 
 def test_parent_binds_session_and_completion_to_provider_effective_tool_schema(
@@ -837,6 +858,9 @@ def test_host_run_claim_rejects_attempt_execution_not_bound_to_host_receipt(
         "cleanup_hash",
         "request_identity",
         "outcome",
+        "missing_evidence_flag",
+        "string_evidence_flag",
+        "failed_exit_zero",
     ],
 )
 def test_host_run_claim_rejects_unbound_exact_producer_payload(
@@ -872,8 +896,20 @@ def test_host_run_claim_rejects_unbound_exact_producer_payload(
         ).hexdigest()
         result_payload["completion"]["result_hash"] = digest
         result_payload["broker_attestation"]["completion"]["result_hash"] = digest
-    else:
+    elif mutation == "outcome":
         result_payload["broker_attestation"]["outcome"]["status"] = "evaluated"
+    elif mutation == "missing_evidence_flag":
+        result_payload["evidence"].pop("stdout_truncated")
+    elif mutation == "string_evidence_flag":
+        result_payload["evidence"]["stdout_truncated"] = "false"
+    else:
+        result_payload["result"]["status"] = "failed"
+        result_payload["broker_attestation"]["outcome"]["status"] = "failed"
+        digest = hashlib.sha256(
+            canonical_json(result_payload["result"]).encode()
+        ).hexdigest()
+        result_payload["completion"]["result_hash"] = digest
+        result_payload["broker_attestation"]["completion"]["result_hash"] = digest
     monkeypatch.setattr(
         "agent.subagent_process_integration.registry.dispatch_snapshot",
         lambda *_args, **_kwargs: result_payload,
@@ -978,11 +1014,11 @@ def test_side_effecting_handler_exception_latches_unresolved_effects(
 
 
 @pytest.mark.parametrize(
-    ("prior_unresolved", "expected_unresolved"),
-    [(False, False), (True, True)],
+    ("prior_unresolved", "containment_proof", "expected_unresolved"),
+    [(False, False, False), (True, False, True), (False, None, True)],
 )
 def test_contained_side_effecting_handler_failure_restores_unresolved_latch(
-    tmp_path, monkeypatch, prior_unresolved, expected_unresolved
+    tmp_path, monkeypatch, prior_unresolved, containment_proof, expected_unresolved
 ):
     name = "scaffolde_evo_run"
     _broker, old_adapter, child, _completions, _digest = _fixture(tmp_path, [])
@@ -996,13 +1032,16 @@ def test_contained_side_effecting_handler_failure_restores_unresolved_latch(
     )
     adapter.profile.execution_backend = "linux_strict"
     adapter._side_effects_unresolved = prior_unresolved
+    failure = {
+        "ok": False,
+        "error_code": "evo_run_failed",
+        "error": "nested attempt failed with conclusive cleanup",
+    }
+    if containment_proof is not None:
+        failure["side_effects_unresolved"] = containment_proof
     monkeypatch.setattr(
         "agent.subagent_process_integration.registry.dispatch_snapshot",
-        lambda *_args, **_kwargs: {
-            "ok": False,
-            "error_code": "evo_run_failed",
-            "error": "nested attempt failed with conclusive cleanup",
-        },
+        lambda *_args, **_kwargs: failure,
     )
 
     response = adapter._dispatch(

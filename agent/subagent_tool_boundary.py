@@ -31,14 +31,8 @@ def classify_evo_tools(names: Iterable[str]) -> tuple[frozenset[str], frozenset[
 
 
 def exact_tool_schema_digest(tools: list[Mapping[str, Any]]) -> str:
-    def tool_name(tool: Mapping[str, Any]) -> str:
-        function = tool.get("function")
-        if isinstance(function, Mapping):
-            return str(function.get("name", ""))
-        return str(tool.get("name", ""))
-
     encoded = json.dumps(
-        sorted(tools, key=tool_name),
+        tools,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,

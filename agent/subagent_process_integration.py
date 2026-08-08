@@ -553,6 +553,39 @@ def _canonical_public_attestation_json(
             host_completion, Mapping
         ):
             raise ProcessIntegrationError("brokered Evo run result is malformed")
+        evidence = result_payload.get("evidence")
+        digest_fields = {
+            "argv_sha256",
+            "before_node_sha256",
+            "after_node_sha256",
+            "stdout_sha256",
+            "stderr_sha256",
+        }
+        if not isinstance(evidence, Mapping) or set(evidence) != digest_fields | {
+            "stdout_truncated",
+            "stderr_truncated",
+        }:
+            raise ProcessIntegrationError("brokered Evo run evidence is malformed")
+        if any(
+            not isinstance(evidence.get(field), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", evidence[field])
+            for field in digest_fields
+        ):
+            raise ProcessIntegrationError("brokered Evo run evidence digest is invalid")
+        if not all(
+            isinstance(evidence.get(field), bool)
+            for field in ("stdout_truncated", "stderr_truncated")
+        ):
+            raise ProcessIntegrationError(
+                "brokered Evo run truncation evidence is invalid"
+            )
+        evidence_sha256 = hashlib.sha256(
+            canonical_json(_json_safe(evidence)).encode("utf-8")
+        ).hexdigest()
+        if value.get("evidence_sha256") != evidence_sha256:
+            raise ProcessIntegrationError(
+                "brokered Evo run evidence hash does not match its evidence"
+            )
         host_result_sha256 = hashlib.sha256(
             canonical_json(_json_safe(host_result)).encode("utf-8")
         ).hexdigest()
@@ -654,6 +687,7 @@ def _canonical_public_attestation_json(
             and outcome.get("status") in {"committed", "evaluated", "failed"}
             and not isinstance(outcome.get("exit_code"), bool)
             and isinstance(outcome.get("exit_code"), int)
+            and (outcome.get("status") == "failed") is (outcome.get("exit_code") != 0)
         )
     elif role == "candidate-worker":
         outcome_valid = (
@@ -1439,7 +1473,10 @@ class ParentBrokerAdapter:
                     with self._claim_lock:
                         if result_payload.get("side_effects_unresolved") is True:
                             self._side_effects_unresolved = True
-                        elif side_effecting:
+                        elif (
+                            side_effecting
+                            and result_payload.get("side_effects_unresolved") is False
+                        ):
                             self._side_effects_unresolved = (
                                 prior_side_effects_unresolved
                             )
