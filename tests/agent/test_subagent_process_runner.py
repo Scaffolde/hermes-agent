@@ -430,6 +430,27 @@ def test_runner_names_admitted_operation_when_revocation_misses_deadline(tmp_pat
     assert "admitted operation model.complete" in (result.diagnostic or "")
 
 
+def test_runner_names_admitted_operation_when_revocation_raises(tmp_path):
+    release = threading.Event()
+
+    class Broker:
+        active_operation_label = "model.complete"
+
+        def serve(self, _channel: socket.socket, *, root_pid: int, stop_requested):
+            assert root_pid > 0
+            assert release.wait(timeout=2)
+
+        def cancel(self):
+            release.set()
+            raise RuntimeError("revocation failed")
+
+    result = run_owned_process(_portable_spec(tmp_path, "-c", "pass", broker=Broker()))
+
+    assert result.state == "FAILED"
+    assert result.cleanup.broker_quiesced is False
+    assert result.cleanup.broker_active_operation == "model.complete"
+
+
 def test_runner_refuses_terminal_result_until_broker_quiesces(tmp_path):
     broker_started = threading.Event()
     release = threading.Event()

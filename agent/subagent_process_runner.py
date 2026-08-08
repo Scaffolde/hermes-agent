@@ -1023,14 +1023,8 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                     raise _BrokerContainmentFailStop(
                         "broker containment fail-stop returned"
                     )
-                if cancel_errors:
-                    quiesced = False
-                    broker_errors.append(
-                        f"broker revocation failed: {type(cancel_errors[0]).__name__}"
-                    )
-                elif cancel_result == [False]:
-                    quiesced = False
-                    active_operation = None
+
+                def admitted_operation() -> str | None:
                     try:
                         candidate = getattr(spec.broker, "active_operation_label", None)
                     except Exception:
@@ -1044,8 +1038,19 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                             for character in candidate
                         )
                     ):
-                        active_operation = candidate
-                        broker_active_operation = candidate
+                        return candidate
+                    return None
+
+                if cancel_errors:
+                    quiesced = False
+                    broker_active_operation = admitted_operation()
+                    broker_errors.append(
+                        f"broker revocation failed: {type(cancel_errors[0]).__name__}"
+                    )
+                elif cancel_result == [False]:
+                    quiesced = False
+                    active_operation = admitted_operation()
+                    broker_active_operation = active_operation
                     operation_detail = (
                         f" {active_operation}" if active_operation is not None else ""
                     )
