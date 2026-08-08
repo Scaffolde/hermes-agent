@@ -11,6 +11,7 @@ LOCAL_EVO_TOOL_NAMES = frozenset({"terminal", "write_file", "patch", "search_fil
 HOST_BROKERED_EVO_TOOL_NAMES = frozenset({
     "read_file",
     "scaffolde_evo_agent_dispatch",
+    "scaffolde_evo_run",
 })
 SUPPORTED_EVO_TOOL_NAMES = LOCAL_EVO_TOOL_NAMES | HOST_BROKERED_EVO_TOOL_NAMES
 

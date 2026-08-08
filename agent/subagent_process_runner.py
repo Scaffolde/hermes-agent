@@ -824,6 +824,10 @@ def _classify_terminal_state(
 ) -> tuple[str, str | None]:
     if cleanup.cgroup_empty is False:
         return "CONTAINMENT_FAILED", "dedicated cgroup was not empty after cleanup"
+    if cleanup.root_reaped is False:
+        return "FAILED", "root process was not reaped"
+    if cleanup.process_group_empty is False:
+        return "FAILED", "process group was not empty"
     if broker_failed:
         return "FAILED", "broker callback failed"
     if cancellation_requested:

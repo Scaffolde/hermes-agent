@@ -236,6 +236,42 @@ def test_explicit_cancellation_terminates_and_reaps_process_group(tmp_path):
     assert results[0].cleanup.term_sent is True
 
 
+@pytest.mark.parametrize(
+    ("cleanup", "diagnostic"),
+    [
+        (
+            runner_module.CleanupEvidence(
+                requested=True,
+                root_reaped=False,
+                process_group_empty=True,
+            ),
+            "root process was not reaped",
+        ),
+        (
+            runner_module.CleanupEvidence(
+                requested=True,
+                root_reaped=True,
+                process_group_empty=False,
+            ),
+            "process group was not empty",
+        ),
+    ],
+)
+def test_cancellation_fails_closed_when_portable_cleanup_is_incomplete(
+    cleanup, diagnostic
+):
+    state, detail = runner_module._classify_terminal_state(
+        returncode=-signal.SIGKILL,
+        timed_out=False,
+        broker_failed=False,
+        cleanup=cleanup,
+        cancellation_requested=True,
+    )
+
+    assert state == "FAILED"
+    assert detail == diagnostic
+
+
 def test_monitor_is_bounded_even_when_group_signals_fail(monkeypatch):
     class FakeProcess:
         pid = 91919

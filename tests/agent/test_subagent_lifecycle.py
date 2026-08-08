@@ -381,12 +381,15 @@ def test_process_brokered_claims_propagate_and_bind_result_hash(monkeypatch, tmp
     parent = SimpleNamespace(session_id="process-claims", enabled_toolsets=["file"])
     child = FakeChild("process-claims")
     claim = BrokeredToolExecutionClaim(
+        sequence=1,
         tool_name="scaffolde_evo_agent_dispatch",
         arguments_sha256=hashlib.sha256(b'{"agent":"reviewer"}').hexdigest(),
         result_sha256=hashlib.sha256(
             b'{"broker_attestation":{"status":"verified"},"summary":"private"}'
         ).hexdigest(),
         public_attestation_json='{"status":"verified"}',
+        launch_receipt_sha256="a" * 64,
+        tool_schema_sha256="b" * 64,
     )
 
     def build(**_kwargs):

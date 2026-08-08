@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import copy
 import hashlib
 import json
 import math
@@ -95,12 +96,15 @@ _FORBIDDEN_CLAIM_KEY_FINGERPRINTS = frozenset(
 class BrokeredToolExecutionClaim:
     """Bounded immutable evidence for one host-successful tool execution."""
 
+    sequence: int
     tool_name: str
     arguments_sha256: str
     result_sha256: str
     public_attestation_json: str
+    launch_receipt_sha256: str
+    tool_schema_sha256: str
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
 
 
@@ -272,9 +276,66 @@ def _workspace_scoped_read_result(
     return json.dumps(result, ensure_ascii=False)
 
 
+def _require_exact_brokered_workspace(
+    arguments: Mapping[str, Any], active_profile: Any
+) -> str:
+    raw_workspace = arguments.get("workspace")
+    if not isinstance(raw_workspace, str) or not raw_workspace:
+        raise ProcessIntegrationError(
+            "Brokered Scaffolde tool requires an explicit workspace."
+        )
+    try:
+        expected = Path(active_profile.workspace_root).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ProcessIntegrationError(
+            "Brokered Scaffolde workspace is unavailable."
+        ) from exc
+    if (
+        getattr(active_profile, "execution_backend", None) == "linux_strict"
+        and raw_workspace == "/workspace"
+    ):
+        return str(expected)
+    try:
+        supplied = Path(raw_workspace).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ProcessIntegrationError(
+            "Brokered Scaffolde workspace is unavailable."
+        ) from exc
+    if supplied != expected:
+        raise ProcessIntegrationError(
+            "Brokered Scaffolde workspace does not match the profile workspace."
+        )
+    return str(expected)
+
+
 def _expected_scaffolde_attestation_binding(
     arguments: Mapping[str, Any],
+    *,
+    tool_name: str,
+    active_profile: Any,
 ) -> Mapping[str, Any]:
+    if tool_name == "scaffolde_evo_run":
+        if active_profile.profile_id != "scaffolde-evo-candidate-v1":
+            raise ProcessIntegrationError(
+                "brokered Evo run is not bound to the candidate profile"
+            )
+        expected_request = {
+            "experiment_id": arguments.get("experiment_id"),
+            "attempt_n": arguments.get("attempt_n"),
+        }
+        if not all(value is not None for value in expected_request.values()):
+            raise ProcessIntegrationError(
+                "brokered Evo run request identity is incomplete"
+            )
+        return MappingProxyType({
+            "kind": "evo-run",
+            "role": "candidate-worker",
+            "profile_id": active_profile.profile_id,
+            "protocol_sha256": active_profile.protocol_sha256,
+            "request": MappingProxyType(expected_request),
+        })
+    if tool_name != "scaffolde_evo_agent_dispatch":
+        raise ProcessIntegrationError("brokered attestation tool is unsupported")
     role = arguments.get("role")
     profile_ids = {
         "candidate-worker": "scaffolde-evo-candidate-v1",
@@ -310,6 +371,7 @@ def _expected_scaffolde_attestation_binding(
             "brokered dispatch request identity is incomplete"
         )
     return MappingProxyType({
+        "kind": None,
         "role": role,
         "profile_id": profile_id,
         "protocol_sha256": profile.protocol_sha256,
@@ -318,7 +380,10 @@ def _expected_scaffolde_attestation_binding(
 
 
 def _canonical_public_attestation_json(
-    value: Any, *, expected_binding: Mapping[str, Any]
+    value: Any,
+    *,
+    expected_binding: Mapping[str, Any],
+    result_payload: Mapping[str, Any],
 ) -> str:
     if not isinstance(value, Mapping):
         raise ProcessIntegrationError(
@@ -336,6 +401,9 @@ def _canonical_public_attestation_json(
         "outcome",
         "evidence_sha256",
     }
+    expected_kind = expected_binding["kind"]
+    if expected_kind is not None:
+        expected_keys.add("kind")
     if set(value) != expected_keys:
         raise ProcessIntegrationError(
             "brokered tool public attestation does not match the Scaffolde schema"
@@ -344,6 +412,10 @@ def _canonical_public_attestation_json(
         raise ProcessIntegrationError(
             "brokered tool public attestation has an invalid version"
         )
+    if expected_kind is not None and value.get("kind") != expected_kind:
+        raise ProcessIntegrationError(
+            "brokered tool public attestation has an invalid kind"
+        )
     if value.get("ok") is not True:
         raise ProcessIntegrationError(
             "brokered tool public attestation does not attest success"
@@ -351,24 +423,32 @@ def _canonical_public_attestation_json(
     role = value.get("role")
     profile_id = value.get("profile_id")
     request = value.get("request")
-    role_contracts = {
-        "candidate-worker": (
-            "scaffolde-evo-candidate-v1",
-            {"parent_node"},
-        ),
-        "verifier": (
-            "scaffolde-evo-verifier-v1",
-            {"experiment_id", "phase", "attempt_n"},
-        ),
-        "benchmark-reviewer": (
-            "scaffolde-evo-benchmark-reviewer-v1",
-            {
-                "experiment_id",
-                "mode",
-                "attempt_n",
-            },
-        ),
-    }
+    if expected_kind == "evo-run":
+        role_contracts = {
+            "candidate-worker": (
+                "scaffolde-evo-candidate-v1",
+                {"experiment_id", "attempt_n"},
+            ),
+        }
+    else:
+        role_contracts = {
+            "candidate-worker": (
+                "scaffolde-evo-candidate-v1",
+                {"parent_node"},
+            ),
+            "verifier": (
+                "scaffolde-evo-verifier-v1",
+                {"experiment_id", "phase", "attempt_n"},
+            ),
+            "benchmark-reviewer": (
+                "scaffolde-evo-benchmark-reviewer-v1",
+                {
+                    "experiment_id",
+                    "mode",
+                    "attempt_n",
+                },
+            ),
+        }
     role_contract = role_contracts.get(role) if isinstance(role, str) else None
     if (
         role_contract is None
@@ -420,7 +500,15 @@ def _canonical_public_attestation_json(
             "brokered tool public attestation has an invalid attempt number"
         )
     outcome = value.get("outcome")
-    if role == "candidate-worker":
+    if expected_kind == "evo-run":
+        outcome_valid = (
+            isinstance(outcome, Mapping)
+            and set(outcome) == {"status", "exit_code"}
+            and outcome.get("status") in {"committed", "evaluated", "failed"}
+            and not isinstance(outcome.get("exit_code"), bool)
+            and isinstance(outcome.get("exit_code"), int)
+        )
+    elif role == "candidate-worker":
         outcome_valid = (
             isinstance(outcome, Mapping)
             and set(outcome) == {"validated"}
@@ -464,6 +552,31 @@ def _canonical_public_attestation_json(
             raise ProcessIntegrationError(
                 f"brokered tool public attestation has an invalid completion {field}"
             )
+    host_completion = result_payload.get("completion")
+    host_result_hash = (
+        host_completion.get("result_hash")
+        if isinstance(host_completion, Mapping)
+        else None
+    )
+    host_execution_receipt_hash = result_payload.get("execution_receipt_hash")
+    host_evidence = result_payload.get("evidence")
+    if (
+        not isinstance(host_completion, Mapping)
+        or not isinstance(host_evidence, Mapping)
+        or not isinstance(host_result_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", host_result_hash)
+        or not isinstance(host_execution_receipt_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", host_execution_receipt_hash)
+        or completion.get("result_hash") != host_result_hash
+        or completion.get("execution_receipt_hash") != host_execution_receipt_hash
+        or value.get("evidence_sha256")
+        != hashlib.sha256(
+            canonical_json(_json_safe(host_evidence)).encode("utf-8")
+        ).hexdigest()
+    ):
+        raise ProcessIntegrationError(
+            "brokered tool public attestation does not match host completion evidence"
+        )
     encoded = _canonical_bounded_json(
         value,
         field="public attestation",
@@ -649,6 +762,9 @@ class ParentBrokerAdapter:
         self.profile = profile
         self.task = task
         self._secret = broker.reveal_secret_for_transport()
+        self._launch_receipt_sha256 = broker.launch_receipt_digest
+        self._effective_tools = self._provider_effective_tools()
+        self._tool_schema_sha256 = exact_tool_schema_digest(self._effective_tools)
         try:
             self.local_tool_names, self.brokered_tool_names = classify_evo_tools(
                 child._delegate_frozen_dispatch_entries
@@ -669,6 +785,19 @@ class ParentBrokerAdapter:
         self._operation_lock = threading.Lock()
         if set(self._brokered_dispatch_entries) != set(self.brokered_tool_names):
             raise ProcessIntegrationError("host-brokered frozen handler is unavailable")
+
+    def _provider_effective_tools(self) -> list[Mapping[str, Any]]:
+        kwargs = self.child._build_api_kwargs(
+            [], tools_for_api=copy.deepcopy(self.child.tools)
+        )
+        tools = _json_safe(kwargs.get("tools"))
+        if not isinstance(tools, list) or not all(
+            isinstance(tool, Mapping) for tool in tools
+        ):
+            raise ProcessIntegrationError(
+                "provider-effective tool schema is unavailable or malformed"
+            )
+        return tools
 
     @property
     def tool_execution_claims(self) -> tuple[BrokeredToolExecutionClaim, ...]:
@@ -712,17 +841,6 @@ class ParentBrokerAdapter:
         result_sha256: str,
         public_attestation_json: str,
     ) -> None:
-        claim = BrokeredToolExecutionClaim(
-            tool_name=name,
-            arguments_sha256=arguments_sha256,
-            result_sha256=result_sha256,
-            public_attestation_json=public_attestation_json,
-        )
-        claim_bytes = len(canonical_json(claim.to_dict()).encode("utf-8"))
-        if claim_bytes > _MAX_RESERVED_CLAIM_BYTES:
-            raise ProcessIntegrationError(
-                "brokered tool claim exceeds its reserved byte bound"
-            )
         with self._claim_lock:
             if self._pending_tool_execution_claims <= 0:
                 raise ProcessIntegrationError(
@@ -731,6 +849,20 @@ class ParentBrokerAdapter:
             if len(self._tool_execution_claims) >= _MAX_BROKERED_TOOL_CLAIMS:
                 raise ProcessIntegrationError(
                     "brokered tool claim count exceeds its bound"
+                )
+            claim = BrokeredToolExecutionClaim(
+                sequence=len(self._tool_execution_claims) + 1,
+                tool_name=name,
+                arguments_sha256=arguments_sha256,
+                result_sha256=result_sha256,
+                public_attestation_json=public_attestation_json,
+                launch_receipt_sha256=self._launch_receipt_sha256,
+                tool_schema_sha256=self._tool_schema_sha256,
+            )
+            claim_bytes = len(canonical_json(claim.to_dict()).encode("utf-8"))
+            if claim_bytes > _MAX_RESERVED_CLAIM_BYTES:
+                raise ProcessIntegrationError(
+                    "brokered tool claim exceeds its reserved byte bound"
                 )
             separator_bytes = 1 if self._tool_execution_claims else 0
             remaining_reserved_bytes = (self._pending_tool_execution_claims - 1) * (
@@ -871,8 +1003,8 @@ class ParentBrokerAdapter:
             return {
                 "protocol": self.profile.protocol_text,
                 "task": self.task,
-                "tools": _json_safe(self.child.tools),
-                "tool_schema_digest": exact_tool_schema_digest(self.child.tools),
+                "tools": _json_safe(self._effective_tools),
+                "tool_schema_digest": self._tool_schema_sha256,
                 "local_tool_names": sorted(self.local_tool_names),
                 "brokered_tool_names": sorted(self.brokered_tool_names),
                 "model": str(self.child.model or ""),
@@ -882,8 +1014,17 @@ class ParentBrokerAdapter:
             if set(body) != {"messages"} or not isinstance(body["messages"], list):
                 raise ProcessIntegrationError("model.complete body is malformed")
             kwargs = self.child._build_api_kwargs(
-                body["messages"], tools_for_api=self.child.tools
+                body["messages"], tools_for_api=copy.deepcopy(self.child.tools)
             )
+            effective_tools = _json_safe(kwargs.get("tools"))
+            if (
+                not isinstance(effective_tools, list)
+                or not all(isinstance(tool, Mapping) for tool in effective_tools)
+                or exact_tool_schema_digest(effective_tools) != self._tool_schema_sha256
+            ):
+                raise ProcessIntegrationError(
+                    "provider-effective tool schema changed after launch"
+                )
             kwargs["stream"] = False
             kwargs.pop("stream_options", None)
             response = self.child.client.chat.completions.create(**kwargs)
@@ -912,6 +1053,13 @@ class ParentBrokerAdapter:
                 )
             if name not in self.brokered_tool_names:
                 raise ProcessIntegrationError("tool is not host-brokered")
+            if (
+                exact_tool_schema_digest(self._provider_effective_tools())
+                != self._tool_schema_sha256
+            ):
+                raise ProcessIntegrationError(
+                    "effective tool schema changed after launch"
+                )
             if name == "read_file":
                 try:
                     result = _workspace_scoped_read_result(
@@ -926,6 +1074,14 @@ class ParentBrokerAdapter:
                         }
                     }
                 return {"result": result}
+            if name in {
+                "scaffolde_evo_agent_dispatch",
+                "scaffolde_evo_run",
+            }:
+                host_workspace = _require_exact_brokered_workspace(args, self.profile)
+                dispatch_args = {**args, "workspace": host_workspace}
+            else:
+                dispatch_args = dict(args)
             arguments_json = _canonical_bounded_json(
                 args,
                 field="arguments",
@@ -942,7 +1098,7 @@ class ParentBrokerAdapter:
                     result = concrete_registry.dispatch_snapshot(
                         self._brokered_dispatch_entries,
                         name,
-                        dict(args),
+                        dispatch_args,
                         task_id=str(
                             getattr(self.child, "_subagent_id", "") or "process"
                         ),
@@ -959,11 +1115,14 @@ class ParentBrokerAdapter:
                 if result_payload.get("ok") is False:
                     return {"result": _bounded_failed_tool_result(result_payload)}
                 expected_attestation_binding = _expected_scaffolde_attestation_binding(
-                    args
+                    args,
+                    tool_name=name,
+                    active_profile=self.profile,
                 )
                 public_attestation_json = _canonical_public_attestation_json(
                     result_payload["broker_attestation"],
                     expected_binding=expected_attestation_binding,
+                    result_payload=result_payload,
                 )
                 self._record_tool_execution_claim(
                     name=name,

@@ -38,8 +38,9 @@ def _resolved_scaffolde_profiles(monkeypatch):
     )
 
 
-def _valid_broker_arguments() -> dict[str, object]:
+def _valid_broker_arguments(tmp_path: Path) -> dict[str, object]:
     return {
+        "workspace": str(tmp_path),
         "role": "verifier",
         "experiment_id": "exp_1001",
         "phase": "post",
@@ -86,6 +87,8 @@ def _fixture(tmp_path: Path, responses):
         normalize_response=lambda _response: responses.pop(0)
     )
     profile = SimpleNamespace(
+        profile_id="scaffolde-evo-candidate-v1",
+        protocol_sha256="a" * 64,
         protocol_text="strict protocol",
         max_process_iterations=4,
         workspace_root=str(tmp_path),
@@ -129,7 +132,41 @@ def _valid_broker_attestation() -> dict[str, object]:
             "execution_receipt_hash": "c" * 64,
         },
         "outcome": {"passed": True, "verdict": "pass"},
-        "evidence_sha256": "d" * 64,
+        "evidence_sha256": hashlib.sha256(
+            canonical_json({"verified": True}).encode()
+        ).hexdigest(),
+    }
+
+
+def _valid_broker_result(
+    *, attestation: dict[str, object] | None = None, **extra: object
+) -> dict[str, object]:
+    return {
+        **extra,
+        "broker_attestation": attestation or _valid_broker_attestation(),
+        "completion": {"result_hash": "b" * 64},
+        "execution_receipt_hash": "c" * 64,
+        "evidence": {"verified": True},
+    }
+
+
+def _valid_run_attestation() -> dict[str, object]:
+    return {
+        "version": 1,
+        "kind": "evo-run",
+        "role": "candidate-worker",
+        "profile_id": "scaffolde-evo-candidate-v1",
+        "protocol_sha256": "a" * 64,
+        "ok": True,
+        "request": {"experiment_id": "exp_1001", "attempt_n": 1},
+        "completion": {
+            "result_hash": "b" * 64,
+            "execution_receipt_hash": "c" * 64,
+        },
+        "outcome": {"status": "committed", "exit_code": 0},
+        "evidence_sha256": hashlib.sha256(
+            canonical_json({"verified": True}).encode()
+        ).hexdigest(),
     }
 
 
@@ -147,6 +184,48 @@ def test_parent_cancel_has_a_real_deadline_for_an_admitted_operation(tmp_path):
 def test_parent_cancel_reports_quiesced_when_no_operation_is_admitted(tmp_path):
     _broker, adapter, _child, _completions, _digest = _fixture(tmp_path, [])
     assert adapter.cancel(timeout_seconds=0.01) is True
+
+
+def test_parent_binds_session_and_completion_to_provider_effective_tool_schema(
+    tmp_path,
+):
+    normalized = SimpleNamespace(
+        content="finished", finish_reason="stop", reasoning=None, tool_calls=[]
+    )
+    broker, old_adapter, child, completions, _digest = _fixture(tmp_path, [normalized])
+    effective_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    child._build_api_kwargs = lambda messages, tools_for_api: {
+        "messages": messages,
+        "tools": effective_tools,
+    }
+    adapter = ParentBrokerAdapter(
+        broker=broker,
+        child=child,
+        profile=old_adapter.profile,
+        task="effective schema task",
+    )
+
+    session = adapter._dispatch("session.start", {})
+    adapter._dispatch(
+        "model.complete", {"messages": [{"role": "user", "content": "go"}]}
+    )
+
+    assert session["tools"] == effective_tools
+    assert session[
+        "tool_schema_digest"
+    ] == process_integration.exact_tool_schema_digest(effective_tools)
+    assert completions.kwargs["tools"] == effective_tools
 
 
 def test_worker_loop_success_uses_authenticated_broker_and_non_streaming(tmp_path):
@@ -445,9 +524,13 @@ def test_nested_dispatch_records_only_digests_and_safe_public_attestation(
     frozen_entry = child._delegate_frozen_dispatch_entries[name]
     observed = []
     result_payload = {
+        "ok": True,
         "status": "completed",
         "private_output": {"api_key": "sk-tes...alue"},
         "broker_attestation": _valid_broker_attestation(),
+        "completion": {"result_hash": "b" * 64},
+        "execution_receipt_hash": "c" * 64,
+        "evidence": {"verified": True},
     }
     result_text = json.dumps(result_payload, indent=2)
 
@@ -467,7 +550,7 @@ def test_nested_dispatch_records_only_digests_and_safe_public_attestation(
         "agent.subagent_process_integration.registry.dispatch_snapshot", dispatch
     )
     arguments = {
-        **_valid_broker_arguments(),
+        **_valid_broker_arguments(tmp_path),
         "api_key": "«redacted:sk-…»",
         "task": "private delegated task",
     }
@@ -494,11 +577,19 @@ def test_nested_dispatch_records_only_digests_and_safe_public_attestation(
         result_payload["broker_attestation"]
     )
     assert set(claim.to_dict()) == {
+        "sequence",
         "tool_name",
         "arguments_sha256",
         "result_sha256",
         "public_attestation_json",
+        "launch_receipt_sha256",
+        "tool_schema_sha256",
     }
+    assert claim.sequence == 1
+    assert claim.launch_receipt_sha256 == _digest
+    assert claim.tool_schema_sha256 == process_integration.exact_tool_schema_digest(
+        child.tools
+    )
     persisted_claim = canonical_json(claim.to_dict())
     assert "private delegated task" not in persisted_claim
     assert "private-result-value" not in persisted_claim
@@ -506,6 +597,177 @@ def test_nested_dispatch_records_only_digests_and_safe_public_attestation(
     assert not hasattr(claim, "result_json")
     with pytest.raises(dataclasses.FrozenInstanceError):
         claim.tool_name = "changed"
+
+
+def test_host_run_claim_binds_candidate_launch_schema_and_attestation(
+    tmp_path, monkeypatch
+):
+    broker, old_adapter, child, _completions, digest = _fixture(tmp_path, [])
+    name = "scaffolde_evo_run"
+    child.tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+    ]
+    child._delegate_frozen_dispatch_entries = {name: object()}
+    adapter = ParentBrokerAdapter(
+        broker=broker, child=child, profile=old_adapter.profile, task="run attempt"
+    )
+    result_payload = {
+        "ok": True,
+        "broker_attestation": _valid_run_attestation(),
+        "completion": {"result_hash": "b" * 64},
+        "result": {
+            "experiment_id": "exp_1001",
+            "attempt_n": 1,
+            "status": "committed",
+            "exit_code": 0,
+        },
+        "execution_receipt_hash": "c" * 64,
+        "evidence": {"verified": True},
+    }
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: result_payload,
+    )
+    arguments = {
+        "workspace": str(tmp_path),
+        "experiment_id": "exp_1001",
+        "attempt_n": 1,
+        "timeout_seconds": 30,
+    }
+
+    response = adapter._dispatch(
+        "tool.execute",
+        {"id": "run-1", "name": name, "arguments": arguments},
+    )
+
+    assert response == {"result": result_payload}
+    claim = adapter.tool_execution_claims[0]
+    assert claim.sequence == 1
+    assert claim.tool_name == name
+    assert claim.launch_receipt_sha256 == digest
+    assert claim.tool_schema_sha256 == process_integration.exact_tool_schema_digest(
+        child.tools
+    )
+    assert claim.public_attestation_json == canonical_json(_valid_run_attestation())
+
+
+def test_brokered_claim_rejects_attestation_not_bound_to_host_completion(
+    tmp_path, monkeypatch
+):
+    name = "scaffolde_evo_agent_dispatch"
+    _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    attestation = _valid_broker_attestation()
+    attestation["completion"] = {
+        "result_hash": "f" * 64,
+        "execution_receipt_hash": "c" * 64,
+    }
+    result_payload = {
+        "ok": True,
+        "broker_attestation": attestation,
+        "completion": {"result_hash": "b" * 64},
+        "execution_receipt_hash": "c" * 64,
+        "evidence": {"verified": True},
+    }
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: result_payload,
+    )
+
+    with pytest.raises(ProcessIntegrationError, match="host completion"):
+        adapter._dispatch(
+            "tool.execute",
+            {
+                "id": "nested-1",
+                "name": name,
+                "arguments": _valid_broker_arguments(tmp_path),
+            },
+        )
+
+
+def test_brokered_dispatch_rejects_effective_tool_schema_drift(tmp_path, monkeypatch):
+    name = "scaffolde_evo_agent_dispatch"
+    _broker, adapter, child, _completions, _digest = _brokered_fixture(tmp_path)
+    child.tools[0]["function"]["parameters"]["properties"] = {
+        "forged": {"type": "string"}
+    }
+    dispatched = []
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: dispatched.append(True),
+    )
+
+    with pytest.raises(
+        ProcessIntegrationError, match="effective tool schema changed after launch"
+    ):
+        adapter._dispatch(
+            "tool.execute",
+            {
+                "id": "nested-1",
+                "name": name,
+                "arguments": _valid_broker_arguments(tmp_path),
+            },
+        )
+
+    assert dispatched == []
+    assert adapter.tool_execution_claims == ()
+
+
+def test_brokered_scaffolde_tool_rejects_cross_workspace_dispatch(
+    tmp_path, monkeypatch
+):
+    name = "scaffolde_evo_agent_dispatch"
+    _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    other_workspace = tmp_path.parent / "other-workspace"
+    other_workspace.mkdir()
+    dispatched = []
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        lambda *_args, **_kwargs: dispatched.append(True),
+    )
+    arguments = _valid_broker_arguments(tmp_path)
+    arguments["workspace"] = str(other_workspace)
+
+    with pytest.raises(
+        ProcessIntegrationError, match="does not match the profile workspace"
+    ):
+        adapter._dispatch(
+            "tool.execute",
+            {"id": "nested-1", "name": name, "arguments": arguments},
+        )
+
+    assert dispatched == []
+    assert adapter.tool_execution_claims == ()
+
+
+def test_brokered_scaffolde_tool_maps_exact_linux_strict_workspace_alias(
+    tmp_path, monkeypatch
+):
+    name = "scaffolde_evo_agent_dispatch"
+    _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
+    adapter.profile.execution_backend = "linux_strict"
+    dispatched = []
+
+    def dispatch(_snapshot, _name, arguments, **_kwargs):
+        dispatched.append(arguments["workspace"])
+        return {"ok": False, "error_code": "expected-stop", "error": "stop"}
+
+    monkeypatch.setattr(
+        "agent.subagent_process_integration.registry.dispatch_snapshot",
+        dispatch,
+    )
+    arguments = _valid_broker_arguments(tmp_path)
+    arguments["workspace"] = "/workspace"
+
+    response = adapter._dispatch(
+        "tool.execute",
+        {"id": "nested-1", "name": name, "arguments": arguments},
+    )
+
+    assert dispatched == [str(tmp_path.resolve())]
+    assert response["result"]["error_code"] == "expected-stop"
 
 
 def test_failed_nested_dispatch_returns_bounded_error_without_claim(
@@ -525,7 +787,11 @@ def test_failed_nested_dispatch_returns_bounded_error_without_claim(
 
     assert adapter._dispatch(
         "tool.execute",
-        {"id": "nested-1", "name": name, "arguments": _valid_broker_arguments()},
+        {
+            "id": "nested-1",
+            "name": name,
+            "arguments": _valid_broker_arguments(tmp_path),
+        },
     ) == {
         "result": {
             "ok": False,
@@ -555,7 +821,12 @@ def test_invalid_nested_arguments_reach_host_validation_without_a_claim(
         "agent.subagent_process_integration.registry.dispatch_snapshot",
         reject_invalid_arguments,
     )
-    arguments = {"role": "verifier", "experiment_id": "exp_1001", "phase": "post"}
+    arguments = {
+        "workspace": str(tmp_path),
+        "role": "verifier",
+        "experiment_id": "exp_1001",
+        "phase": "post",
+    }
 
     assert adapter._dispatch(
         "tool.execute",
@@ -626,7 +897,11 @@ def test_brokered_claim_rejects_missing_malformed_or_unsafe_attestation(
     with pytest.raises(ProcessIntegrationError, match=error):
         adapter._dispatch(
             "tool.execute",
-            {"id": "nested-1", "name": name, "arguments": _valid_broker_arguments()},
+            {
+                "id": "nested-1",
+                "name": name,
+                "arguments": _valid_broker_arguments(tmp_path),
+            },
         )
     assert adapter.tool_execution_claims == ()
 
@@ -644,7 +919,11 @@ def test_brokered_claim_rejects_oversized_arguments_before_execution(
     with pytest.raises(ProcessIntegrationError, match="exceeds its byte bound"):
         adapter._dispatch(
             "tool.execute",
-            {"id": "nested-1", "name": name, "arguments": {"task": "x" * 32}},
+            {
+                "id": "nested-1",
+                "name": name,
+                "arguments": {"workspace": str(tmp_path), "task": "x" * 32},
+            },
         )
     assert adapter.tool_execution_claims == ()
 
@@ -662,7 +941,11 @@ def test_brokered_claim_rejects_non_finite_json_numbers(tmp_path, monkeypatch, v
     with pytest.raises(ProcessIntegrationError, match="not canonical JSON"):
         argument_adapter._dispatch(
             "tool.execute",
-            {"id": "nested-1", "name": name, "arguments": {"score": value}},
+            {
+                "id": "nested-1",
+                "name": name,
+                "arguments": {"workspace": str(tmp_path), "score": value},
+            },
         )
     assert argument_adapter.tool_execution_claims == ()
 
@@ -678,7 +961,11 @@ def test_brokered_claim_rejects_non_finite_json_numbers(tmp_path, monkeypatch, v
     with pytest.raises(ProcessIntegrationError, match="not canonical JSON"):
         result_adapter._dispatch(
             "tool.execute",
-            {"id": "nested-1", "name": name, "arguments": _valid_broker_arguments()},
+            {
+                "id": "nested-1",
+                "name": name,
+                "arguments": _valid_broker_arguments(tmp_path),
+            },
         )
     assert result_adapter.tool_execution_claims == ()
 
@@ -701,7 +988,11 @@ def test_brokered_claim_rejects_oversized_result_and_public_attestation(
     with pytest.raises(ProcessIntegrationError, match="result exceeds its byte bound"):
         result_adapter._dispatch(
             "tool.execute",
-            {"id": "nested-1", "name": name, "arguments": _valid_broker_arguments()},
+            {
+                "id": "nested-1",
+                "name": name,
+                "arguments": _valid_broker_arguments(tmp_path),
+            },
         )
     assert result_adapter.tool_execution_claims == ()
 
@@ -714,7 +1005,7 @@ def test_brokered_claim_rejects_oversized_result_and_public_attestation(
     )
     monkeypatch.setattr(
         "agent.subagent_process_integration.registry.dispatch_snapshot",
-        lambda *_args, **_kwargs: {"broker_attestation": _valid_broker_attestation()},
+        lambda *_args, **_kwargs: _valid_broker_result(),
     )
 
     with pytest.raises(
@@ -722,7 +1013,11 @@ def test_brokered_claim_rejects_oversized_result_and_public_attestation(
     ):
         attestation_adapter._dispatch(
             "tool.execute",
-            {"id": "nested-1", "name": name, "arguments": _valid_broker_arguments()},
+            {
+                "id": "nested-1",
+                "name": name,
+                "arguments": _valid_broker_arguments(tmp_path),
+            },
         )
     assert attestation_adapter.tool_execution_claims == ()
 
@@ -734,7 +1029,7 @@ def test_brokered_public_attestation_enforces_canonical_schema_byte_bound(
     body = {
         "id": "nested-1",
         "name": name,
-        "arguments": _valid_broker_arguments(),
+        "arguments": _valid_broker_arguments(tmp_path),
     }
     exact_attestation = _valid_broker_attestation()
     exact_size = len(canonical_json(exact_attestation).encode())
@@ -744,7 +1039,7 @@ def test_brokered_public_attestation_enforces_canonical_schema_byte_bound(
     _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
     monkeypatch.setattr(
         "agent.subagent_process_integration.registry.dispatch_snapshot",
-        lambda *_args, **_kwargs: {"broker_attestation": exact_attestation},
+        lambda *_args, **_kwargs: _valid_broker_result(attestation=exact_attestation),
     )
 
     adapter._dispatch("tool.execute", body)
@@ -762,7 +1057,7 @@ def test_brokered_public_attestation_enforces_canonical_schema_byte_bound(
     )
     monkeypatch.setattr(
         "agent.subagent_process_integration.registry.dispatch_snapshot",
-        lambda *_args, **_kwargs: {"broker_attestation": exact_attestation},
+        lambda *_args, **_kwargs: _valid_broker_result(attestation=exact_attestation),
     )
 
     with pytest.raises(ProcessIntegrationError, match="exceeds its byte bound"):
@@ -775,15 +1070,12 @@ def test_brokered_claims_enforce_aggregate_byte_bound(tmp_path, monkeypatch):
     _broker, adapter, _child, _completions, _digest = _brokered_fixture(tmp_path)
     monkeypatch.setattr(
         "agent.subagent_process_integration.registry.dispatch_snapshot",
-        lambda *_args, **_kwargs: {
-            "summary": "bounded",
-            "broker_attestation": _valid_broker_attestation(),
-        },
+        lambda *_args, **_kwargs: _valid_broker_result(summary="bounded"),
     )
     body = {
         "id": "nested-1",
         "name": name,
-        "arguments": _valid_broker_arguments(),
+        "arguments": _valid_broker_arguments(tmp_path),
     }
     adapter._dispatch("tool.execute", body)
     first_claim = adapter.tool_execution_claims[0]
@@ -808,7 +1100,7 @@ def test_brokered_claim_count_reservation_is_race_safe(tmp_path, monkeypatch):
     def dispatch(*_args, **_kwargs):
         entered.set()
         assert release.wait(timeout=1)
-        return {"broker_attestation": _valid_broker_attestation()}
+        return _valid_broker_result()
 
     monkeypatch.setattr(
         "agent.subagent_process_integration.registry.dispatch_snapshot", dispatch
@@ -816,7 +1108,7 @@ def test_brokered_claim_count_reservation_is_race_safe(tmp_path, monkeypatch):
     body = {
         "id": "nested-1",
         "name": name,
-        "arguments": _valid_broker_arguments(),
+        "arguments": _valid_broker_arguments(tmp_path),
     }
 
     def invoke():
@@ -836,17 +1128,17 @@ def test_brokered_claim_count_reservation_is_race_safe(tmp_path, monkeypatch):
         thread.join(timeout=1)
 
     assert not thread.is_alive()
-    assert outcomes == [{"result": {"broker_attestation": _valid_broker_attestation()}}]
+    assert outcomes == [{"result": _valid_broker_result()}]
     assert len(adapter.tool_execution_claims) == 1
 
 
 def test_brokered_claim_aggregate_bound_is_race_safe(tmp_path, monkeypatch):
     name = "scaffolde_evo_agent_dispatch"
-    result = {"broker_attestation": _valid_broker_attestation()}
+    result = _valid_broker_result()
     body = {
         "id": "nested-1",
         "name": name,
-        "arguments": _valid_broker_arguments(),
+        "arguments": _valid_broker_arguments(tmp_path),
     }
     _broker, probe, _child, _completions, _digest = _brokered_fixture(tmp_path)
     monkeypatch.setattr(
@@ -933,7 +1225,7 @@ def test_parent_dispatch_error_returns_authenticated_rejection(tmp_path, monkeyp
         id="nested-error",
         function=SimpleNamespace(
             name=name,
-            arguments=json.dumps(_valid_broker_arguments()),
+            arguments=json.dumps(_valid_broker_arguments(tmp_path)),
         ),
     )
     responses = [

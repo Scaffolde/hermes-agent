@@ -85,7 +85,10 @@ def canonical_json(value: Any) -> str:
     """
     _assert_json_safe(value)
     return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
         allow_nan=False,
     )
 
@@ -120,9 +123,7 @@ def _sha256_hex(text: str) -> str:
 
 def _validate_operation_name(operation: Any) -> str:
     if not isinstance(operation, str) or not _OPERATION_RE.match(operation):
-        raise BrokerProtocolError(
-            "operation must match ^[a-z][a-z0-9._-]{0,127}$."
-        )
+        raise BrokerProtocolError("operation must match ^[a-z][a-z0-9._-]{0,127}$.")
     return operation
 
 
@@ -168,9 +169,7 @@ class BrokerGrant:
             or "\x00" in root
             or not os.path.isabs(root)
         ):
-            raise BrokerProtocolError(
-                "workspace_root must be an absolute path string."
-            )
+            raise BrokerProtocolError("workspace_root must be an absolute path string.")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -259,9 +258,7 @@ class BrokerEnvelopeSigner:
 class SubagentBroker:
     """Host-owned authenticated broker for one separate-process launch."""
 
-    def __init__(
-        self, *, launch_receipt_digest: str, grant: BrokerGrant
-    ) -> None:
+    def __init__(self, *, launch_receipt_digest: str, grant: BrokerGrant) -> None:
         self._launch_receipt_digest = _validate_launch_digest(
             launch_receipt_digest, "launch_receipt_digest"
         )
@@ -275,16 +272,14 @@ class SubagentBroker:
         self._closed = False
         self._revoked = False
         self._transcript = hashlib.sha256(
-            canonical_json(
-                {
-                    "broker_transcript_v1": {
-                        "capability_id": self._capability_id,
-                        "launch_receipt_digest": self._launch_receipt_digest,
-                        "workspace_root": grant.workspace_root,
-                        "operations": sorted(grant.operations),
-                    }
+            canonical_json({
+                "broker_transcript_v1": {
+                    "capability_id": self._capability_id,
+                    "launch_receipt_digest": self._launch_receipt_digest,
+                    "workspace_root": grant.workspace_root,
+                    "operations": sorted(grant.operations),
                 }
-            ).encode("utf-8")
+            }).encode("utf-8")
         )
 
     @property
@@ -294,6 +289,10 @@ class SubagentBroker:
     @property
     def grant(self) -> BrokerGrant:
         return self._grant
+
+    @property
+    def launch_receipt_digest(self) -> str:
+        return self._launch_receipt_digest
 
     @property
     def closed(self) -> bool:
@@ -360,9 +359,7 @@ class SubagentBroker:
                 self._reject_locked("capability-closed")
             if parsed["protocol_version"] != BROKER_PROTOCOL_VERSION:
                 self._reject_locked("protocol-version-mismatch")
-            if not hmac.compare_digest(
-                parsed["capability_id"], self._capability_id
-            ):
+            if not hmac.compare_digest(parsed["capability_id"], self._capability_id):
                 self._reject_locked("capability-mismatch")
             expected_mac = _envelope_mac(self._secret, parsed)
             if not hmac.compare_digest(parsed["mac"], expected_mac):
