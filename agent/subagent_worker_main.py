@@ -308,6 +308,29 @@ def _dispatch_local(
     )
 
 
+def _safe_tool_result_diagnostic(value: Any) -> dict[str, Any]:
+    payload = value
+    if isinstance(payload, str) and len(payload) <= 131_072:
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            payload = None
+    if not isinstance(payload, Mapping):
+        return {"outcome": "unknown"}
+    ok = payload.get("ok")
+    diagnostic: dict[str, Any] = {
+        "outcome": "ok" if ok is True else "error" if ok is False else "unknown"
+    }
+    error_code = payload.get("error_code")
+    if (
+        isinstance(error_code, str)
+        and 1 <= len(error_code) <= 64
+        and all(character.isalnum() or character in "_.-" for character in error_code)
+    ):
+        diagnostic["error_code"] = error_code
+    return diagnostic
+
+
 def run_worker_loop(
     channel: socket.socket,
     secret: bytes,
@@ -364,6 +387,7 @@ def run_worker_loop(
         {"role": "user", "content": session["task"]},
     ]
     seen_call_ids: set[str] = set()
+    diagnostic_tail: list[dict[str, Any]] = []
     for iteration in range(limit):
         completion = _broker_call(
             channel,
@@ -440,6 +464,12 @@ def run_worker_loop(
             ):
                 raise BrokerFrameError("tool result is malformed")
             tool_content = result["result"]
+            diagnostic_tail.append({
+                "iteration": iteration + 1,
+                "tool_name": name,
+                **_safe_tool_result_diagnostic(tool_content),
+            })
+            diagnostic_tail[:] = diagnostic_tail[-8:]
             if not isinstance(tool_content, str):
                 tool_content = json.dumps(
                     tool_content,
@@ -453,7 +483,14 @@ def run_worker_loop(
                 "tool_call_id": call_id,
                 "content": tool_content,
             })
-    raise BrokerFrameError("worker iteration bound exhausted")
+    trace = json.dumps(
+        diagnostic_tail,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    raise BrokerFrameError(f"worker iteration bound exhausted; tool_trace={trace}")
 
 
 def _default_handler(request: Mapping[str, Any]) -> Mapping[str, Any]:

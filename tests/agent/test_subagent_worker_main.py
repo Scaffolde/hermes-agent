@@ -170,3 +170,74 @@ def test_cgroup_launcher_parser_preserves_bwrap_separator(monkeypatch):
         "--capability-fd",
         "8",
     ]
+
+
+def test_iteration_exhaustion_reports_safe_bounded_tool_trace(monkeypatch):
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "scaffolde_evo_run",
+            "description": "Run one attempt",
+            "parameters": {"type": "object"},
+        },
+    }
+    session = {
+        "protocol": "protocol",
+        "task": "task",
+        "tools": [tool],
+        "tool_schema_digest": worker_main_module.exact_tool_schema_digest([tool]),
+        "local_tool_names": [],
+        "brokered_tool_names": ["scaffolde_evo_run"],
+        "model": "test-model",
+        "max_iterations": 2,
+    }
+    model_calls = 0
+
+    def fake_broker_call(_channel, _secret, _signer, operation, _body):
+        nonlocal model_calls
+        if operation == "session.start":
+            return session
+        if operation == "model.complete":
+            model_calls += 1
+            return {
+                "finish_reason": "tool_calls",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": f"call-{model_calls}",
+                        "name": "scaffolde_evo_run",
+                        "arguments": {
+                            "workspace": "/secret/workspace",
+                            "token": "DO_NOT_LEAK_ARGUMENT",
+                        },
+                    }
+                ],
+            }
+        assert operation == "tool.execute"
+        return {
+            "result": json.dumps({
+                "ok": False,
+                "error_code": "evo_run_failed",
+                "error": "DO_NOT_LEAK_RESULT",
+            })
+        }
+
+    monkeypatch.setattr(worker_main_module, "_broker_call", fake_broker_call)
+
+    with socket.socket() as channel:
+        with pytest.raises(BrokerFrameError) as caught:
+            worker_main_module.run_worker_loop(
+                channel,
+                SECRET,
+                capability_id="capability",
+                launch_receipt_digest="a" * 64,
+            )
+
+    message = str(caught.value)
+    assert "worker iteration bound exhausted" in message
+    assert '"iteration":2' in message
+    assert '"tool_name":"scaffolde_evo_run"' in message
+    assert '"error_code":"evo_run_failed"' in message
+    assert "DO_NOT_LEAK_ARGUMENT" not in message
+    assert "/secret/workspace" not in message
+    assert "DO_NOT_LEAK_RESULT" not in message

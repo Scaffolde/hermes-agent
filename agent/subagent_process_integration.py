@@ -51,6 +51,16 @@ _MAX_RESERVED_CLAIM_BYTES = 24 * 1024
 _MAX_SCOPED_READ_FILE_BYTES = 16 * 1024 * 1024
 _MAX_SCOPED_READ_OUTPUT_CHARS = 100_000
 _DEFAULT_CANCELLATION_QUIESCE_SECONDS = 0.5
+_STRICT_EVO_SYSTEM_COMMANDS = (
+    "git",
+    "sh",
+    "bash",
+    "env",
+    "mktemp",
+    "awk",
+    "grep",
+    "mv",
+)
 _SENSITIVE_CLAIM_KEYS = frozenset({
     "access_token",
     "api_key",
@@ -895,7 +905,7 @@ def strict_worker_runtime_mounts(
                 RuntimeMount(source=target.resolve(strict=True), target=target),
             )
     if expose_scaffolde_evo_run:
-        for command in ("git", "sh", "bash", "env"):
+        for command in _STRICT_EVO_SYSTEM_COMMANDS:
             executable = shutil.which(command)
             if executable is None:
                 raise ProcessIntegrationError(
@@ -949,7 +959,7 @@ def strict_worker_runtime_path(*, expose_scaffolde_evo_run: bool = False) -> str
     """Return a narrow PATH matching host-declared strict runtime mounts."""
     directories = {str(Path(sys.executable).resolve(strict=True).parent)}
     if expose_scaffolde_evo_run:
-        for command in ("evo", "git", "sh", "bash", "env"):
+        for command in ("evo", *_STRICT_EVO_SYSTEM_COMMANDS):
             executable = shutil.which(command)
             if executable is None:
                 raise ProcessIntegrationError(

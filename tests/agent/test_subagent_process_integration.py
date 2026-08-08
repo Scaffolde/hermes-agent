@@ -1637,6 +1637,9 @@ def test_strict_evo_profile_mounts_declared_cli_and_system_utilities_only():
     git = Path(shutil.which("git") or "").resolve(strict=True)
     assert any(evo == source or evo.is_relative_to(source) for source in sources)
     assert git in sources
+    for utility in ("mktemp", "awk", "grep", "mv"):
+        executable = Path(shutil.which(utility) or "").resolve(strict=True)
+        assert executable in sources
     assert Path("/") not in targets
     assert Path("/usr/bin") not in targets
     environment = {"PATH": strict_worker_runtime_path(expose_scaffolde_evo_run=True)}
