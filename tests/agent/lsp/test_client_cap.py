@@ -10,6 +10,7 @@ bounds the population itself.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Optional, Tuple
 
 import pytest
@@ -53,6 +54,47 @@ def make_service(max_clients: Optional[int] = None, idle_timeout: float = 600.0)
         idle_timeout=idle_timeout,
         max_clients=max_clients,
     )
+
+
+@pytest.fixture
+def running_service():
+    """Build services with a REAL background loop, and stop them after.
+
+    ``make_service`` uses ``enabled=False``, which never starts the
+    loop — fine for driving the eviction coroutines by hand, useless
+    for the release path, whose whole point is that nothing hand-cranks
+    it.  These tests must go through the production scheduling path.
+    """
+    services = []
+
+    def _make(max_clients: Optional[int] = None, idle_timeout: float = 0.0) -> LSPService:
+        svc = LSPService(
+            enabled=True,
+            wait_mode="document",
+            wait_timeout=1.0,
+            install_strategy="manual",
+            idle_timeout=idle_timeout,
+            max_clients=max_clients,
+        )
+        services.append(svc)
+        return svc
+
+    yield _make
+
+    for svc in services:
+        svc._loop.stop()
+
+
+def drain_to(svc: LSPService, expected: int, timeout: float = 5.0) -> None:
+    """Block until the fleet reaches *expected* clients, or give up.
+
+    Polls rather than sleeping a fixed interval so a slow machine does
+    not turn a correct fix into a flake, and a broken one still fails
+    within the budget instead of hanging the suite.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and len(svc._clients) != expected:
+        time.sleep(0.01)
 
 
 def seed(svc: LSPService, *specs: Tuple[str, float]) -> dict:
@@ -198,6 +240,93 @@ def test_release_makes_a_client_evictable_again():
     evicted = asyncio.run(svc._enforce_cap_async())
 
     assert evicted == [key]
+
+
+# ----------------------------------------------------------------------
+# the escape hatch closes itself: release re-enforces
+# ----------------------------------------------------------------------
+
+
+def test_release_drains_the_overage_with_nothing_hand_cranking_it(running_service):
+    """The all-busy break leaves the fleet over cap.  Nothing else closes it.
+
+    ``idle_timeout=0`` is a documented setting for keeping indexes
+    warm, and it disables the reaper outright — so the reaper cannot be
+    the backstop the break comment assumes.  The spawn path only runs
+    on the next spawn, which a saturated burst may never issue.  This
+    asserts the fleet returns to the cap on releases alone, with no
+    ``enforce_cap_now()`` anywhere: that hand-crank is what let
+    ``test_release_makes_a_client_evictable_again`` pass while the
+    production lifecycle stayed broken.
+    """
+    svc = running_service(max_clients=2, idle_timeout=0.0)
+    seed(svc, ("/a", 100.0), ("/b", 200.0), ("/c", 300.0), ("/d", 400.0))
+    keys = [("pyright", root) for root in ("/a", "/b", "/c", "/d")]
+    for key in keys:
+        svc._acquire(key)
+
+    # Precondition: this is the escape hatch, not a quiet no-op.
+    assert svc._loop.run(svc._enforce_cap_async(), timeout=5.0) == []
+    assert len(svc._clients) == 4
+
+    for key in keys:
+        svc._release(key)
+
+    drain_to(svc, 2)
+
+    assert set(svc._clients) == {("pyright", "/c"), ("pyright", "/d")}
+
+
+def test_release_triggered_sweep_still_refuses_to_evict_a_busy_client(running_service):
+    """The anti-criterion, re-asserted on the new path.
+
+    Closing the hatch must not be done by reaping mid-request: that
+    times out the outer diagnostics wait and marks the workspace broken
+    for the process lifetime.
+    """
+    svc = running_service(max_clients=1, idle_timeout=0.0)
+    seed(svc, ("/busy", 100.0), ("/done", 200.0))
+    busy = ("pyright", "/busy")
+    done = ("pyright", "/done")
+    svc._acquire(busy)
+    svc._acquire(done)
+
+    svc._release(done)
+    drain_to(svc, 1)
+
+    assert set(svc._clients) == {busy}
+
+
+def test_release_under_the_cap_schedules_no_sweep(monkeypatch):
+    """Every request ends in a release; only the over-cap ones may pay."""
+    svc = make_service(max_clients=4)
+    seed(svc, ("/a", 100.0), ("/b", 200.0))
+    calls = []
+    monkeypatch.setattr(svc, "_schedule_cap_enforcement", lambda: calls.append(1))
+    key = ("pyright", "/a")
+
+    svc._acquire(key)
+    svc._release(key)
+
+    assert calls == []
+
+
+def test_partial_release_of_a_shared_client_schedules_no_sweep(monkeypatch):
+    """A client with a second request still in flight is not evictable,
+    so sweeping on the first release is pure churn."""
+    svc = make_service(max_clients=1)
+    seed(svc, ("/shared", 100.0), ("/other", 200.0))
+    calls = []
+    monkeypatch.setattr(svc, "_schedule_cap_enforcement", lambda: calls.append(1))
+    key = ("pyright", "/shared")
+
+    svc._acquire(key)
+    svc._acquire(key)
+    svc._release(key)
+    assert calls == []
+
+    svc._release(key)
+    assert calls == [1]
 
 
 def test_inflight_is_refcounted_for_concurrent_requests():

@@ -40,6 +40,7 @@ import math
 import os
 import threading
 import time
+from concurrent.futures import Future
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.lsp import eventlog
@@ -183,6 +184,20 @@ def resolve_max_clients(raw: Any) -> int:
     return max(MIN_CLIENT_CAP, min(MAX_CLIENT_CAP, int(parsed)))
 
 
+def _log_cap_enforcement_result(fut: Future) -> None:
+    """Drain a fire-and-forget cap sweep so its failure is not silent.
+
+    Nobody calls ``.result()`` on a detached enforcement future, so an
+    exception inside the sweep would otherwise vanish — and a silently
+    dead sweep is exactly the failure mode this whole path exists to
+    close.  Never re-raises: this runs on the loop thread.
+    """
+    try:
+        fut.result()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("detached LSP cap enforcement failed: %s", e)
+
+
 class _BackgroundLoop:
     """A daemon thread that owns one asyncio event loop.
 
@@ -237,6 +252,23 @@ class _BackgroundLoop:
         except Exception:
             fut.cancel()
             raise
+
+    def schedule(self, coro) -> Optional[Future]:
+        """Submit a coroutine to the loop and return immediately.
+
+        Fire-and-forget counterpart to :meth:`run`: the caller is not
+        charged for the coroutine's runtime.  Returns the
+        :class:`concurrent.futures.Future` so callers can attach a
+        done-callback, or ``None`` when the loop is not running (the
+        coroutine is closed rather than leaked).
+        """
+        from agent.async_utils import safe_schedule_threadsafe
+        return safe_schedule_threadsafe(
+            coro,
+            self._loop,
+            logger=logger,
+            log_message="Failed to schedule LSP coroutine",
+        )
 
     def stop(self) -> None:
         loop = self._loop
@@ -792,8 +824,44 @@ class LSPService:
             remaining = self._inflight.get(key, 0) - 1
             if remaining > 0:
                 self._inflight[key] = remaining
-            else:
-                self._inflight.pop(key, None)
+                return
+            self._inflight.pop(key, None)
+            # This release may have produced the first evictable client
+            # since ``_enforce_cap_async`` broke out over the cap with
+            # everything busy.  Nothing else closes that escape hatch:
+            # the spawn path only runs on the next spawn, and the idle
+            # reaper is disabled outright at ``idle_timeout: 0`` — a
+            # supported setting for keeping indexes warm.  Without this,
+            # "briefly over the cap" becomes "over the cap forever",
+            # which is the population blow-up the cap exists to bound.
+            over_cap = self._overage_locked() > 0
+        if not over_cap:
+            return
+        self._schedule_cap_enforcement()
+
+    def _overage_locked(self) -> int:
+        """How far the fleet is over the cap.  Caller holds ``_state_lock``.
+
+        Counts keys reserved in ``_spawning`` but not yet in
+        ``_clients`` — a server that is about to exist occupies its
+        slot, matching :meth:`_enforce_cap_async`.
+        """
+        pending = sum(1 for k in self._spawning if k not in self._clients)
+        return len(self._clients) + pending - self._max_clients
+
+    def _schedule_cap_enforcement(self) -> None:
+        """Re-run cap enforcement on the background loop, fire-and-forget.
+
+        Deliberately not awaited: the request that just finished must
+        not be charged for a victim's shutdown.  Making the releasing
+        caller wait would push the eviction cost into the diagnostics
+        timeout budget it is trying to leave.
+        """
+        if not self._enabled:
+            return
+        fut = self._loop.schedule(self._enforce_cap_async())
+        if fut is not None:
+            fut.add_done_callback(_log_cap_enforcement_result)
 
     def _evictable(self) -> List[Tuple[Tuple[str, str], float]]:
         """(key, last_used) for clients with no outstanding request,
@@ -847,8 +915,7 @@ class LSPService:
         evicted: List[Tuple[str, str]] = []
         while True:
             with self._state_lock:
-                pending = sum(1 for k in self._spawning if k not in self._clients)
-                overage = len(self._clients) + pending - self._max_clients
+                overage = self._overage_locked()
             if overage <= 0:
                 break
             victim = next(
@@ -858,7 +925,11 @@ class LSPService:
             if victim is None:
                 # Everything left is in-flight or protected.  Going over
                 # the cap briefly is the right trade against killing a
-                # live request; the next idle sweep collects the slack.
+                # live request.  ``_release`` re-runs this sweep the
+                # moment the first of them goes idle, so "briefly" is
+                # enforced rather than hoped for — the idle reaper is
+                # not the backstop here, and at ``idle_timeout: 0`` it
+                # does not run at all.
                 logger.debug(
                     "LSP cap %d exceeded by %d but all clients are busy",
                     self._max_clients,
