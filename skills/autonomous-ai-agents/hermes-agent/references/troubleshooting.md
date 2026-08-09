@@ -51,3 +51,4 @@ hermes config set auxiliary.vision.model <model_name>
 
 ### "Reset permissions" / auto-approving everything
 See `references/security-privacy.md` — wipe the "Always allow" stores, don't touch yolo mode.
+

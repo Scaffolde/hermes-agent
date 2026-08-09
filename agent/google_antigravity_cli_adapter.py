@@ -98,7 +98,7 @@ class _AntigravityCompletions:
         prompt = build_prompt_from_messages(messages)
         if not prompt:
             raise AntigravityCLIError("Antigravity CLI request had no text prompt")
-        content = self._client.complete(prompt)
+        content = self._client.complete(prompt, timeout=kwargs.get("timeout"))
         return _completion_response(content, model)
 
 
@@ -119,6 +119,7 @@ class GoogleAntigravityCLIClient:
         api_key: str = "google-antigravity-cli",
         model: str = DEFAULT_ANTIGRAVITY_MODEL,
         print_timeout: str = DEFAULT_PRINT_TIMEOUT,
+        subprocess_timeout: float = 330.0,
     ) -> None:
         self.command = command
         self.args = list(args or [])
@@ -126,10 +127,17 @@ class GoogleAntigravityCLIClient:
         self.api_key = api_key
         self.model = model
         self.print_timeout = print_timeout
+        self.subprocess_timeout = subprocess_timeout
         self.chat = _AntigravityChat(self)
 
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str, *, timeout: Any = None) -> str:
         cmd = [self.command, *self.args, "-p", prompt, "--print-timeout", self.print_timeout]
+        effective_timeout = self.subprocess_timeout
+        if timeout is not None:
+            try:
+                effective_timeout = min(effective_timeout, float(timeout))
+            except (TypeError, ValueError):
+                pass
         try:
             proc = subprocess.run(
                 cmd,
@@ -137,10 +145,15 @@ class GoogleAntigravityCLIClient:
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                timeout=effective_timeout,
             )
         except FileNotFoundError as exc:
             raise AntigravityCLIError(
                 f"Antigravity CLI command not found: {self.command!r}"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise AntigravityCLIError(
+                f"Antigravity CLI timed out after {effective_timeout:g}s"
             ) from exc
         except Exception as exc:
             raise AntigravityCLIError(

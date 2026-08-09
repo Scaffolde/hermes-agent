@@ -45,12 +45,12 @@ def _descriptor(home: Path, *, runner: Path | None = None, risk="read", extra=No
     runner_arg = str(runner)
     desc = {
         "version": 1,
-        "id": "scaffolde.gmail.pai",
+        "id": "scaffolde.gmail",
         "tool_name": "scaffolde_gmail",
         "authority": "scaffolde",
         "kind": "gmail",
-        "description": "Canonical Scaffolde Gmail capability for PAI account email.",
-        "triggers": ["pai gmail", "scaffolde gmail", "email sarah"],
+        "description": "Canonical Scaffolde Gmail capability.",
+        "triggers": ["scaffolde gmail", "email sarah"],
         "entrypoint": {
             "command": "bun",
             "args": [runner_arg],
@@ -126,7 +126,7 @@ def test_loader_reports_absent_valid_malformed_and_degraded_status(hermes_home):
     _write_registry(hermes_home, _descriptor(hermes_home))
     valid = load_capability_registry()
     assert valid.status == "valid"
-    assert list(valid.capabilities) == ["scaffolde.gmail.pai"]
+    assert list(valid.capabilities) == ["scaffolde.gmail"]
 
     (hermes_home / "scaffolde" / "capabilities.json").write_text("{not-json", encoding="utf-8")
     malformed = load_capability_registry()
@@ -138,6 +138,19 @@ def test_loader_reports_absent_valid_malformed_and_degraded_status(hermes_home):
     assert degraded.status == "degraded"
     assert degraded.capabilities == {}
     assert degraded.errors[0]["code"] == "capability_schema"
+
+
+def test_registry_rejects_the_retired_gmail_capability_identity(hermes_home):
+    from tools.scaffolde_capabilities import load_capability_registry
+
+    retired = _descriptor(hermes_home)
+    retired["id"] = "scaffolde.gmail.pai"
+    _write_registry(hermes_home, retired)
+
+    registry = load_capability_registry()
+    assert registry.status == "degraded"
+    assert "scaffolde.gmail.pai" not in registry.capabilities
+    assert any(error["code"] == "retired_capability" for error in registry.errors)
 
 
 def test_schema_path_and_secret_rejection_fail_closed(hermes_home):
@@ -225,17 +238,34 @@ def test_native_tool_visible_in_default_schema_even_without_valid_registry(herme
     assert "scaffolde_capability" in names
 
 
+def test_tool_contract_advertises_only_the_canonical_gmail_identity(hermes_home):
+    from tools.scaffolde_capability_tool import SCAFFOLDE_CAPABILITY_SCHEMA
+
+    schema = json.dumps(SCAFFOLDE_CAPABILITY_SCHEMA)
+    assert "scaffolde.gmail" in schema
+    assert "scaffolde.gmail.pai" not in schema
+
+    _write_registry(hermes_home, _descriptor(hermes_home))
+    result = _call_tool(
+        action="invoke",
+        capability_id="scaffolde.gmail.pai",
+        operation="search",
+        arguments={"query": "Sarah"},
+    )
+    assert result["error_type"] == "unknown_capability"
+
+
 def test_argument_validation_no_shell_and_env_allowlist_for_read_operation(hermes_home, monkeypatch):
     runner = _write_fake_runner(hermes_home)
     _write_registry(hermes_home, _descriptor(hermes_home, runner=runner))
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/tmp/should-not-leak")
     monkeypatch.setenv("SECRET_TOKEN", "should-not-inherit")
 
-    extra = _call_tool(action="invoke", capability_id="scaffolde.gmail.pai", operation="search", arguments={"query": "Sarah; touch /tmp/pwned", "limit": 2, "extra": "nope"})
+    extra = _call_tool(action="invoke", capability_id="scaffolde.gmail", operation="search", arguments={"query": "Sarah; touch /tmp/pwned", "limit": 2, "extra": "nope"})
     assert extra["status"] == "error"
     assert extra["error_type"] == "invalid_arguments"
 
-    result = _call_tool(action="invoke", capability_id="scaffolde.gmail.pai", operation="search", arguments={"query": "Sarah; touch /tmp/pwned", "limit": 2})
+    result = _call_tool(action="invoke", capability_id="scaffolde.gmail", operation="search", arguments={"query": "Sarah; touch /tmp/pwned", "limit": 2})
     assert result["status"] == "ok"
     child = json.loads(result["stdout"])
     assert child["argv"] == ["search", "--query", "Sarah; touch /tmp/pwned", "--limit", "2", "--untrusted-literal", "Sarah; touch /tmp/pwned"]
@@ -258,14 +288,14 @@ def test_write_operations_are_approval_gated(hermes_home, monkeypatch, operation
         return {"approved": False, "message": "denied"}
 
     monkeypatch.setattr("tools.approval.request_tool_approval", deny)
-    result = _call_tool(action="invoke", capability_id="scaffolde.gmail.pai", operation=operation, arguments={})
+    result = _call_tool(action="invoke", capability_id="scaffolde.gmail", operation=operation, arguments={})
     assert result["status"] == "error"
     assert result["error_type"] == "approval_required"
     assert len(calls) == 1
     assert calls[0][0] == "scaffolde_capability"
     assert operation in calls[0][1]
     assert "Arguments: {}" in calls[0][1]
-    assert calls[0][2].startswith(f"scaffolde:scaffolde.gmail.pai:{operation}:")
+    assert calls[0][2].startswith(f"scaffolde:scaffolde.gmail:{operation}:")
     assert len(calls[0][2].rsplit(":", 1)[1]) == 12
 
 
@@ -288,7 +318,7 @@ def test_long_write_payload_uses_exact_temporary_preview(hermes_home, monkeypatc
     body = "full-body-" * 300
     result = _call_tool(
         action="invoke",
-        capability_id="scaffolde.gmail.pai",
+        capability_id="scaffolde.gmail",
         operation="send",
         arguments={"to": "person@example.com", "body": body},
     )
@@ -296,7 +326,7 @@ def test_long_write_payload_uses_exact_temporary_preview(hermes_home, monkeypatc
     assert observed["payload"]["body"] == body
     assert observed["mode"] == 0o600
     assert "Exact payload SHA256=" in observed["reason"]
-    assert observed["rule_key"].startswith("scaffolde:scaffolde.gmail.pai:send:")
+    assert observed["rule_key"].startswith("scaffolde:scaffolde.gmail:send:")
     assert not observed["path"].exists()
 
 
@@ -315,8 +345,8 @@ def test_prompt_routing_block_precedes_skill_guidance(hermes_home):
 
     prompt = build_scaffolde_capabilities_prompt({"scaffolde_capability", "skill_view"})
     assert "Available Scaffolde capabilities" in prompt
-    assert "explicit user override > matching Scaffolde authority/account > generic skills" in prompt
-    assert "scaffolde.gmail.pai" in prompt
+    assert "explicit user override > matching Scaffolde authority > generic skills" in prompt
+    assert "scaffolde.gmail" in prompt
     assert "capability_degraded" in prompt
 
 
@@ -327,7 +357,7 @@ def test_incident_regression_fake_scaffolde_gmail_succeeds_without_generic_invoc
         encoding="utf-8",
     )
     _write_registry(hermes_home, _descriptor(hermes_home, runner=runner))
-    result = _call_tool(action="invoke", capability_id="scaffolde.gmail.pai", operation="search", arguments={"query": "Sarah", "limit": 1})
+    result = _call_tool(action="invoke", capability_id="scaffolde.gmail", operation="search", arguments={"query": "Sarah", "limit": 1})
     assert result["status"] == "ok"
     assert json.loads(result["stdout"])["from"] == "Sarah"
     assert json.loads(result["stdout"])["generic_invoked"] is False
@@ -338,13 +368,13 @@ def test_runtime_failures_are_capability_degraded(hermes_home):
 
     failing = _write_fake_runner(hermes_home, exit_code=9)
     _write_registry(hermes_home, _descriptor(hermes_home, runner=failing))
-    failed = invoke_capability("scaffolde.gmail.pai", "search", {"query": "Sarah", "limit": 1})
+    failed = invoke_capability("scaffolde.gmail", "search", {"query": "Sarah", "limit": 1})
     assert failed["status"] == "capability_degraded"
     assert failed["error_type"] == "nonzero_exit"
 
     slow = hermes_home / "slow.ts"
     slow.write_text("import time\ntime.sleep(5)\n", encoding="utf-8")
     _write_registry(hermes_home, _descriptor(hermes_home, runner=slow))
-    timed_out = invoke_capability("scaffolde.gmail.pai", "search", {"query": "Sarah", "limit": 1}, timeout=1)
+    timed_out = invoke_capability("scaffolde.gmail", "search", {"query": "Sarah", "limit": 1}, timeout=1)
     assert timed_out["status"] == "capability_degraded"
     assert timed_out["error_type"] == "timeout"

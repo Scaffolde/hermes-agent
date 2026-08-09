@@ -15,7 +15,7 @@ def build_scaffolde_capabilities_prompt(valid_tool_names: Iterable[str]) -> str:
         return ""
     lines = [
         "# Available Scaffolde capabilities",
-        "Use the native `scaffolde_capability` tool for Scaffolde-owned capabilities and PAI accounts. Routing precedence: explicit user override > matching Scaffolde authority/account > generic skills.",
+        "Use the native `scaffolde_capability` tool for declared Scaffolde-owned capabilities. Routing precedence: explicit user override > matching Scaffolde authority > generic skills.",
         "If a declared capability fails, describe it as `capability_degraded` rather than claiming the mailbox/service is unavailable.",
     ]
     for cap in registry.capabilities.values():

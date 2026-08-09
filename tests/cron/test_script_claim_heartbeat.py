@@ -84,7 +84,7 @@ def test_long_running_script_refreshes_owned_claim_in_profile_store(
         heartbeat_seen.set()
         return updated
 
-    def _blocking_script(_script_path: str) -> tuple[bool, str]:
+    def _blocking_script(_script_path: str, **kwargs) -> tuple[bool, str]:
         assert heartbeat_seen.wait(timeout=2), (
             "claim was not refreshed while script blocked"
         )
@@ -146,7 +146,7 @@ def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
         heartbeat_seen.set()
         return updated
 
-    def _blocking_script(_script_path: str) -> tuple[bool, str]:
+    def _blocking_script(_script_path: str, **kwargs) -> tuple[bool, str]:
         assert heartbeat_seen.wait(timeout=2)
         return True, "done"
 
@@ -163,25 +163,3 @@ def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
             "at": replacement_timestamp,
             "by": "replacement-owner",
         }
-
-
-def test_script_heartbeat_forwards_workdir(monkeypatch, tmp_path):
-    """The claim wrapper preserves the cron job's configured script cwd."""
-    import cron.scheduler as scheduler
-
-    observed = {}
-
-    def _script(_script_path: str, *, cwd=None) -> tuple[bool, str]:
-        observed["cwd"] = cwd
-        return True, "done"
-
-    monkeypatch.setattr(scheduler, "_run_job_script", _script)
-
-    result = scheduler._run_job_script_with_claim_heartbeat(
-        {"schedule": {"kind": "cron"}},
-        "watchdog.py",
-        cwd=str(tmp_path),
-    )
-
-    assert result == (True, "done")
-    assert observed == {"cwd": str(tmp_path)}

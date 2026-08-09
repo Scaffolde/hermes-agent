@@ -39,7 +39,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
-from hermes_cli import profiles as profiles_mod
 
 from utils import env_int
 
@@ -140,41 +139,6 @@ def _profile_author() -> str:
     )
 
 
-def _load_config() -> dict:
-    try:
-        from hermes_cli.config import load_config
-        return load_config() or {}
-    except Exception:
-        return {}
-
-
-def _resolve_default_assignee(cfg: dict) -> Optional[str]:
-    """Resolve the worker profile for specify-style single-task promotion.
-
-    The specifier is the fallback path for triage items that do not fan out.
-    Before this helper, that path could produce ``ready`` tasks with
-    ``assignee=None``; the dispatcher then correctly skipped them forever.
-    Prefer ``kanban.default_assignee`` when it names an installed profile,
-    otherwise use the active profile. Return ``None`` only when no valid
-    profile can be resolved, preserving existing behaviour for broken setups.
-    """
-    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    explicit = (kanban_cfg.get("default_assignee") or "").strip()
-    if explicit:
-        try:
-            if profiles_mod.profile_exists(explicit):
-                return explicit
-        except Exception:
-            pass
-    try:
-        active = profiles_mod.get_active_profile_name() or "default"
-        if profiles_mod.profile_exists(active):
-            return active
-    except Exception:
-        return None
-    return None
-
-
 def specify_task(
     task_id: str,
     *,
@@ -196,9 +160,6 @@ def specify_task(
         return SpecifyOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
-
-    cfg = _load_config()
-    assignee_val = None if task.assignee else _resolve_default_assignee(cfg)
 
     try:
         from agent.auxiliary_client import call_llm
@@ -277,7 +238,6 @@ def specify_task(
             task_id,
             title=new_title,
             body=new_body,
-            assignee=assignee_val,
             author=author or _profile_author(),
         )
     if not ok:

@@ -1,17 +1,22 @@
 /**
- * Regression tests for electron/native-auth-decisions.ts — the three pure
- * decision seams behind the RFC 8252 native-app auth flow, each of which was a
- * real runtime bug that the mocked flow tests could not catch.
+ * Regression tests for electron/native-auth-decisions.ts — the pure decision
+ * seams behind the RFC 8252 native-app auth flow, each of which was a real
+ * runtime bug that the mocked flow tests could not catch.
  *
  * Run via the vitest `electron` project (electron/**\/*.test.ts).
  */
 
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
 
 import { test } from 'vitest'
 
-import { oauthSessionIsLive, resolveJsonBody, resolveOauthRestAuth } from './native-auth-decisions'
+import {
+  oauthGuardMayHardFail,
+  oauthSessionIsLive,
+  resolveJsonBody,
+  resolveOauthRestAuth,
+  resolveReadinessProbeAuth
+} from './native-auth-decisions'
 
 // --- 1. body encoding (guards the double-JSON.stringify 422) ---
 
@@ -68,14 +73,60 @@ test('resolveOauthRestAuth falls back to cookie when there is no native token', 
   assert.deepEqual(resolveOauthRestAuth(''), { kind: 'cookie' })
 })
 
-test('native refresh outages propagate instead of silently selecting cookie fallback', () => {
-  const mainSource = readFileSync(new URL('./main.ts', import.meta.url), 'utf8')
-  const nativeTokenCalls = mainSource.match(/await ensureNativeAccessToken\([^)]*\)/g) ?? []
+// --- 4. readiness-probe auth (guards the credential-free 401 boot loop) ---
 
-  assert.ok(nativeTokenCalls.length >= 3, 'expected every native-token request seam to remain covered')
-  assert.doesNotMatch(
-    mainSource,
-    /ensureNativeAccessToken\([^)]*\)\.catch\(\(\) => null\)/,
-    'only an explicit null result may select cookie fallback; refresh errors must propagate'
+test('resolveReadinessProbeAuth reuses the oauth bearer-vs-cookie choice', () => {
+  assert.deepEqual(resolveReadinessProbeAuth('oauth', 'native-at'), { kind: 'bearer', token: 'native-at' })
+  assert.deepEqual(resolveReadinessProbeAuth('oauth', null), { kind: 'cookie' })
+  assert.deepEqual(resolveReadinessProbeAuth('oauth', ''), { kind: 'cookie' })
+})
+
+test('resolveReadinessProbeAuth sends the session token for a token gateway', () => {
+  assert.deepEqual(resolveReadinessProbeAuth('token', null, 'session-token'), {
+    kind: 'token',
+    token: 'session-token'
+  })
+  assert.deepEqual(resolveReadinessProbeAuth('token', null, null), { kind: 'token', token: null })
+})
+
+test('resolveReadinessProbeAuth stays public for local and unknown modes', () => {
+  // A loopback backend has no gate; sending credentials it never issued is
+  // meaningless, and an unknown mode must not invent a credential.
+  assert.deepEqual(resolveReadinessProbeAuth('local', 'native-at', 'session-token'), { kind: 'public' })
+  assert.deepEqual(resolveReadinessProbeAuth(undefined, 'native-at', 'session-token'), { kind: 'public' })
+  assert.deepEqual(resolveReadinessProbeAuth('something-new', null, null), { kind: 'public' })
+})
+
+// --- 5. oauth guard vs password gateways (guards the false "not signed in") ---
+
+test('oauthGuardMayHardFail is false only when EVERY provider is password-based', () => {
+  assert.equal(oauthGuardMayHardFail([{ name: 'basic', supportsPassword: true }]), false)
+  assert.equal(
+    oauthGuardMayHardFail([
+      { name: 'basic', supportsPassword: true },
+      { name: 'ldap', supportsPassword: true }
+    ]),
+    false
   )
+})
+
+test('oauthGuardMayHardFail keeps the strict guard for oauth and mixed deployments', () => {
+  assert.equal(oauthGuardMayHardFail([{ name: 'nous', supportsPassword: false }]), true)
+  assert.equal(
+    oauthGuardMayHardFail([
+      { name: 'nous', supportsPassword: false },
+      { name: 'basic', supportsPassword: true }
+    ]),
+    true
+  )
+})
+
+test('oauthGuardMayHardFail keeps the strict guard when the list is unusable', () => {
+  // Backends predating /api/auth/providers, or an unreachable probe, must not
+  // silently weaken the guard.
+  assert.equal(oauthGuardMayHardFail([]), true)
+  assert.equal(oauthGuardMayHardFail(null), true)
+  assert.equal(oauthGuardMayHardFail(undefined), true)
+  assert.equal(oauthGuardMayHardFail('nonsense' as any), true)
+  assert.equal(oauthGuardMayHardFail([{ supportsPassword: true }]), true)
 })

@@ -15,20 +15,22 @@ browser tool needs agent-browser).
 """
 from __future__ import annotations
 
-import os
 import platform
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from hermes_constants import agent_browser_runnable, find_packaged_data_dir
+from hermes_constants import agent_browser_runnable, find_node_executable
 from tools.environments.local import hermes_subprocess_env
 
 _IS_WINDOWS = platform.system() == "Windows"
 
 _DEP_CHECKS = {
-    "node": lambda: shutil.which("node") is not None,
+    # find_node_executable() rather than a bare which(): $HERMES_HOME/node is
+    # not on PATH, so which() would report Node missing on an install that has
+    # a managed one and trigger a redundant re-install.
+    "node": lambda: find_node_executable("node") is not None,
     "browser": lambda: (
         agent_browser_runnable(shutil.which("agent-browser"))
         or _has_system_browser()
@@ -84,7 +86,6 @@ def _find_install_script(
         package_dir = Path(__file__).parent
     if repo_root is None:
         repo_root = package_dir.parent
-    packaged_root = find_packaged_data_dir("hermes-agent")
 
     if _IS_WINDOWS:
         preferred = ("install.ps1", "powershell")
@@ -100,10 +101,6 @@ def _find_install_script(
         repo = repo_root / "scripts" / script_name
         if repo.is_file():
             return repo, shell
-        if packaged_root is not None:
-            packaged = packaged_root / "scripts" / script_name
-            if packaged.is_file():
-                return packaged, shell
 
     return None, None
 

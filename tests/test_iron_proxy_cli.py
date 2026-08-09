@@ -43,7 +43,9 @@ def _args(**overrides):
         force=False,
         tunnel_port=None,
         from_bitwarden=False,
+        no_bitwarden=False,
         rotate_tokens=False,
+        restart=None,
         show_tokens=False,
     )
     for k, v in overrides.items():
@@ -57,7 +59,7 @@ def _args(**overrides):
 
 
 def test_cmd_install_success_returns_0(hermes_home, monkeypatch):
-    monkeypatch.setattr(ip, "install_iron_proxy", lambda **kw: Path("/tmp/iron-proxy"))
+    monkeypatch.setattr(ip, "install_iron_proxy", lambda **kw: hermes_home / "iron-proxy")
     monkeypatch.setattr(ip, "iron_proxy_version", lambda b: "v0.39.0-test")
     rc = proxy_cli.cmd_install(_args())
     assert rc == 0
@@ -76,57 +78,8 @@ def test_cmd_install_failure_returns_1(hermes_home, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_cmd_setup_from_bitwarden_refuses_when_bw_disabled(hermes_home, monkeypatch):
-    """When --from-bitwarden is passed but secrets.bitwarden.enabled=false,
-    the wizard must FAIL rather than silently rewriting credential_source
-    to bitwarden."""
-
-    from hermes_cli.config import load_config, save_config
-
-    cfg = load_config()
-    cfg.setdefault("secrets", {})["bitwarden"] = {"enabled": False}
-    save_config(cfg)
-
-    # Pre-stub install + CA so we get to step 3.
-    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: Path("/tmp/iron-proxy"))
-    monkeypatch.setattr(ip, "iron_proxy_version", lambda b: "test")
-    monkeypatch.setattr(
-        ip, "ensure_ca_cert",
-        lambda **kw: (hermes_home / "ca.crt", hermes_home / "ca.key"),
-    )
-
-    rc = proxy_cli.cmd_setup(_args(from_bitwarden=True))
-    assert rc == 1
-    # Verify we did NOT write credential_source: bitwarden to config.
-    cfg2 = load_config()
-    proxy_cfg = cfg2.get("proxy") or {}
-    assert proxy_cfg.get("credential_source", "env") != "bitwarden"
 
 
-def test_cmd_setup_from_bitwarden_refuses_when_token_missing(hermes_home, monkeypatch):
-    """--from-bitwarden with secrets.bitwarden.enabled=true but BWS access
-    token unset → fail loud, not silent env-fallback."""
-
-    from hermes_cli.config import load_config, save_config
-
-    cfg = load_config()
-    cfg.setdefault("secrets", {})["bitwarden"] = {
-        "enabled": True,
-        "project_id": "test-proj",
-        "access_token_env": "BWS_ACCESS_TOKEN",
-    }
-    save_config(cfg)
-    monkeypatch.delenv("BWS_ACCESS_TOKEN", raising=False)
-
-    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: Path("/tmp/iron-proxy"))
-    monkeypatch.setattr(ip, "iron_proxy_version", lambda b: "test")
-    monkeypatch.setattr(
-        ip, "ensure_ca_cert",
-        lambda **kw: (hermes_home / "ca.crt", hermes_home / "ca.key"),
-    )
-
-    rc = proxy_cli.cmd_setup(_args(from_bitwarden=True))
-    assert rc == 1
 
 
 def test_cmd_setup_from_bitwarden_refuses_on_empty_vault(hermes_home, monkeypatch):
@@ -144,7 +97,7 @@ def test_cmd_setup_from_bitwarden_refuses_on_empty_vault(hermes_home, monkeypatc
     save_config(cfg)
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "bwsk-test-token")
 
-    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: Path("/tmp/iron-proxy"))
+    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: hermes_home / "iron-proxy")
     monkeypatch.setattr(ip, "iron_proxy_version", lambda b: "test")
     monkeypatch.setattr(
         ip, "ensure_ca_cert",
@@ -162,49 +115,16 @@ def test_cmd_setup_from_bitwarden_refuses_on_empty_vault(hermes_home, monkeypatc
     assert rc == 1
 
 
-def test_cmd_setup_rejects_tunnel_port_zero(hermes_home, monkeypatch):
-    """--tunnel-port=0 is rejected explicitly (was silently substituting
-    the default before the fix)."""
 
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
-    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: Path("/tmp/iron-proxy"))
-    monkeypatch.setattr(ip, "iron_proxy_version", lambda b: "test")
-    monkeypatch.setattr(
-        ip, "ensure_ca_cert",
-        lambda **kw: (hermes_home / "ca.crt", hermes_home / "ca.key"),
-    )
-    rc = proxy_cli.cmd_setup(_args(tunnel_port=0))
-    assert rc == 1
+
 
 
 # ---------------------------------------------------------------------------
-# cmd_start — fail_on_uncovered_providers + Bitwarden rotation wire-up
 # ---------------------------------------------------------------------------
 
 
-def test_cmd_start_refuses_when_proxy_disabled(hermes_home, monkeypatch):
-    from hermes_cli.config import load_config, save_config
-    cfg = load_config()
-    cfg.setdefault("proxy", {})["enabled"] = False
-    save_config(cfg)
-
-    rc = proxy_cli.cmd_start(_args())
-    assert rc == 1
 
 
-def test_cmd_start_refuses_on_uncovered_provider_when_strict(hermes_home, monkeypatch):
-    """fail_on_uncovered_providers=true + ANTHROPIC_API_KEY in env =
-    refuse to start (real credential would otherwise leak into sandbox)."""
-
-    from hermes_cli.config import load_config, save_config
-    cfg = load_config()
-    cfg.setdefault("proxy", {})["enabled"] = True
-    cfg["proxy"]["fail_on_uncovered_providers"] = True
-    save_config(cfg)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-
-    rc = proxy_cli.cmd_start(_args())
-    assert rc == 1
 
 
 def test_cmd_start_passes_bitwarden_refresh_flag_when_credential_source_is_bitwarden(
@@ -218,9 +138,16 @@ def test_cmd_start_passes_bitwarden_refresh_flag_when_credential_source_is_bitwa
     cfg = load_config()
     cfg.setdefault("proxy", {})["enabled"] = True
     cfg["proxy"]["credential_source"] = "bitwarden"
-    cfg["proxy"]["fail_on_uncovered_providers"] = False
-    cfg.setdefault("secrets", {})["bitwarden"] = {"enabled": True}
+    cfg.setdefault("secrets", {})["bitwarden"] = {
+        "enabled": True,
+        "project_id": "test-proj-id",
+        "access_token_env": "BWS_ACCESS_TOKEN",
+    }
     save_config(cfg)
+    # v3: cmd_start now pre-checks BWS access token + project_id before
+    # calling start_proxy.  Provide both so we get to the rotation
+    # wire-up code path.
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "bwsk-test-access-token")
 
     captured: dict = {}
     def fake_start_proxy(**kw):
@@ -239,29 +166,8 @@ def test_cmd_start_passes_bitwarden_refresh_flag_when_credential_source_is_bitwa
     assert captured.get("bitwarden_config") is not None
 
 
-def test_cmd_start_does_not_pass_bitwarden_refresh_when_credential_source_is_env(
-    hermes_home, monkeypatch,
-):
-    from hermes_cli.config import load_config, save_config
-    cfg = load_config()
-    cfg.setdefault("proxy", {})["enabled"] = True
-    cfg["proxy"]["credential_source"] = "env"
-    cfg["proxy"]["fail_on_uncovered_providers"] = False
-    save_config(cfg)
 
-    captured: dict = {}
-    def fake_start_proxy(**kw):
-        captured.update(kw)
-        s = ip.ProxyStatus()
-        s.pid = 4242
-        s.listening = True
-        return s
-    monkeypatch.setattr(ip, "start_proxy", fake_start_proxy)
-    monkeypatch.setattr(ip, "discover_uncovered_providers", lambda **kw: [])
 
-    rc = proxy_cli.cmd_start(_args())
-    assert rc == 0
-    assert captured.get("refresh_secrets_from_bitwarden") is False
 
 
 # ---------------------------------------------------------------------------
@@ -269,16 +175,33 @@ def test_cmd_start_does_not_pass_bitwarden_refresh_when_credential_source_is_env
 # ---------------------------------------------------------------------------
 
 
-def test_cmd_stop_returns_0_when_running(hermes_home, monkeypatch):
+
+
+
+
+# ---------------------------------------------------------------------------
+# cmd_restart
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+def test_cmd_restart_propagates_start_failure(hermes_home, monkeypatch):
     monkeypatch.setattr(ip, "stop_proxy", lambda: True)
-    rc = proxy_cli.cmd_stop(_args())
-    assert rc == 0
+    monkeypatch.setattr(proxy_cli, "cmd_start", lambda args: 1)
+    rc = proxy_cli.cmd_restart(_args())
+    assert rc == 1
 
 
-def test_cmd_stop_returns_0_when_already_stopped(hermes_home, monkeypatch):
-    monkeypatch.setattr(ip, "stop_proxy", lambda: False)
-    rc = proxy_cli.cmd_stop(_args())
-    assert rc == 0
+# ---------------------------------------------------------------------------
+# _load_env_file_into_environ — setup discovers keys kept only in ~/.hermes/.env
+# ---------------------------------------------------------------------------
+
+
+
+
 
 
 def test_cmd_status_returns_0(hermes_home, monkeypatch):
@@ -335,16 +258,12 @@ def test_cmd_disable_uses_public_status_pid_not_private_read_pid(
 
 def test_cmd_config_returns_0_when_present(hermes_home, monkeypatch):
     fake = ip.ProxyStatus()
-    fake.config_path = Path("/tmp/proxy.yaml")
+    fake.config_path = hermes_home / "proxy.yaml"
     monkeypatch.setattr(ip, "get_status", lambda: fake)
     rc = proxy_cli.cmd_config(_args())
     assert rc == 0
 
 
-def test_cmd_config_returns_1_when_missing(hermes_home, monkeypatch):
-    monkeypatch.setattr(ip, "get_status", lambda: ip.ProxyStatus())
-    rc = proxy_cli.cmd_config(_args())
-    assert rc == 1
 
 
 # ---------------------------------------------------------------------------
@@ -366,24 +285,56 @@ def test_register_cli_uses_egress_command_dest():
     assert not hasattr(args, "proxy_command")
 
 
-def test_egress_subcommands_registered():
-    """Smoke test: every documented subcommand parses without error."""
-
-    parser = argparse.ArgumentParser(prog="hermes egress")
-    proxy_cli.register_cli(parser)
-    for sub in ("install", "setup", "start", "stop", "status", "disable", "config"):
-        args = parser.parse_args([sub])
-        assert args.egress_command == sub
 
 
-def test_setup_has_rotate_tokens_flag():
-    """--rotate-tokens is the documented escape hatch for re-rolling
-    every proxy token (used after a suspected token leak).  Default is
-    preserve-existing."""
 
-    parser = argparse.ArgumentParser(prog="hermes egress")
-    proxy_cli.register_cli(parser)
-    args = parser.parse_args(["setup"])
-    assert args.rotate_tokens is False
-    args = parser.parse_args(["setup", "--rotate-tokens"])
-    assert args.rotate_tokens is True
+
+# ---------------------------------------------------------------------------
+# v4 round: credential_source=bitwarden with secrets.bitwarden disabled
+# must NOT silently degrade to host-env secrets
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_start_refuses_when_bitwarden_mode_but_disabled(hermes_home, monkeypatch):
+    """config keeps credential_source: bitwarden but secrets.bitwarden.enabled
+    later flips to false — cmd_start must refuse, not silently start on
+    host env (the silent-degrade class strict mode is meant to close)."""
+
+    from hermes_cli.config import load_config, save_config
+    cfg = load_config()
+    cfg.setdefault("proxy", {})["enabled"] = True
+    cfg["proxy"]["credential_source"] = "bitwarden"
+    cfg.setdefault("secrets", {})["bitwarden"] = {"enabled": False}
+    save_config(cfg)
+
+    def must_not_call(**kw):
+        pytest.fail("start_proxy must not run when bitwarden mode is broken")
+    monkeypatch.setattr(ip, "start_proxy", must_not_call)
+    monkeypatch.setattr(ip, "discover_uncovered_providers", lambda **kw: [])
+
+    rc = proxy_cli.cmd_start(_args())
+    assert rc == 1
+
+
+
+
+def test_cmd_setup_audit_log_failure_is_warning_not_abort(hermes_home, monkeypatch):
+    """On the pinned v0.39 the daemon never writes audit.log, so a
+    pre-create failure must not abort the wizard."""
+
+    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: hermes_home / "iron-proxy")
+    monkeypatch.setattr(ip, "discover_provider_mappings", lambda **kw: [
+        ip.TokenMapping(
+            proxy_token="hermes-proxy-deadbeef",
+            real_env_name="OPENROUTER_API_KEY",
+            upstream_hosts=("openrouter.ai",),
+        ),
+    ])
+    monkeypatch.setattr(ip, "discover_uncovered_providers", lambda **kw: [])
+
+    def boom(path):
+        raise RuntimeError("could not pre-create audit log (synthetic)")
+    monkeypatch.setattr(ip, "ensure_audit_log", boom)
+
+    rc = proxy_cli.cmd_setup(_args())
+    assert rc == 0

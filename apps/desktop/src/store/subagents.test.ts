@@ -6,10 +6,9 @@ import {
   allSubagents,
   buildSubagentTree,
   clearSessionSubagents,
-  DELEGATION_STATUS_SESSION_ID,
   failedSubagentCount,
   pruneDelegateFallbackSubagents,
-  syncActiveDelegationSubagents,
+  pruneFinishedSessionSubagents,
   upsertSubagent
 } from './subagents'
 
@@ -26,20 +25,6 @@ describe('subagent store', () => {
     const item = listFor('s1')[0]
     expect(item?.status).toBe('completed')
     expect(item?.summary).toBe('done')
-  })
-
-  it('treats timeout and error completions as terminal failures, not running agents', () => {
-    upsertSubagent('s1', { goal: 'timeout child', status: 'running', subagent_id: 'timeout', task_index: 0 })
-    upsertSubagent('s1', { status: 'timeout', subagent_id: 'timeout', summary: 'timed out', task_index: 0 })
-    upsertSubagent('s1', { goal: 'error child', status: 'running', subagent_id: 'error', task_index: 1 })
-    upsertSubagent('s1', { status: 'error', subagent_id: 'error', summary: 'crashed', task_index: 1 })
-
-    expect(listFor('s1').map(item => item.status)).toEqual(['timeout', 'error'])
-    expect(activeSubagentCount(listFor('s1'))).toBe(0)
-    expect(failedSubagentCount(listFor('s1'))).toBe(2)
-
-    upsertSubagent('s1', { goal: 'late start', status: 'running', subagent_id: 'timeout', task_index: 0 })
-    expect(listFor('s1')[0]?.status).toBe('timeout')
   })
 
   it('builds parent/child trees', () => {
@@ -138,46 +123,6 @@ describe('subagent store', () => {
     expect(indicatorRunning + indicatorFailed).toBe(tree.length)
   })
 
-  it('syncs backend active delegation status and dedupes against native rows', () => {
-    syncActiveDelegationSubagents([
-      {
-        goal: 'long child',
-        model: 'm',
-        parent_session_id: 's1',
-        started_at: 1_700_000_001,
-        status: 'running',
-        subagent_id: 'sa-session',
-        tool_count: 1
-      },
-      {
-        goal: 'orphan child',
-        model: 'm',
-        started_at: 1_700_000_000,
-        status: 'running',
-        subagent_id: 'sa-live',
-        tool_count: 2
-      }
-    ])
-
-    expect(listFor(DELEGATION_STATUS_SESSION_ID)).toHaveLength(1)
-    expect(listFor(DELEGATION_STATUS_SESSION_ID)[0]).toMatchObject({
-      id: 'sa-live',
-      source: 'delegation-status',
-      status: 'running',
-      toolCount: 2
-    })
-    expect(listFor(DELEGATION_STATUS_SESSION_ID)[0]?.startedAt).toBe(1_700_000_000_000)
-    expect(listFor('s1')).toHaveLength(1)
-    expect(listFor('s1')[0]).toMatchObject({ id: 'sa-session', source: 'delegation-status' })
-
-    upsertSubagent('s1', { goal: 'native live', status: 'running', subagent_id: 'sa-live', task_index: 0 })
-    expect(allSubagents($subagentsBySession.get()).filter(item => item.id === 'sa-live')).toHaveLength(1)
-    expect(allSubagents($subagentsBySession.get()).find(item => item.id === 'sa-live')?.source).toBeUndefined()
-
-    syncActiveDelegationSubagents([])
-    expect($subagentsBySession.get()[DELEGATION_STATUS_SESSION_ID]).toBeUndefined()
-  })
-
   it('clears one session without touching another', () => {
     upsertSubagent('s1', { goal: 'one', status: 'running', subagent_id: 'a1', task_index: 0 })
     upsertSubagent('s2', { goal: 'two', status: 'running', subagent_id: 'a2', task_index: 0 })
@@ -186,5 +131,63 @@ describe('subagent store', () => {
 
     expect($subagentsBySession.get().s1).toBeUndefined()
     expect($subagentsBySession.get().s2).toHaveLength(1)
+  })
+
+  // Regression test for #64015: still-RUNNING background subagents must survive
+  // the per-turn wipe that previously dropped them at message.start. The fix
+  // replaces clearSessionSubagents() with pruneFinishedSessionSubagents() at
+  // the use-message-stream message.start handler, so only terminal-status rows
+  // get filtered out.
+  it('pruneFinishedSessionSubagents keeps running/queued and drops terminal rows', () => {
+    upsertSubagent('s1', { goal: 'live-a', status: 'running', subagent_id: 'live-a', task_index: 0 })
+    upsertSubagent('s1', { goal: 'live-b', status: 'queued', subagent_id: 'live-b', task_index: 1 })
+    upsertSubagent('s1', { goal: 'done', status: 'completed', subagent_id: 'done', task_index: 2 })
+    upsertSubagent('s1', { goal: 'broken', status: 'failed', subagent_id: 'broken', task_index: 3 })
+    upsertSubagent('s1', { goal: 'cancelled', status: 'interrupted', subagent_id: 'cancelled', task_index: 4 })
+
+    pruneFinishedSessionSubagents('s1')
+
+    const ids = listFor('s1')
+      .map(item => item.id)
+      .sort()
+
+    expect(ids).toEqual(['live-a', 'live-b'])
+    expect(activeSubagentCount(listFor('s1'))).toBe(2)
+  })
+
+  // Companion test: after prune, a late `subagent.complete` event for a
+  // surviving live row must still be accepted by upsertSubagent (the wipe
+  // path previously silently dropped these).
+  it('surviving live subagents still accept createIfMissing=false completion', () => {
+    upsertSubagent('s1', { goal: 'live', status: 'running', subagent_id: 'live', task_index: 0 })
+
+    pruneFinishedSessionSubagents('s1')
+
+    upsertSubagent(
+      's1',
+      { status: 'completed', subagent_id: 'live', task_index: 0, summary: 'finished later' },
+      false,
+      'subagent.complete'
+    )
+
+    const item = listFor('s1')[0]
+    expect(item?.status).toBe('completed')
+    expect(item?.summary).toBe('finished later')
+  })
+
+  it('pruneFinishedSessionSubagents leaves other sessions untouched', () => {
+    upsertSubagent('s1', { goal: 'live', status: 'running', subagent_id: 'a', task_index: 0 })
+    upsertSubagent('s1', { goal: 'done', status: 'completed', subagent_id: 'b', task_index: 1 })
+    upsertSubagent('s2', { goal: 'live', status: 'running', subagent_id: 'c', task_index: 0 })
+    upsertSubagent('s2', { goal: 'done', status: 'completed', subagent_id: 'd', task_index: 1 })
+
+    pruneFinishedSessionSubagents('s1')
+
+    expect(listFor('s1').map(item => item.id)).toEqual(['a'])
+    expect(
+      listFor('s2')
+        .map(item => item.id)
+        .sort()
+    ).toEqual(['c', 'd'])
   })
 })

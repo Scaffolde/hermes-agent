@@ -48,7 +48,7 @@ def persist_whatsapp_enabled(enabled: bool) -> None:
         load_env,
         read_raw_config,
         remove_env_value,
-        remove_platform_config_field,
+        save_config,
         save_env_value,
         write_platform_config_field,
     )
@@ -118,11 +118,13 @@ def persist_whatsapp_enabled(enabled: bool) -> None:
                     previous_yaml_value,
                 )
             else:
-                remove_platform_config_field(
-                    "whatsapp",
-                    "enabled",
-                    raw=True,
-                )
+                raw_config = read_raw_config()
+                platforms = raw_config.get("platforms")
+                if isinstance(platforms, dict):
+                    whatsapp = platforms.get("whatsapp")
+                    if isinstance(whatsapp, dict):
+                        whatsapp.pop("enabled", None)
+                save_config(raw_config)
         except Exception as rollback_exc:
             rollback_errors.append(f"config rollback failed: {rollback_exc}")
         try:

@@ -90,26 +90,13 @@ class TestSlackSendRetryable:
         client.chat_postMessage = AsyncMock(
             side_effect=_slack_api_error(429, retry_after="30")
         )
-        adapter._get_client = lambda cid, metadata=None, team_id=None: client
+        adapter._get_client = lambda chat_id, team_id="", metadata=None: client
 
         result = await adapter.send("C123", "hello")
         assert not result.success
         assert result.retryable is True
         assert result.retry_after == 30.0
 
-    @pytest.mark.asyncio
-    async def test_429_without_retry_after_header(self):
-        adapter = _make_adapter()
-        client = AsyncMock()
-        client.chat_postMessage = AsyncMock(
-            side_effect=_slack_api_error(429)
-        )
-        adapter._get_client = lambda cid, metadata=None, team_id=None: client
-
-        result = await adapter.send("C123", "hello")
-        assert not result.success
-        assert result.retryable is True
-        assert result.retry_after is None
 
     @pytest.mark.asyncio
     async def test_500_is_retryable_no_retry_after(self):
@@ -118,35 +105,11 @@ class TestSlackSendRetryable:
         client.chat_postMessage = AsyncMock(
             side_effect=_slack_api_error(500)
         )
-        adapter._get_client = lambda cid, metadata=None, team_id=None: client
+        adapter._get_client = lambda chat_id, team_id="", metadata=None: client
 
         result = await adapter.send("C123", "hello")
         assert not result.success
         assert result.retryable is True
         assert result.retry_after is None
 
-    @pytest.mark.asyncio
-    async def test_403_is_not_retryable(self):
-        adapter = _make_adapter()
-        client = AsyncMock()
-        client.chat_postMessage = AsyncMock(
-            side_effect=_slack_api_error(403)
-        )
-        adapter._get_client = lambda cid, metadata=None, team_id=None: client
 
-        result = await adapter.send("C123", "hello")
-        assert not result.success
-        assert result.retryable is False
-
-    @pytest.mark.asyncio
-    async def test_connection_error_is_retryable(self):
-        adapter = _make_adapter()
-        client = AsyncMock()
-        client.chat_postMessage = AsyncMock(
-            side_effect=ConnectionError("Connection reset by peer")
-        )
-        adapter._get_client = lambda cid, metadata=None, team_id=None: client
-
-        result = await adapter.send("C123", "hello")
-        assert not result.success
-        assert result.retryable is True

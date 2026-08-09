@@ -1,4 +1,5 @@
 import asyncio
+from subprocess import CompletedProcess, TimeoutExpired
 
 import pytest
 
@@ -50,6 +51,37 @@ def test_create_invokes_agy_print(monkeypatch):
     assert "User:\nReply OK" in cmd
     assert cmd[-2:] == ["--print-timeout", "60s"]
     assert kwargs["text"] is True
+    assert kwargs["timeout"] == 330.0
+
+
+def test_create_forwards_call_timeout_to_subprocess(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured.update(kwargs)
+        return CompletedProcess(cmd, 0, stdout="OK", stderr="")
+
+    monkeypatch.setattr("agent.google_antigravity_cli_adapter.subprocess.run", fake_run)
+    client = GoogleAntigravityCLIClient(command="agy")
+
+    client.chat.completions.create(
+        messages=[{"role": "user", "content": "x"}], timeout=0.25
+    )
+
+    assert captured["timeout"] == 0.25
+
+
+def test_subprocess_timeout_becomes_adapter_error(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        raise TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr("agent.google_antigravity_cli_adapter.subprocess.run", fake_run)
+    client = GoogleAntigravityCLIClient(command="agy")
+
+    with pytest.raises(AntigravityCLIError, match="timed out after 0.25s"):
+        client.chat.completions.create(
+            messages=[{"role": "user", "content": "x"}], timeout=0.25
+        )
 
 
 def test_nonzero_exit_raises_redacted_error(monkeypatch):
@@ -69,6 +101,17 @@ def test_nonzero_exit_raises_redacted_error(monkeypatch):
 
     assert "failure text" in str(exc.value)
     assert "exit 7" in str(exc.value)
+
+
+def test_empty_stdout_success_is_rejected(monkeypatch):
+    monkeypatch.setattr(
+        "agent.google_antigravity_cli_adapter.subprocess.run",
+        lambda *args, **kwargs: CompletedProcess(args[0], 0, stdout="", stderr=""),
+    )
+
+    client = GoogleAntigravityCLIClient(command="/bin/agy")
+    with pytest.raises(AntigravityCLIError, match="produced no output"):
+        client.complete("Reply OK")
 
 
 def test_async_wrapper_returns_completion(monkeypatch):

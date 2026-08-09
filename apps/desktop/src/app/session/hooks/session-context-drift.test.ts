@@ -87,7 +87,7 @@ describe('sessionContextDrift', () => {
     expect(reason).toBe('route:sess-a->__new__')
   })
 
-  it('drifts when the route moves to a non-chat route (null target)', () => {
+  it('does not drift when the route moves to a non-chat route (null target)', () => {
     const reason = sessionContextDrift({
       startRouteToken: routeToken(sessionRoute(SESS_A)),
       nowRouteToken: routeToken(SETTINGS_ROUTE),
@@ -96,19 +96,7 @@ describe('sessionContextDrift', () => {
       submitTargetStoredId: SESS_A
     })
 
-    expect(reason).toBe('route:sess-a->null')
-  })
-
-  it('drifts when a new-chat submit navigates to settings before create finishes', () => {
-    const reason = sessionContextDrift({
-      startRouteToken: routeToken(NEW_CHAT_ROUTE),
-      nowRouteToken: routeToken(SETTINGS_ROUTE),
-      startSelectedStoredId: null,
-      nowSelectedStoredId: null,
-      submitTargetStoredId: null
-    })
-
-    expect(reason).toBe('route:__new__->null')
+    expect(reason).toBeNull()
   })
 
   it('does not drift when route and selection re-home onto the submit target (the create pipeline re-home)', () => {
@@ -133,5 +121,78 @@ describe('sessionContextDrift', () => {
     })
 
     expect(reason).toBe('route:__new__->sess-b')
+  })
+
+  it('does not drift when composerScope is omitted (non-composer submits: queue drain, steer)', () => {
+    const reason = sessionContextDrift({
+      startRouteToken: routeToken(sessionRoute(SESS_A)),
+      nowRouteToken: routeToken(sessionRoute(SESS_A)),
+      startSelectedStoredId: SESS_A,
+      nowSelectedStoredId: SESS_A,
+      submitTargetStoredId: SESS_A
+    })
+
+    expect(reason).toBeNull()
+  })
+
+  it('does not drift when composerScope matches the resolved (lineage) submit target', () => {
+    const reason = sessionContextDrift({
+      startRouteToken: routeToken(sessionRoute(SESS_A)),
+      nowRouteToken: routeToken(sessionRoute(SESS_A)),
+      startSelectedStoredId: SESS_A,
+      nowSelectedStoredId: SESS_A,
+      submitTargetStoredId: SESS_A,
+      composerScope: SESS_A,
+      submitTargetComposerScope: SESS_A
+    })
+
+    expect(reason).toBeNull()
+  })
+
+  it('drifts (composer prong) when the loaded composer scope disagrees with the resolved submit target (#59305)', () => {
+    const reason = sessionContextDrift({
+      startRouteToken: routeToken(sessionRoute(SESS_A)),
+      nowRouteToken: routeToken(sessionRoute(SESS_A)),
+      startSelectedStoredId: SESS_A,
+      nowSelectedStoredId: SESS_A,
+      submitTargetStoredId: SESS_A,
+      composerScope: SESS_B,
+      submitTargetComposerScope: SESS_A
+    })
+
+    expect(reason).toBe('composer:sess-b->sess-a')
+  })
+
+  it('checks the composer prong before the route/selection prongs', () => {
+    const reason = sessionContextDrift({
+      startRouteToken: routeToken(sessionRoute(SESS_A)),
+      nowRouteToken: routeToken(sessionRoute(SESS_B)),
+      startSelectedStoredId: SESS_A,
+      nowSelectedStoredId: SESS_B,
+      submitTargetStoredId: SESS_A,
+      composerScope: SESS_B,
+      submitTargetComposerScope: SESS_A
+    })
+
+    expect(reason).toBe('composer:sess-b->sess-a')
+  })
+
+  it('does not drift when the session has rotated via compression (composerScope is the lineage root, submitTargetStoredId is the live tip)', () => {
+    const ROOT_ID = 'stored-root'
+    const TIP_ID = 'stored-tip-after-compression'
+
+    const reason = sessionContextDrift({
+      startRouteToken: routeToken(sessionRoute(TIP_ID)),
+      nowRouteToken: routeToken(sessionRoute(TIP_ID)),
+      startSelectedStoredId: TIP_ID,
+      nowSelectedStoredId: TIP_ID,
+      submitTargetStoredId: TIP_ID,
+      composerScope: ROOT_ID,
+      // What submit.ts actually passes: resolveComposerSessionKey(TIP_ID, sessions),
+      // which resolves to the lineage root for a session that has compressed.
+      submitTargetComposerScope: ROOT_ID
+    })
+
+    expect(reason).toBeNull()
   })
 })

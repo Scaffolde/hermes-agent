@@ -757,9 +757,6 @@ function WhatsAppOnboardingPanel({
       const res = await api.startWhatsAppOnboarding({
         mode,
         allowed_users: allowedUsers,
-        // This control explicitly starts a new QR link. Never let a stale
-        // creds.json masquerade as a connected WhatsApp session.
-        replace_existing: true,
       });
       setSetup(res);
       if (res.qr_payload) {
@@ -843,23 +840,19 @@ function WhatsAppOnboardingPanel({
     [setup, tick],
   );
   const setupStatusLabel =
-    setup?.status === "preparing"
-      ? "quiescing gateway"
-      : setup?.status === "installing"
-        ? "preparing"
-        : setup?.status === "starting"
-          ? "starting"
-          : "waiting";
+    setup?.status === "installing"
+      ? "preparing"
+      : setup?.status === "starting"
+        ? "starting"
+        : "waiting";
   const setupHelp =
     phase === "connected" || phase === "applying"
       ? "WhatsApp is linked but Hermes is not listening yet. Save and restart the gateway to finish setup."
-      : setup?.status === "preparing"
-        ? "Stopping the active WhatsApp bridge so QR pairing can take exclusive ownership of the session."
-        : setup?.status === "installing"
-          ? "Preparing the WhatsApp bridge. The QR code will appear here when it is ready."
-          : setup?.status === "starting"
-            ? "Starting the WhatsApp pairing bridge. The QR code will appear here when it is ready."
-            : "Open WhatsApp on your phone, then go to Linked Devices and scan from there. This QR is not a browser URL.";
+      : setup?.status === "installing"
+        ? "Preparing the WhatsApp bridge. The QR code will appear here when it is ready."
+        : setup?.status === "starting"
+          ? "Starting the WhatsApp pairing bridge. The QR code will appear here when it is ready."
+          : "Open WhatsApp on your phone, then go to Linked Devices and scan from there. This QR is not a browser URL.";
   const linkedAccountLabel = setup?.account_phone
     ? `+${setup.account_phone}`
     : setup?.account_name || setup?.account_id || "";

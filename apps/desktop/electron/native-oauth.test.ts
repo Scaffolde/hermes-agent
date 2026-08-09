@@ -177,27 +177,37 @@ test('parseTokenResponse tolerates an absent refresh token / expiry', () => {
   assert.equal(t.expiresAt, 0)
 })
 
-test('parseStoredTokenSet reloads the camelCase shape persisted by the desktop', () => {
+test('parseStoredTokenSet maps the encrypted on-disk camelCase shape', () => {
   const t = parseStoredTokenSet({
-    accessToken: 'AT',
-    refreshToken: 'RT',
+    accessToken: 'AT-stored',
+    refreshToken: 'RT-stored',
     expiresAt: 1893456000,
-    provider: 'nous',
-    userId: 'u-1'
+    provider: 'self-hosted',
+    userId: 'u-stored'
   })
 
-  assert.deepEqual(t, {
-    accessToken: 'AT',
-    refreshToken: 'RT',
-    expiresAt: 1893456000,
-    provider: 'nous',
-    userId: 'u-1'
-  })
+  assert.equal(t.accessToken, 'AT-stored')
+  assert.equal(t.refreshToken, 'RT-stored')
+  assert.equal(t.expiresAt, 1893456000)
+  assert.equal(t.provider, 'self-hosted')
+  assert.equal(t.userId, 'u-stored')
 })
 
-test('parseStoredTokenSet rejects token-response and malformed shapes', () => {
-  assert.throws(() => parseStoredTokenSet({ access_token: 'AT' }), /missing accessToken/i)
-  assert.throws(() => parseStoredTokenSet({ refreshToken: 'RT' }), /missing accessToken/i)
+test('parseTokenResponse cannot read a persisted set (the reload bug #73271)', () => {
+  // Guards against regressing to the wrong parser on the reload path: a
+  // persisted camelCase set has no snake_case access_token, so the raw-response
+  // parser throws — which is exactly why the stored path must use
+  // parseStoredTokenSet instead.
+  const persisted = JSON.parse(
+    JSON.stringify({ accessToken: 'AT', refreshToken: 'RT', expiresAt: 1, provider: 'nous', userId: 'u' })
+  )
+
+  assert.throws(() => parseTokenResponse(persisted), /missing access_token/i)
+  assert.equal(parseStoredTokenSet(persisted).accessToken, 'AT')
+})
+
+test('parseStoredTokenSet rejects a non-normalized server response', () => {
+  assert.throws(() => parseStoredTokenSet({ access_token: 'AT-server' }), /missing accessToken/i)
 })
 
 // --- refresh timing ---

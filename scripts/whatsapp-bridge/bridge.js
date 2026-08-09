@@ -36,21 +36,18 @@ import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import { hasValidBridgeToken } from './bridge_http_security.js';
 import {
   buildPollPayload,
+  createReconnectScheduler,
+  createVersionResolver,
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
   extractBridgeEvent,
+  inboundReadReceiptKeys,
   inferMediaType,
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
-  resolvePairTimeoutSeconds,
-  writePairEventAndExit,
 } from './bridge_helpers.js';
-
-// Terminal contract with the Python adapter: unlike generic startup failures,
-// a logged-out session cannot recover by retrying and requires QR pairing.
-const WHATSAPP_SESSION_LOGGED_OUT_EXIT_CODE = 64;
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -82,6 +79,12 @@ const FORWARD_OWNER_MESSAGES =
   typeof process.env.WHATSAPP_FORWARD_OWNER_MESSAGES === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_FORWARD_OWNER_MESSAGES.toLowerCase());
 
+const SEND_READ_RECEIPTS =
+  typeof process !== 'undefined' &&
+  process.env &&
+  typeof process.env.WHATSAPP_SEND_READ_RECEIPTS === 'string' &&
+  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_SEND_READ_RECEIPTS.toLowerCase());
+
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
 // Cache directories: the Python gateway passes the profile-aware paths via
@@ -108,9 +111,6 @@ try {
 } catch {}
 const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');
-const PAIR_TIMEOUT_SECONDS = resolvePairTimeoutSeconds(
-  getArg('pair-timeout-seconds', '600'),
-);
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
@@ -125,7 +125,12 @@ const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10
 // which pins the bridge's HTTP handler until the upstream aiohttp timeout
 // fires. Fail fast instead so the gateway can surface a real error and retry.
 const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
-const BRIDGE_TOKEN = String(process.env.WHATSAPP_BRIDGE_TOKEN || '').trim();
+const BRIDGE_TOKEN = String(process.env.WHATSAPP_BRIDGE_TOKEN || '').trim()
+  || (PAIR_ONLY ? randomBytes(32).toString('base64url') : '');
+if (!BRIDGE_TOKEN) {
+  console.error('WHATSAPP_BRIDGE_TOKEN is required for bridge HTTP mode.');
+  process.exit(2);
+}
 
 // --- Send queue: serialise all sock.sendMessage() calls across concurrent
 //     HTTP handlers so a single Baileys socket never has overlapping sends.
@@ -389,7 +394,6 @@ function rememberSentId(id) {
 
 let sock = null;
 let connectionState = 'disconnected';
-let pairTimeoutTimer = null;
 
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
@@ -398,19 +402,15 @@ function emitPairEvent(event) {
   } catch {}
 }
 
-function clearPairTimeout() {
-  if (pairTimeoutTimer) {
-    clearTimeout(pairTimeoutTimer);
-    pairTimeoutTimer = null;
-  }
-}
+const scheduleReconnect = createReconnectScheduler(() => startSocket());
+const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+  const version = await getWAVersion();
 
   sock = makeWASocket({
-    version,
+    ...(version ? { version } : {}),
     auth: state,
     logger,
     printQRInTerminal: false,
@@ -448,9 +448,9 @@ async function startSocket() {
       if (reason === DisconnectReason.loggedOut) {
         emitPairEvent({ event: 'error', error: 'logged_out', reason });
         if (!PAIR_JSON) {
-          console.log('❌ Logged out. Run `hermes whatsapp` to pair this device again.');
+          console.log('❌ Logged out. Delete session and restart to re-authenticate.');
         }
-        process.exit(WHATSAPP_SESSION_LOGGED_OUT_EXIT_CODE);
+        process.exit(64);
       } else {
         // 515 = restart requested (common after pairing). Always reconnect.
         emitPairEvent({ event: 'disconnected', reason });
@@ -461,11 +461,10 @@ async function startSocket() {
             console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
           }
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        scheduleReconnect(reason === 515 ? 1000 : 3000);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
-      clearPairTimeout();
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
@@ -820,13 +819,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// Managed gateways authenticate every stateful/read-sensitive bridge request.
-// Keep /health unauthenticated for local process supervision and preserve
-// compatibility with manually launched legacy bridges that have no token.
+// Authenticate every bridge request, including /health. The adapter uses this
+// probe before reusing an existing listener, so an unrelated or legacy process
+// cannot impersonate the managed bridge with a public script hash.
 app.use((req, res, next) => {
-  if (req.path === '/health' || !BRIDGE_TOKEN) {
-    return next();
-  }
   if (!hasValidBridgeToken(BRIDGE_TOKEN, req.headers.authorization)) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -1078,6 +1074,30 @@ app.post('/typing', async (req, res) => {
   }
 });
 
+// Mark an inbound message as read only after the Python adapter has accepted
+// it through the authoritative DM/group/mention intake policy.
+app.post('/read', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected' });
+  }
+
+  const receiptKeys = inboundReadReceiptKeys({
+    key: req.body?.key,
+    enabled: SEND_READ_RECEIPTS,
+  });
+  if (receiptKeys.length === 0) {
+    return res.json({ success: true, marked: false });
+  }
+
+  try {
+    await sock.readMessages(receiptKeys);
+    return res.json({ success: true, marked: true });
+  } catch (err) {
+    console.warn('[bridge] failed to send read receipt:', err.message);
+    return res.status(500).json({ error: 'Failed to send read receipt' });
+  }
+});
+
 // Chat info
 app.get('/chat/:id', async (req, res) => {
   const chatId = req.params.id;
@@ -1110,6 +1130,7 @@ app.get('/health', (req, res) => {
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
+    sendReadReceipts: SEND_READ_RECEIPTS,
   });
 });
 
@@ -1123,20 +1144,7 @@ if (PAIR_ONLY) {
     console.log(`📁 Session: ${SESSION_DIR}`);
     console.log();
   }
-  pairTimeoutTimer = setTimeout(() => {
-    if (PAIR_JSON) {
-      writePairEventAndExit(
-        { event: 'error', error: 'pair_timeout' },
-        { code: 124 },
-      );
-      return;
-    }
-    console.error(`✗ WhatsApp pairing timed out after ${PAIR_TIMEOUT_SECONDS} seconds.`);
-    process.exit(124);
-  }, PAIR_TIMEOUT_SECONDS * 1000);
-  pairTimeoutTimer.unref?.();
   startSocket().catch((err) => {
-    clearPairTimeout();
     emitPairEvent({ event: 'error', error: err?.message || String(err) });
     if (!PAIR_JSON) {
       console.error(err);
@@ -1148,7 +1156,7 @@ if (PAIR_ONLY) {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
     if (ALLOWED_USERS.size > 0) {
-      console.log(`🔒 Allowed users configured: ${ALLOWED_USERS.size}`);
+      console.log(`🔒 Allowed users: ${Array.from(ALLOWED_USERS).join(', ')}`);
     } else if (WHATSAPP_MODE === 'self-chat') {
       console.log(`🔒 Self-chat mode — only your own messages to yourself are processed.`);
     } else if (WHATSAPP_MODE === 'bot' && WHATSAPP_DM_POLICY === 'pairing') {
@@ -1162,6 +1170,6 @@ if (PAIR_ONLY) {
       console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
     }
     console.log();
-    startSocket();
+    scheduleReconnect(0);
   });
 }

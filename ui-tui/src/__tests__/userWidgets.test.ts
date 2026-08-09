@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 
 import { getOverlayState, resetOverlayState } from '../app/overlayStore.js'
 import { launchWidget } from '../sdk/host.js'
-import { defineWidgetApp, getWidgetApp, removeWidgetApp } from '../sdk/registry.js'
+import { getWidgetApp } from '../sdk/registry.js'
 import { loadUserWidgets } from '../sdk/userWidgets.js'
 
 const WIDGET = `
@@ -63,52 +63,5 @@ describe('user widget loading', () => {
 
     expect(result.removed).toEqual(['soon-gone'])
     expect(getWidgetApp('soon-gone')).toBeUndefined()
-  })
-
-  it('a changed file unregisters ids that it no longer defines', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'tui-widgets-'))
-    const file = join(dir, 'renamed.mjs')
-
-    await writeFile(file, WIDGET.replace('test-user-widget', 'old-widget-id'))
-    await loadUserWidgets(dir)
-    expect(getWidgetApp('old-widget-id')).toBeDefined()
-
-    await writeFile(file, WIDGET.replace('test-user-widget', 'new-widget-id'))
-    const result = await loadUserWidgets(dir)
-
-    expect(result.added).toEqual(['new-widget-id'])
-    expect(result.removed).toEqual(['old-widget-id'])
-    expect(getWidgetApp('old-widget-id')).toBeUndefined()
-    expect(getWidgetApp('new-widget-id')).toBeDefined()
-  })
-
-  it('restores a built-in app after its user-widget shadow is deleted', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'tui-widgets-'))
-    const file = join(dir, 'shadow.mjs')
-
-    const builtIn = defineWidgetApp({
-      id: 'shadowed-built-in',
-      help: 'built in',
-      init: () => null,
-      reduce: state => state,
-      render: () => null
-    })
-
-    try {
-      await writeFile(
-        file,
-        WIDGET.replace('test-user-widget', 'shadowed-built-in').replace('from disk', 'user override')
-      )
-      await loadUserWidgets(dir)
-      expect(getWidgetApp('shadowed-built-in')).toMatchObject({ help: 'user override' })
-
-      await rm(file)
-      const result = await loadUserWidgets(dir)
-
-      expect(result.removed).toEqual([])
-      expect(getWidgetApp('shadowed-built-in')).toBe(builtIn)
-    } finally {
-      removeWidgetApp('shadowed-built-in')
-    }
   })
 })

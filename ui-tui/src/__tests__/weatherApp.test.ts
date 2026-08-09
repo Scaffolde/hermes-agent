@@ -29,9 +29,10 @@ afterEach(() => vi.unstubAllGlobals())
 
 describe('weather reference app (async contract)', () => {
   it('launches into loading, lands the fetch via updateWidget', async () => {
-    const fetchMock = vi.fn(async () => ({ json: async () => wttrReply('113'), ok: true }))
-
-    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ json: async () => wttrReply('113'), ok: true }))
+    )
 
     expect(launchWidget('weather', 'Austin')).toBeNull()
     expect(activeState()?.phase.kind).toBe('loading')
@@ -41,7 +42,6 @@ describe('weather reference app (async contract)', () => {
     const phase = activeState()!.phase
 
     expect(phase).toMatchObject({ kind: 'ready', report: { area: 'Austin, USA', tempC: '22', weatherCode: 113 } })
-    expect(fetchMock.mock.calls[0]?.[1]).not.toHaveProperty('headers')
   })
 
   it('a late resolution cannot resurrect a closed app', async () => {

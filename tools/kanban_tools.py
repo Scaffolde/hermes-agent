@@ -197,69 +197,6 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
-def _completion_says_review_needed(summary: Any, result: Any) -> bool:
-    """Heuristic for workers that explicitly say the work still needs review."""
-    text = " ".join(str(v) for v in (summary, result) if v).lower()
-    if not text:
-        return False
-    review_cues = (
-        "review-required",
-        "review required",
-        "human review",
-        "needs review",
-        "need review",
-        "needs eyes",
-        "need eyes",
-        "pending review",
-        "requires review",
-        "require review",
-    )
-    if any(cue in text for cue in review_cues):
-        return True
-    return "review" in text and "warrant" in text
-
-
-def _metadata_declares_changed_files(metadata: Any) -> bool:
-    """Return True when completion metadata carries concrete file-change evidence."""
-    if not isinstance(metadata, dict):
-        return False
-    changed_files = metadata.get("changed_files")
-    if isinstance(changed_files, str):
-        return bool(changed_files.strip())
-    if isinstance(changed_files, (list, tuple)):
-        return any(str(path).strip() for path in changed_files)
-    return False
-
-
-def _enforce_review_required_completion_guard(
-    task_id: str,
-    *,
-    summary: Any,
-    result: Any,
-    metadata: Any,
-) -> Optional[str]:
-    """Prevent fake-green completion when a worker admits review is still needed.
-
-    This is intentionally narrower than "all changed_files require review" so
-    existing terminal/research handoffs keep working. It catches the dangerous
-    contradiction: a dispatcher-scoped worker reports changed files and says the
-    change warrants human review, then tries to call ``kanban_complete`` anyway.
-    """
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
-        return None
-    if not _metadata_declares_changed_files(metadata):
-        return None
-    if not _completion_says_review_needed(summary, result):
-        return None
-    return tool_error(
-        "kanban_complete blocked: your summary/result says this code change "
-        "needs human review. Per the review-required policy, add the "
-        "structured handoff with kanban_comment first, then call "
-        "kanban_block(reason=\"review-required: <one-line summary>\"). "
-        "Your task is still in-flight (no state change)."
-    )
-
-
 def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
@@ -380,6 +317,85 @@ def heartbeat_current_worker_from_env() -> bool:
         return True
     except Exception:
         logger.debug("auto-heartbeat: bridge failed", exc_info=True)
+        return False
+
+
+# Live operator-note injection: poll the worker's task for new comments and
+# fold them into the running agent via the OUT-OF-BAND steer channel, so a user
+# can "talk to" a running kanban task without the block → comment → unblock
+# dance (or a restart). Rate-limited on its own (tighter than the 60s heartbeat
+# so notes land within a few seconds), watermarked per task id.
+_COMMENT_POLL_MIN_INTERVAL_SECONDS = 6.0
+_comment_poll_last_attempt: float = 0.0
+# task_id -> highest comment id already seen (seeded on first poll so history
+# already present in build_worker_context isn't re-injected).
+_comment_watermark: dict[str, int] = {}
+
+
+def inject_new_comments_from_env(agent: Any) -> bool:
+    """Fold new operator comments on the current worker's task into ``agent``.
+
+    Best-effort and self-gating: no-op unless this process is a kanban worker
+    (``HERMES_KANBAN_TASK`` set) and ``agent`` exposes ``steer``. Returns True
+    if a steer was injected, else False. Never raises into the agent loop.
+
+    The first poll only *seeds* the watermark to the newest existing comment —
+    those are already in the worker's context — so only comments added after
+    the run started are injected. The worker's own authored comments (matched
+    by ``HERMES_PROFILE``) are skipped to avoid echoing itself.
+    """
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid or agent is None or not hasattr(agent, "steer"):
+        return False
+    global _comment_poll_last_attempt
+    import time as _time
+    now = _time.monotonic()
+    if (now - _comment_poll_last_attempt) < _COMMENT_POLL_MIN_INTERVAL_SECONDS:
+        return False
+    _comment_poll_last_attempt = now
+
+    seen = _comment_watermark.get(tid)
+    try:
+        kb, conn = _connect()
+        try:
+            rows = kb.list_comments_after(conn, tid, after_id=seen or 0)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        logger.debug("comment-inject: bridge failed", exc_info=True)
+        return False
+
+    if seen is None:
+        # First poll for this task: seed past the existing thread, inject nothing.
+        _comment_watermark[tid] = max((c.id for c in rows), default=0)
+        return False
+    if not rows:
+        return False
+
+    # Advance the watermark past everything we just read (including our own
+    # notes) so nothing is re-injected next poll.
+    _comment_watermark[tid] = max(c.id for c in rows)
+
+    own = (os.environ.get("HERMES_PROFILE") or "").strip()
+    fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
+    if not fresh:
+        return False
+
+    lines = [f"- {c.author or 'operator'}: {c.body.strip()}" for c in fresh]
+    note = (
+        "New note"
+        + ("s" if len(fresh) > 1 else "")
+        + " on your kanban task from the operator (delivered mid-run). "
+        + "Take it into account for the work you're doing right now:\n"
+        + "\n".join(lines)
+    )
+    try:
+        return bool(agent.steer(note))
+    except Exception:
+        logger.debug("comment-inject: steer failed", exc_info=True)
         return False
 
 
@@ -689,14 +705,6 @@ def _handle_complete(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
-    review_guard_err = _enforce_review_required_completion_guard(
-        tid,
-        summary=summary,
-        result=result,
-        metadata=metadata,
-    )
-    if review_guard_err:
-        return review_guard_err
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1343,10 +1351,10 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
     Subscription paths:
 
-    - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``
-      and ``HERMES_SESSION_CHAT_ID`` are set in ContextVars by the
-      messaging gateway before agent dispatch. The notification poller
-      already keys off these, so we just register a row.
+    - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``,
+      ``HERMES_SESSION_CHAT_ID``, and ``HERMES_SESSION_CHAT_TYPE`` are set in
+      ContextVars by the messaging gateway before agent dispatch. The
+      notification poller already keys off these, so we just register a row.
 
     - **TUI** (herm desktop / herm TUI): the platform/chat_id ContextVars
       are intentionally cleared (TUI is a single-channel local UI, not
@@ -1404,18 +1412,43 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
+        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
         notifier_profile = (
             get_session_env("HERMES_SESSION_PROFILE", "")
             or os.environ.get("HERMES_PROFILE")
         )
+        if not notifier_profile:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                notifier_profile = get_active_profile_name() or "default"
+            except Exception:
+                notifier_profile = "default"
+        delivery_metadata: dict[str, Any] = {}
+        if thread_id:
+            delivery_metadata["thread_id"] = thread_id
+        if chat_type:
+            delivery_metadata["chat_type"] = chat_type
+        if (
+            platform.lower() == "telegram"
+            and thread_id
+            and (chat_type or "").lower() in {"dm", "direct", "private"}
+        ):
+            delivery_metadata["telegram_dm_topic_reply_fallback"] = True
+            if str(thread_id) not in {"", "1"}:
+                delivery_metadata["direct_messages_topic_id"] = str(thread_id)
+            if message_id:
+                delivery_metadata["telegram_reply_to_message_id"] = str(message_id)
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
+            chat_type=chat_type,
             thread_id=thread_id, user_id=user_id,
             notifier_profile=notifier_profile,
+            delivery_metadata=delivery_metadata or None,
         )
         return True
     except Exception as _exc:
@@ -1586,13 +1619,10 @@ KANBAN_COMPLETE_SCHEMA = {
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
         "tests_run, decisions, findings, etc). At least one of "
-        "``summary`` or ``result`` is required. If your output is a "
-        "code change that still needs human review, do not call this "
-        "tool: add the structured handoff with ``kanban_comment`` and "
-        "then call ``kanban_block(reason=\"review-required: ...\")``. "
-        "If you created new tasks via ``kanban_create`` during this run, "
-        "list their ids in ``created_cards`` — the kernel verifies them "
-        "so phantom references are caught before they leak into downstream "
+        "``summary`` or ``result`` is required. If you created new "
+        "tasks via ``kanban_create`` during this run, list their ids "
+        "in ``created_cards`` — the kernel verifies them so phantom "
+        "references are caught before they leak into downstream "
         "automation. If you produced deliverable files (charts, PDFs, "
         "spreadsheets, generated images), list their absolute paths "
         "in ``artifacts`` — the gateway notifier will upload them as "

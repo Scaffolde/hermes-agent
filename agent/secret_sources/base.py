@@ -39,18 +39,35 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from contextvars import ContextVar, Token
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, FrozenSet, Iterator, List, Mapping, Optional, Sequence
+from typing import Dict, FrozenSet, List, MutableMapping, Optional, Sequence
 
 # Bump ONLY for breaking changes to the required contract surface
 # (abstract-method signatures, FetchResult required fields).  Additive
 # optional hooks must ship with defaults and must NOT bump this.
 SECRET_SOURCE_API_VERSION = 1
+
+_SOURCE_ENVIRONMENT: ContextVar[Optional[MutableMapping[str, str]]]
+_SOURCE_ENVIRONMENT = ContextVar("hermes_secret_source_environment", default=None)
+
+
+def set_source_environment(environ: MutableMapping[str, str]) -> Token:
+    """Install a per-fetch environment view without changing ``os.environ``."""
+    return _SOURCE_ENVIRONMENT.set(environ)
+
+
+def reset_source_environment(token: Token) -> None:
+    _SOURCE_ENVIRONMENT.reset(token)
+
+
+def get_source_environment() -> MutableMapping[str, str]:
+    """Return the active per-fetch environment, or the process environment."""
+    environ = _SOURCE_ENVIRONMENT.get()
+    return environ if environ is not None else os.environ
 
 # Timeout the orchestrator enforces around fetch() when the source's
 # config section doesn't override it.  Generous because a first run may
@@ -59,31 +76,6 @@ DEFAULT_FETCH_TIMEOUT_SECONDS = 120.0
 
 # Default timeout for run_secret_cli() subprocess invocations.
 DEFAULT_CLI_TIMEOUT_SECONDS = 30.0
-
-_SOURCE_ENVIRON: ContextVar[Optional[Mapping[str, str]]] = ContextVar(
-    "_SOURCE_ENVIRON", default=None
-)
-
-
-def source_environ() -> Mapping[str, str]:
-    """Return the environment visible to the active source fetch.
-
-    Registry-driven profile fetches install an isolated mapping here so
-    backends can resolve bootstrap credentials without reading or mutating
-    another profile's process-global environment.
-    """
-    scoped = _SOURCE_ENVIRON.get()
-    return scoped if scoped is not None else os.environ
-
-
-@contextmanager
-def use_source_environ(environ: Mapping[str, str]) -> Iterator[None]:
-    """Install an isolated source environment for one fetch worker."""
-    token = _SOURCE_ENVIRON.set(environ)
-    try:
-        yield
-    finally:
-        _SOURCE_ENVIRON.reset(token)
 
 
 class ErrorKind(str, Enum):
@@ -174,9 +166,6 @@ class SecretSource(ABC):
         ``cfg`` is the source's raw config section (``secrets.<name>``)
         from config.yaml — treat every field defensively, the section
         may be malformed.  ``home_path`` is the resolved HERMES_HOME.
-        Read bootstrap/process values through :func:`source_environ`, not
-        directly from ``os.environ``; multiplexed profile fetches install an
-        isolated mapping there to prevent cross-profile credential reads.
         """
 
     # -- optional hooks (defaults are correct for most sources) ------------
@@ -269,6 +258,10 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # ANSI CSI/OSC escape sequences — helper-CLI stderr often carries color
 # codes that must not reach Hermes' own startup output.
+# NOTE: intentionally NOT migrated to tools.ansi_strip.strip_ansi — the
+# optional terminator here (``(?:\x07|\x1b\\)?``) also strips *unterminated*
+# OSC sequences (common when a CLI is killed mid-write), which strip_ansi
+# leaves untouched. strip_ansi is not a superset of this regex.
 _ANSI_RE = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?)")
 
 
@@ -313,7 +306,7 @@ def run_secret_cli(
                  "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
     env: Dict[str, str] = {}
     for key in (*base_keep, *allow_env):
-        val = source_environ().get(key)
+        val = os.environ.get(key)
         if val is not None:
             env[key] = val
     if extra_env:
@@ -325,7 +318,7 @@ def run_secret_cli(
             list(argv),
             env=env,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=timeout,
             stdin=subprocess.DEVNULL,
         )

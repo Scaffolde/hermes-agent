@@ -19,9 +19,9 @@ name: Supply Chain Audit
 #   review_status      — JSON array of status objects consumed by the review
 #                         comment assembler (scripts/ci/assemble_review_comment.py).
 #   critical_findings  — "true" when the narrow critical-pattern scan found
-#                         something. The scanner publishes the exact evidence;
-#                         the review-label gate consumes this boolean and owns
-#                         approval, so adding ``ci-reviewed`` can heal the run.
+#                         something. The review-label gate consumes this and
+#                         owns the action-required result, so adding
+#                         ``ci-reviewed`` can heal the run on rerun.
 
 on:
   workflow_call:
@@ -162,16 +162,19 @@ jobs:
         id: emit-status
         if: always()
         env:
-          CI_REVIEWED: ${{ contains(github.event.pull_request.labels.*.name, 'ci-reviewed') }}
+          FOUND: ${{ steps.scan.outputs.found }}
         run: |
-          args=(
-            --supply-chain-findings-file /tmp/findings.md
-            --output "$GITHUB_OUTPUT"
-          )
-          if [ "$CI_REVIEWED" = "true" ]; then
-            args+=(--label-present)
-          fi
-          python3 scripts/ci/emit_review_status.py "${args[@]}"
+          python3 - <<'PYEOF'
+          import json, os
+
+          # The review-label gate renders and blocks critical findings. Keep
+          # this scan a fact-finder so adding ci-reviewed can rerun the gate
+          # without requiring the scanner itself to fail again.
+          status = []
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"review_status={json.dumps(status)}\n")
+          PYEOF
 
 
   dep-bounds:

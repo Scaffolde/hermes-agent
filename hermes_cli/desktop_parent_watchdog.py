@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -23,6 +24,7 @@ from typing import Optional
 _LOG = logging.getLogger(__name__)
 _ORPHAN_PARENT_PIDS = {0, 1}
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+_WINDOWS_PARENT_START_EPOCH_TOLERANCE_S = 5.0
 
 
 def _parse_parent_pid(raw: object) -> Optional[int]:
@@ -31,6 +33,14 @@ def _parse_parent_pid(raw: object) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return pid if pid > 0 else None
+
+
+def _parse_parent_start_epoch(raw: object) -> Optional[float]:
+    try:
+        epoch = float(str(raw or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return epoch if epoch > 0 else None
 
 
 def _pid_exists(pid: int) -> bool:
@@ -48,11 +58,43 @@ def _pid_exists(pid: int) -> bool:
         return True
 
 
+def _process_create_time(pid: int) -> Optional[float]:
+    if pid <= 0:
+        return None
+    try:
+        import psutil  # type: ignore
+
+        return float(psutil.Process(pid).create_time())
+    except ImportError:
+        # psutil is a core dependency. On Windows, parent identity checking is
+        # specifically what prevents PID reuse from keeping an orphan alive, so
+        # callers treat an unknown create_time as a failed identity check.
+        return None
+    except Exception:
+        return None
+
+
+def _windows_parent_identity_matches(
+    parent_pid: int,
+    expected_parent_start_epoch: float,
+    *,
+    process_create_time: Callable[[int], Optional[float]] = _process_create_time,
+    tolerance_s: float = _WINDOWS_PARENT_START_EPOCH_TOLERANCE_S,
+) -> bool:
+    actual = process_create_time(parent_pid)
+    if actual is None:
+        return False
+    return abs(actual - expected_parent_start_epoch) <= tolerance_s
+
+
 def _should_exit_for_parent(
     parent_pid: int,
     *,
+    expected_parent_start_epoch: float | None = None,
     getppid: Callable[[], int] = os.getppid,
     pid_exists: Callable[[int], bool] = _pid_exists,
+    process_create_time: Callable[[int], Optional[float]] = _process_create_time,
+    platform: str = sys.platform,
 ) -> bool:
     """Return True when the desktop parent is gone.
 
@@ -64,11 +106,22 @@ def _should_exit_for_parent(
     """
 
     current_parent = getppid()
+    if not pid_exists(parent_pid):
+        return True
+    if platform == "win32":
+        if expected_parent_start_epoch is None:
+            return True
+        if not _windows_parent_identity_matches(
+            parent_pid,
+            expected_parent_start_epoch,
+            process_create_time=process_create_time,
+        ):
+            return True
     if current_parent == parent_pid:
         return False
     if current_parent in _ORPHAN_PARENT_PIDS:
         return True
-    return not pid_exists(parent_pid)
+    return False
 
 
 def start_desktop_parent_watchdog(
@@ -91,13 +144,14 @@ def start_desktop_parent_watchdog(
     parent_pid = _parse_parent_pid(env.get("HERMES_DESKTOP_PARENT_PID"))
     if parent_pid is None:
         return None
+    expected_parent_start_epoch = _parse_parent_start_epoch(env.get("HERMES_DESKTOP_PARENT_START_EPOCH"))
 
     def _watch() -> None:
         while True:
             time.sleep(max(0.25, interval_s))
-            if _should_exit_for_parent(parent_pid):
+            if _should_exit_for_parent(parent_pid, expected_parent_start_epoch=expected_parent_start_epoch):
                 _LOG.warning(
-                    "Desktop parent PID %s disappeared; exiting orphaned dashboard backend",
+                    "Desktop parent PID %s disappeared or no longer matches; exiting orphaned dashboard backend",
                     parent_pid,
                 )
                 exit_fn(0)

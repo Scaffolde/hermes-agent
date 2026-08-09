@@ -3,12 +3,12 @@ import { timingSafeEqual } from 'node:crypto';
 /**
  * Authenticate the private Python↔Node bridge channel.
  *
- * An empty expected token keeps manually launched legacy bridges working.
- * Managed gateways always provide a persisted high-entropy token.
+ * Every bridge process must have a high-entropy token. Pair-only launches use
+ * an ephemeral token because they do not expose the HTTP API to a client.
  */
 export function hasValidBridgeToken(expectedToken, authorizationHeader) {
   const expected = String(expectedToken || '');
-  if (!expected) return true;
+  if (!expected) return false;
 
   const header = String(authorizationHeader || '');
   if (!header.startsWith('Bearer ')) return false;

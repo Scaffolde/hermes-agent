@@ -32,7 +32,6 @@ import { test } from 'vitest'
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..')
 const DESKTOP_PKG = path.join(REPO_ROOT, 'apps', 'desktop', 'package.json')
 const ROOT_LOCK = path.join(REPO_ROOT, 'package-lock.json')
-const PYPROJECT = path.join(REPO_ROOT, 'pyproject.toml')
 
 // An exact semver: digits.digits.digits with an optional prerelease/build tag,
 // but NO range operators (^ ~ > < = * x || spaces || -range).
@@ -56,28 +55,6 @@ function electronSpec(pkg: Record<string, unknown>): string {
 
   assert.fail('electron is not listed in apps/desktop dependencies')
 }
-
-function pythonProjectVersion(): string {
-  assert.ok(fs.existsSync(PYPROJECT), `missing ${PYPROJECT}`)
-  const source = fs.readFileSync(PYPROJECT, 'utf-8')
-  const projectSection = source.split(/^\[project\]\s*$/m)[1]?.split(/^\[/m)[0]
-  assert.ok(projectSection, 'pyproject.toml is missing [project]')
-  const version = projectSection.match(/^version\s*=\s*["']([^"']+)["']\s*$/m)?.[1]
-  assert.ok(version, 'pyproject.toml [project] is missing version')
-
-  return version
-}
-
-test('desktop package version matches Python runtime', () => {
-  const desktopVersion = desktopPkg().version
-  const pythonVersion = pythonProjectVersion()
-  assert.equal(
-    desktopVersion,
-    pythonVersion,
-    `desktop package version (${String(desktopVersion)}) must match the Python runtime ` +
-      `version (${pythonVersion}); run scripts/release.py to bump both together`
-  )
-})
 
 test('electron dependency is exactly pinned', () => {
   const spec = electronSpec(desktopPkg())

@@ -15,8 +15,8 @@ import { gauge, hbars, sparkline, sparkRows } from '../lib/charts.js'
 import { recordParentLifecycle } from '../lib/parentLog.js'
 
 import { openWidget, updateWidget } from './host.js'
-import { defineWidgetApp, getWidgetApp, listWidgetApps, removeWidgetApp } from './registry.js'
-import { isCtrl, type WidgetApp } from './types.js'
+import { defineWidgetApp, listWidgetApps, removeWidgetApp } from './registry.js'
+import { isCtrl } from './types.js'
 
 /**
  * User widget apps — Hermes authors its own TUI widgets, mirroring the
@@ -72,9 +72,6 @@ export interface UserWidgetLoadResult {
 /** Which app ids each user file registered — the delete-sync source of
  *  truth (file gone on the next scan ⇒ its apps unregister). */
 const fileApps = new Map<string, string[]>()
-const fileDefinitions = new Map<string, Map<string, WidgetApp<never>>>()
-const baseApps = new Map<string, undefined | WidgetApp<never>>()
-let widgetImportVersion = 0
 
 const listeners = new Set<(result: UserWidgetLoadResult) => void>()
 
@@ -92,8 +89,6 @@ export function onUserWidgets(listener: (result: UserWidgetLoadResult) => void):
  *  definitions). Files that vanished unregister their apps. */
 export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoadResult> {
   const result: UserWidgetLoadResult = { added: [], errors: [], loaded: [], removed: [] }
-  const beforeIds = new Set(listWidgetApps().map(app => app.id))
-  const affectedIds = new Set<string>()
 
   let files: string[] = []
 
@@ -106,26 +101,20 @@ export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoa
   for (const [file, ids] of fileApps) {
     if (!files.includes(file)) {
       fileApps.delete(file)
-      fileDefinitions.delete(file)
-      ids.forEach(id => affectedIds.add(id))
+
+      for (const id of ids) {
+        if (removeWidgetApp(id)) {
+          result.removed.push(id)
+        }
+      }
     }
   }
 
   for (const file of files) {
-    const previousIds = new Set(fileApps.get(file) ?? [])
-    const registeredApps = new Map<string, WidgetApp<never>>()
-
-    const scopedSdk: WidgetSdk = {
-      ...widgetSdk,
-      defineWidgetApp<S>(app: WidgetApp<S>): WidgetApp<S> {
-        registeredApps.set(app.id, app as WidgetApp<never>)
-
-        return app
-      }
-    }
+    const before = new Set(listWidgetApps().map(app => app.id))
 
     try {
-      const mod = (await import(`${pathToFileURL(join(dir, file)).href}?t=${Date.now()}-${++widgetImportVersion}`)) as {
+      const mod = (await import(`${pathToFileURL(join(dir, file)).href}?t=${Date.now()}`)) as {
         default?: (sdk: WidgetSdk) => void
       }
 
@@ -133,61 +122,23 @@ export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoa
         throw new Error('default export must be register(sdk)')
       }
 
-      mod.default(scopedSdk)
+      mod.default(widgetSdk)
       result.loaded.push(file)
 
-      const ids = [...registeredApps.keys()]
+      const ids = listWidgetApps()
+        .map(app => app.id)
+        .filter(id => !before.has(id))
 
-      for (const id of ids) {
-        if (!baseApps.has(id)) {
-          baseApps.set(id, getWidgetApp(id))
-        }
+      // Re-registrations of existing ids keep their prior file attribution.
+      if (ids.length) {
+        fileApps.set(file, ids)
+        result.added.push(...ids)
       }
-
-      previousIds.forEach(id => affectedIds.add(id))
-      ids.forEach(id => affectedIds.add(id))
-      fileApps.set(file, ids)
-      fileDefinitions.set(file, registeredApps)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
 
       result.errors.push({ file, message })
       recordParentLifecycle(`user widget ${file} failed to load: ${message}`)
-    }
-  }
-
-  const orderedFiles = [...fileDefinitions.keys()].sort()
-
-  for (const id of [...affectedIds].sort()) {
-    const baseApp = baseApps.get(id)
-
-    if (baseApp) {
-      defineWidgetApp(baseApp)
-    } else {
-      removeWidgetApp(id)
-    }
-
-    let hasUserDefinition = false
-
-    for (const file of orderedFiles) {
-      const userApp = fileDefinitions.get(file)?.get(id)
-
-      if (userApp) {
-        defineWidgetApp(userApp)
-        hasUserDefinition = true
-      }
-    }
-
-    const existsAfter = getWidgetApp(id) !== undefined
-
-    if (!beforeIds.has(id) && existsAfter) {
-      result.added.push(id)
-    } else if (beforeIds.has(id) && !existsAfter) {
-      result.removed.push(id)
-    }
-
-    if (!hasUserDefinition) {
-      baseApps.delete(id)
     }
   }
 

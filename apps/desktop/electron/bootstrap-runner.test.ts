@@ -81,38 +81,24 @@ test('existing checkout detection requires git metadata', () => {
   }
 })
 
-test('fresh bootstrap args prefer the durable commit over a stale packaged branch', () => {
-  const installStamp = { commit: 'a'.repeat(40), branch: 'deleted-build-branch' }
+test('fresh bootstrap args include the packaged commit pin', () => {
+  const installStamp = { commit: 'a'.repeat(40), branch: 'main' }
 
-  assert.deepEqual(buildPinArgs(installStamp), ['-Commit', installStamp.commit])
+  assert.deepEqual(buildPinArgs(installStamp), ['-Commit', installStamp.commit, '-Branch', 'main'])
   assert.deepEqual(
     buildPosixPinArgs({
       installStamp,
       activeRoot: '/tmp/hermes-agent',
       hermesHome: '/tmp/hermes'
     }),
-    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--commit', installStamp.commit]
+    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--branch', 'main', '--commit', installStamp.commit]
   )
 })
 
-test('fresh bootstrap args fall back to a packaged branch when no commit is available', () => {
-  const installStamp = { branch: 'release-branch' }
+test('existing-checkout bootstrap args keep branch but skip the packaged commit pin', () => {
+  const installStamp = { commit: 'a'.repeat(40), branch: 'main' }
 
-  assert.deepEqual(buildPinArgs(installStamp), ['-Branch', 'release-branch'])
-  assert.deepEqual(
-    buildPosixPinArgs({
-      installStamp,
-      activeRoot: '/tmp/hermes-agent',
-      hermesHome: '/tmp/hermes'
-    }),
-    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--branch', 'release-branch']
-  )
-})
-
-test('existing-checkout bootstrap args ignore stale packaged commit and branch pins', () => {
-  const installStamp = { commit: 'a'.repeat(40), branch: 'deleted-build-branch' }
-
-  assert.deepEqual(buildPinArgs(installStamp, { pinCommit: false }), [])
+  assert.deepEqual(buildPinArgs(installStamp, { pinCommit: false }), ['-Branch', 'main'])
   assert.deepEqual(
     buildPosixPinArgs({
       installStamp,
@@ -120,7 +106,7 @@ test('existing-checkout bootstrap args ignore stale packaged commit and branch p
       hermesHome: '/tmp/hermes',
       pinCommit: false
     }),
-    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes']
+    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--branch', 'main']
   )
 })
 
@@ -143,14 +129,6 @@ test('fallback install stamps use an unpinned branch ref', () => {
     }),
     ['--dir', '/tmp/hermes', '--hermes-home', '/tmp/home', '--branch', 'main']
   )
-})
-
-test('legacy branch-only install stamps use an unpinned branch ref', () => {
-  assert.deepEqual(installRefForStamp({ branch: 'release-branch' }), {
-    ref: 'release-branch',
-    cacheKey: 'fallback-release-branch',
-    pinned: false
-  })
 })
 
 test('resolveMarkerPinnedCommit prefers real HEAD over fallback stamp zeros', () => {

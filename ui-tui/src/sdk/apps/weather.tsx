@@ -79,6 +79,7 @@ const artColor = (art: Art, t: Theme): string =>
 
 async function fetchReport(location: string): Promise<Report> {
   const res = await fetch(`https://wttr.in/${encodeURIComponent(location)}?format=j1`, {
+    headers: { 'User-Agent': 'hermes-tui-weather' },
     signal: AbortSignal.timeout(10_000)
   })
 

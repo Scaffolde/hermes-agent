@@ -8,11 +8,9 @@ import { sessionTileDelegate } from './session-states'
 
 const STORAGE_KEY = 'hermes.desktop.model-presets'
 
-/** Per-model reasoning / variant-fast preset, remembered globally across sessions
- *  and re-applied whenever that model is selected. Param-fast is intentionally
- *  excluded elsewhere so GPT/OpenAI Priority Processing never becomes a saved
- *  default. Unset dimensions fall back to the Hermes default (medium effort, no
- *  fast). */
+/** Per-model reasoning/fast preset, remembered globally across sessions and
+ *  re-applied to the session whenever that model is selected. Unset dimensions
+ *  fall back to the Hermes default (medium effort, no fast). */
 export interface ModelPreset {
   effort?: string
   fast?: boolean

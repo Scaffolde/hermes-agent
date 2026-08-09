@@ -99,6 +99,13 @@ def _make_origin_with_checkout_target(tmp_path: Path) -> tuple[Path, Path, str]:
     _git(origin_work, "add", "f.txt")
     _git(origin_work, "commit", "-m", "main")
 
+    _git(origin_work, "checkout", "-b", "pinned-target", base_commit)
+    (origin_work / "f.txt").write_text("pinned target\n")
+    _git(origin_work, "add", "f.txt")
+    _git(origin_work, "commit", "-m", "pinned-target")
+    target_commit = _git(origin_work, "rev-parse", "HEAD").stdout.strip()
+    _git(origin_work, "checkout", "main")
+
     origin = tmp_path / "origin.git"
     _git(tmp_path, "clone", "--bare", str(origin_work), str(origin))
 
@@ -106,8 +113,7 @@ def _make_origin_with_checkout_target(tmp_path: Path) -> tuple[Path, Path, str]:
     _git(tmp_path, "clone", str(origin), str(install_dir))
     (install_dir / "f.txt").write_text("local dirty edit\n")
 
-    return origin, install_dir, base_commit
-
+    return origin, install_dir, target_commit
 
 @pytest.mark.live_system_guard_bypass  # runs against a dedicated throwaway repo
 def test_install_sh_clears_unmerged_index_then_stashes(tmp_path: Path) -> None:
@@ -185,7 +191,6 @@ def test_install_sh_stage_protocol_fails_when_pin_checkout_is_blocked(
     assert '"ok":false' in res.stdout
     assert "Your local changes to the following files would be overwritten" in res.stderr
     assert "Repository ready" not in res.stdout
-
 
 def test_install_ps1_clears_unmerged_index_before_stash() -> None:
     """install.ps1 must clear an unmerged index before stash/checkout, and do

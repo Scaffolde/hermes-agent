@@ -194,16 +194,17 @@ export function parseTokenResponse(body: any): NativeTokenSet {
 }
 
 /**
- * Validate the camelCase NativeTokenSet shape encrypted by
- * `_persistNativeTokens`. This is intentionally separate from
- * parseTokenResponse: gateway wire responses are snake_case, while the local
- * JSON store serializes the normalized TypeScript object.
+ * Validate a token set loaded from the encrypted local store.
+ *
+ * The stored representation is already normalized as NativeTokenSet and
+ * therefore uses camelCase. Gateway token responses use snake_case and
+ * remain handled separately by parseTokenResponse().
  */
 export function parseStoredTokenSet(body: any): NativeTokenSet {
   const accessToken = String(body?.accessToken || '')
 
   if (!accessToken) {
-    throw new Error('Stored native token set missing accessToken')
+    throw new Error('Stored token set missing accessToken')
   }
 
   const expiresAt = Number(body?.expiresAt)

@@ -1,7 +1,7 @@
 """Tests for CLI/TUI CWD resolution in load_cli_config().
 
 Rules:
-- Local backend CLI/TUI: explicit terminal.cwd is respected; placeholders use os.getcwd().
+- Local backend CLI/TUI: always os.getcwd(), ignoring config and inherited env.
 - Non-local with placeholder: pop cwd for backend default.
 - Non-local with explicit path: keep as-is.
 """
@@ -13,15 +13,11 @@ _CWD_PLACEHOLDERS = (".", "auto", "cwd")
 def _resolve_cwd(terminal_config: dict, defaults: dict, env: dict):
     """Mirror the CWD resolution logic from cli.py load_cli_config()."""
     effective_backend = terminal_config.get("env_type", "local")
-    configured_cwd = str(terminal_config.get("cwd", ".") or ".").strip()
 
     if effective_backend == "local":
-        if configured_cwd in _CWD_PLACEHOLDERS:
-            terminal_config["cwd"] = "/fake/getcwd"
-        else:
-            terminal_config["cwd"] = configured_cwd.replace("~", "/fake/home", 1)
+        terminal_config["cwd"] = "/fake/getcwd"
         defaults["terminal"]["cwd"] = terminal_config["cwd"]
-    elif configured_cwd in _CWD_PLACEHOLDERS:
+    elif terminal_config.get("cwd") in _CWD_PLACEHOLDERS:
         terminal_config.pop("cwd", None)
 
     # Bridge: TERMINAL_CWD always exported in CLI, skipped in gateway
@@ -36,19 +32,19 @@ def _resolve_cwd(terminal_config: dict, defaults: dict, env: dict):
 
 
 class TestLocalBackendCli:
-    """Local backend respects explicit config and resolves placeholders to os.getcwd()."""
+    """Local backend always uses os.getcwd()."""
 
-    def test_explicit_config_respected(self):
+    def test_explicit_config_ignored(self):
         env = {}
         tc = {"cwd": "/explicit/path", "env_type": "local"}
         d = {"terminal": {"cwd": "/explicit/path"}}
-        assert _resolve_cwd(tc, d, env) == "/explicit/path"
+        assert _resolve_cwd(tc, d, env) == "/fake/getcwd"
 
     def test_inherited_env_overwritten(self):
         env = {"TERMINAL_CWD": "/parent/hermes"}
         tc = {"cwd": "/home/user", "env_type": "local"}
         d = {"terminal": {"cwd": "/home/user"}}
-        assert _resolve_cwd(tc, d, env) == "/home/user"
+        assert _resolve_cwd(tc, d, env) == "/fake/getcwd"
 
     def test_placeholder_resolved(self):
         env = {}
@@ -61,12 +57,6 @@ class TestLocalBackendCli:
         tc = {"cwd": ".", "env_type": "local"}
         d = {"terminal": {"cwd": "."}}
         assert _resolve_cwd(tc, d, env) == "/fake/getcwd"
-
-    def test_explicit_home_path_expanded(self):
-        env = {}
-        tc = {"cwd": "~/project", "env_type": "local"}
-        d = {"terminal": {"cwd": "~/project"}}
-        assert _resolve_cwd(tc, d, env) == "/fake/home/project"
 
 
 class TestNonLocalBackends:
@@ -106,4 +96,4 @@ class TestGatewayLazyImport:
         tc = {"cwd": "/home/user", "env_type": "local"}
         d = {"terminal": {"cwd": "/home/user"}}
         result = _resolve_cwd(tc, d, env)
-        assert result == "/home/user"
+        assert result == "/fake/getcwd"

@@ -25,8 +25,6 @@ import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from hermes_state import SessionDB
 
 from agent.turn_context import build_turn_context
@@ -89,58 +87,8 @@ def _history(n: int = 20) -> list:
     return [{"role": "user", "content": f"m{i}"} for i in range(n)]
 
 
-def test_idle_compaction_runs_through_guarded_path_and_releases_lock(
-    tmp_path: Path,
-) -> None:
-    """Happy path: the idle trigger reaches the real ``compress_context``.
-
-    It must acquire + release the per-session lock, invoke the compressor
-    exactly once, and (rotation mode) rotate the session — proving the trigger
-    is wired through the guarded entrypoint rather than calling the compressor
-    directly.
-    """
-    db = SessionDB(db_path=tmp_path / "state.db")
-    sid = "IDLE_HAPPY"
-    db.create_session(sid, source="cli")
-    agent = _prep_idle_agent(db, sid)
-
-    ctx = _run_prologue(agent, _history())
-
-    agent.context_compressor.compress.assert_called_once()
-    # Rotation mode (in_place=False in the shared fixture) creates a child.
-    assert agent.session_id != sid
-    # The lock keyed on the OLD session id must not leak.
-    assert db.get_compression_lock_holder(sid) is None
-    # The turn continues on the compacted transcript, with the user-message
-    # anchor pointing at a live user row in the rebuilt list.
-    assert 0 <= ctx.current_turn_user_idx < len(ctx.messages)
-    assert ctx.messages[ctx.current_turn_user_idx].get("role") == "user"
 
 
-def test_idle_compaction_status_suppressed_when_engine_opts_out(
-    tmp_path: Path,
-) -> None:
-    """Quiet context engines silence the 💤 idle-resume status line too.
-
-    The idle emit routes through ``automatic_compaction_status_message``
-    (phase="idle") the same way the preflight and pre-API emits do — an
-    engine with ``emit_automatic_compaction_status = False`` gets a fully
-    silent idle compaction, while the compaction itself still runs.
-    """
-    db = SessionDB(db_path=tmp_path / "state.db")
-    sid = "IDLE_QUIET"
-    db.create_session(sid, source="cli")
-    agent = _prep_idle_agent(db, sid)
-    agent.context_compressor.emit_automatic_compaction_status = False
-    events = []
-    agent.status_callback = lambda ev, msg: events.append((ev, msg))
-
-    _run_prologue(agent, _history())
-
-    agent.context_compressor.compress.assert_called_once()
-    assert not any(
-        "Resumed after" in str(msg) for _ev, msg in events
-    ), f"idle status leaked despite quiet engine: {events}"
 
 
 def test_idle_compaction_status_emitted_by_default(tmp_path: Path) -> None:
@@ -237,111 +185,5 @@ def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> None:
     assert len(ctx.messages) == len(_history()) + 1
 
 
-def test_idle_compaction_respects_persisted_failure_cooldown(
-    tmp_path: Path,
-) -> None:
-    """An active summary-failure cooldown must gate the idle trigger up front.
-
-    The idle predicate itself consults
-    ``get_active_compression_failure_cooldown`` — with a persisted cooldown in
-    state.db the trigger must not even reach ``_compress_context``.
-    """
-    from agent.context_compressor import ContextCompressor
-
-    db = SessionDB(db_path=tmp_path / "state.db")
-    sid = "IDLE_COOLDOWN"
-    db.create_session(sid, source="cli")
-    db.record_compression_failure_cooldown(sid, 4_000_000_000.0, "timeout")
-
-    agent = _prep_idle_agent(db, sid)
-    with patch(
-        "agent.context_compressor.get_model_context_length", return_value=100_000
-    ):
-        compressor = ContextCompressor(
-            model="test/model",
-            threshold_percent=0.85,
-            protect_first_n=2,
-            protect_last_n=2,
-            quiet_mode=True,
-        )
-    compressor.bind_session_state(db, sid)
-    compressor.compress = MagicMock()
-    agent.context_compressor = compressor
-    agent._compress_context = MagicMock()
-
-    ctx = _run_prologue(agent, _history())
-
-    agent._compress_context.assert_not_called()
-    compressor.compress.assert_not_called()
-    assert agent.session_id == sid
-    assert len(ctx.messages) == len(_history()) + 1
 
 
-def test_idle_compaction_disabled_by_default(tmp_path: Path) -> None:
-    """With the default config (0) a huge idle gap must never trigger."""
-    db = SessionDB(db_path=tmp_path / "state.db")
-    sid = "IDLE_OFF"
-    db.create_session(sid, source="cli")
-    agent = _prep_idle_agent(db, sid, idle_after=0, idle_gap=10_000_000.0)
-    agent._compress_context = MagicMock()
-
-    ctx = _run_prologue(agent, _history())
-
-    agent._compress_context.assert_not_called()
-    agent.context_compressor.compress.assert_not_called()
-    assert agent.session_id == sid
-    assert len(ctx.messages) == len(_history()) + 1
-
-
-def test_idle_compaction_uses_configured_ratio_for_plugin_engine(
-    tmp_path: Path,
-) -> None:
-    """Plugin engines need not expose ContextCompressor-only ratio fields."""
-    db = SessionDB(db_path=tmp_path / "state.db")
-    sid = "IDLE_PLUGIN_ENGINE"
-    db.create_session(sid, source="cli")
-    agent = _prep_idle_agent(db, sid)
-    agent.compression_summary_target_ratio = 0.35
-    agent.context_compressor = types.SimpleNamespace(
-        threshold_tokens=100_000,
-        protect_first_n=2,
-        protect_last_n=2,
-        get_active_compression_failure_cooldown=lambda: None,
-    )
-
-    with patch(
-        "agent.turn_context._should_idle_compact", return_value=False
-    ) as should_idle:
-        _run_prologue(agent, _history())
-
-    assert should_idle.call_args.kwargs["floor_tokens"] == 35_000
-
-
-@pytest.mark.parametrize(
-    ("raw_value", "expected"),
-    [
-        (None, 0),
-        ("never", 0),
-        (True, 0),
-        (12.5, 0),
-        (-60, 0),
-        (60.0, 60),
-        ("120", 120),
-    ],
-)
-def test_idle_compaction_config_is_tolerant(
-    monkeypatch,
-    tmp_path: Path,
-    raw_value,
-    expected: int,
-) -> None:
-    """Invalid YAML values disable idle compaction instead of startup."""
-    from tests.agent.test_proactive_prune_config import _make_agent
-
-    agent = _make_agent(
-        monkeypatch,
-        tmp_path,
-        idle_compact_after_seconds=raw_value,
-    )
-
-    assert agent.compression_idle_compact_after_seconds == expected

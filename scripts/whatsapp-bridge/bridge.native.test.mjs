@@ -18,47 +18,31 @@ import {
   createBoundedMessageStore,
   appendMediaFailureNote,
   extractBridgeEvent,
+  inboundReadReceiptKeys,
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
-  resolvePairTimeoutSeconds,
-  writePairEventAndExit,
 } from './bridge_helpers.js';
 
-// -- bounded pairing lifecycle -------------------------------------------
+// -- inbound read receipts ------------------------------------------------
 {
-  assert.equal(resolvePairTimeoutSeconds('15'), 15);
-  assert.equal(resolvePairTimeoutSeconds('0'), 600);
-  assert.equal(resolvePairTimeoutSeconds('not-a-number'), 600);
-  assert.equal(resolvePairTimeoutSeconds('15seconds'), 600);
-  console.log('  ✓ pair-only timeout parsing is bounded and deterministic');
-}
+  const groupKey = {
+    id: 'incoming-group-1',
+    remoteJid: '120363001234567890@g.us',
+    participant: '15550001111@s.whatsapp.net',
+    fromMe: false,
+  };
 
-{
-  let pendingFlush = null;
-  let exitCode = null;
-  let output = '';
-  writePairEventAndExit(
-    { event: 'error', error: 'pair_timeout' },
-    {
-      code: 124,
-      now: () => 123,
-      stream: {
-        write(line, callback) {
-          output += line;
-          pendingFlush = callback;
-        },
-      },
-      exit(code) {
-        exitCode = code;
-      },
-    },
+  assert.deepEqual(inboundReadReceiptKeys({ key: groupKey, enabled: false }), []);
+  assert.deepEqual(
+    inboundReadReceiptKeys({ key: { ...groupKey, fromMe: true }, enabled: true }),
+    [],
   );
-  assert.equal(exitCode, null);
-  assert.equal(output, '{"ts":123,"event":"error","error":"pair_timeout"}\n');
-  pendingFlush();
-  assert.equal(exitCode, 124);
-  console.log('  ✓ pair-only timeout exits only after its JSON event flushes');
+  const receiptKeys = inboundReadReceiptKeys({ key: groupKey, enabled: true });
+  assert.equal(receiptKeys.length, 1);
+  assert.equal(receiptKeys[0], groupKey);
+  assert.equal(receiptKeys[0].participant, groupKey.participant);
+  console.log('  ✓ inbound read receipts preserve the original group message key');
 }
 
 // -- quoted outbound text -------------------------------------------------
@@ -134,6 +118,12 @@ import {
   assert.equal(event.quotedParticipant, '15559998888@s.whatsapp.net');
   assert.equal(event.quotedRemoteJid, '15551234567@s.whatsapp.net');
   assert.equal(event.quotedText, 'approve deploy?');
+  assert.deepEqual(event.readReceiptKey, {
+    id: 'incoming-1',
+    remoteJid: '15551234567@s.whatsapp.net',
+    participant: '15550001111@s.whatsapp.net',
+    fromMe: false,
+  });
   assert.equal(event.hasQuotedMessage, true);
   assert.equal(event.body, 'approved');
   console.log('  ✓ inbound quoted metadata includes quoted text');

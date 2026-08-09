@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 from typing import List
 
 from rich.console import Console
@@ -73,10 +72,26 @@ def register_cli(parent_parser: argparse.ArgumentParser) -> None:
              "loudly if BW is unreachable rather than silently falling back.",
     )
     setup.add_argument(
+        "--no-bitwarden", action="store_true",
+        help="Explicitly switch credential_source back to env on re-setup "
+             "(only meaningful when the previous setup used --from-bitwarden).",
+    )
+    setup.add_argument(
         "--rotate-tokens", action="store_true",
         help="Mint fresh proxy tokens for every provider (default is to "
              "preserve tokens for providers that already had one — avoids "
              "401-ing already-running sandboxes on re-setup).",
+    )
+    setup.add_argument(
+        "--restart", dest="restart", action="store_true", default=None,
+        help="If a daemon is already running, restart it automatically after "
+             "writing the new config/tokens (non-interactive default on a tty "
+             "is to ask).",
+    )
+    setup.add_argument(
+        "--no-restart", dest="restart", action="store_false",
+        help="Do not restart a running daemon after setup; you'll need to run "
+             "`hermes egress restart` yourself for changes to take effect.",
     )
     setup.set_defaults(func=cmd_setup)
 
@@ -85,6 +100,19 @@ def register_cli(parent_parser: argparse.ArgumentParser) -> None:
 
     stop = sub.add_parser("stop", help="Stop the managed iron-proxy")
     stop.set_defaults(func=cmd_stop)
+
+    restart = sub.add_parser(
+        "restart",
+        help="Restart the managed iron-proxy (stop if running, then start)",
+    )
+    restart.set_defaults(func=cmd_restart)
+
+    reload_p = sub.add_parser(
+        "reload",
+        help="Hot-reload the running daemon's ruleset from proxy.yaml "
+             "(management API — no restart, no dropped connections)",
+    )
+    reload_p.set_defaults(func=cmd_reload)
 
     status = sub.add_parser("status", help="Show proxy state and mappings")
     status.add_argument(
@@ -212,6 +240,19 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 "the host process env at start time)."
             )
             return 1
+    else:
+        # Env-based discovery reads os.environ.  Operators commonly keep their
+        # provider keys only in ~/.hermes/.env (loaded automatically when the
+        # agent runs, but NOT exported into an interactive shell).  Fall back
+        # to loading that file so `hermes egress setup` finds the same keys the
+        # agent would — otherwise a user with keys solely in .env sees a
+        # confusing "no provider keys found" when the keys clearly "exist".
+        loaded = _load_env_file_into_environ()
+        if loaded:
+            console.print(
+                f"  [dim]Loaded {loaded} provider key name(s) from "
+                f"~/.hermes/.env for discovery.[/dim]"
+            )
 
     discovered = ip.discover_provider_mappings(
         available_env_names=available_env_names or None,
@@ -222,10 +263,58 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # egress setup` from invalidating tokens baked into already-running
     # sandboxes.
     existing = ip.load_mappings()
+    rotate = bool(getattr(args, "rotate_tokens", False))
+
+    # P3 confirmation gate: --rotate-tokens invalidates every running
+    # sandbox's proxy tokens immediately.  An accidental re-run (history
+    # scroll-back, tmux paste) is unrecoverable, so require explicit
+    # confirmation when there's something to actually rotate.  Skipped
+    # when stdin isn't a tty (CI / non-interactive use), in which case
+    # the operator passed the flag deliberately.
+    if rotate and existing:
+        import sys as _sys
+        from datetime import datetime as _dt
+        if _sys.stdin.isatty():
+            console.print(
+                "[yellow]⚠[/yellow]  --rotate-tokens will invalidate proxy "
+                "tokens in every running Hermes sandbox.  They will start "
+                "401-ing against upstreams until restarted."
+            )
+            try:
+                ans = input("Type 'rotate' to confirm: ").strip().lower()
+            except EOFError:
+                ans = ""
+            if ans != "rotate":
+                console.print("[yellow]Cancelled.[/yellow]")
+                return 1
+        # Backup the existing mappings before we overwrite.  The
+        # resulting ``.rotated-<unix>`` sibling is plain JSON and lets
+        # the operator manually recover tokens if they realise the
+        # rotation was a mistake.
+        try:
+            import shutil as _shutil
+            state_dir = ip._proxy_state_dir()
+            mappings_src = state_dir / "mappings.json"
+            if mappings_src.exists():
+                ts = _dt.now().strftime("%Y%m%dT%H%M%S")
+                backup = state_dir / f"mappings.json.rotated-{ts}"
+                _shutil.copy2(str(mappings_src), str(backup))
+                console.print(f"  [dim]backup: {backup}[/dim]")
+        except OSError as exc:
+            console.print(
+                f"  [yellow]Could not back up mappings before rotation: "
+                f"{exc}[/yellow]"
+            )
+    elif rotate and not existing:
+        console.print(
+            "[dim]Note: --rotate-tokens is a no-op on first-time setup "
+            "(no existing tokens to rotate).[/dim]"
+        )
+
     mappings = ip.merge_mappings(
         existing=existing,
         discovered=discovered,
-        rotate=bool(getattr(args, "rotate_tokens", False)),
+        rotate=rotate,
     )
 
     if not mappings:
@@ -240,7 +329,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         return 1
 
     # Warn the operator about providers we recognize but can't proxy
-    # (Anthropic native, AWS Bedrock, Azure OpenAI, etc).  These still
+    # (AWS Bedrock SigV4, GCP Vertex service-account OAuth).  These still
     # work — they just bypass the egress isolation.
     uncovered = ip.discover_uncovered_providers(
         available_env_names=available_env_names or None,
@@ -254,19 +343,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
         for name in uncovered:
             console.print(f"    - {name}")
         console.print(
-            "  [dim]These providers use non-bearer auth (x-api-key, "
-            "SigV4, etc.) and will hold real credentials inside the "
-            "sandbox.  Egress isolation is INCOMPLETE for these.[/dim]"
-        )
-
-    # If we're rotating existing mappings, also surface that — the
-    # operator might be running containers that hold the old tokens.
-    if existing and getattr(args, "rotate_tokens", False):
-        console.print()
-        console.print(
-            "  [yellow]⚠[/yellow]  --rotate-tokens used: any running "
-            "Hermes sandbox holds stale tokens and will 401 against "
-            "upstreams until restarted."
+            "  [dim]These providers use request signing or SDK-minted "
+            "OAuth (SigV4, service-account files) and will hold real "
+            "credentials inside the sandbox.  Egress isolation is "
+            "INCOMPLETE for these.[/dim]"
         )
 
     table = Table(show_header=True, header_style="bold")
@@ -292,9 +372,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # and surface a clear error rather than silently substituting the
     # default.
     if args.tunnel_port is not None:
-        if args.tunnel_port == 0:
+        if args.tunnel_port < 1 or args.tunnel_port > 65534:
             console.print(
-                "  [red]✗ --tunnel-port=0 is not a valid TCP port.[/red]"
+                "  [red]✗ --tunnel-port must be between 1 and 65534 "
+                "(the plain-HTTP listener uses port+1).[/red]"
             )
             return 1
         tunnel_port = int(args.tunnel_port)
@@ -308,10 +389,19 @@ def cmd_setup(args: argparse.Namespace) -> int:
     ]
 
     audit_log_path = ip._proxy_state_dir() / "audit.log"
-    # Pre-create the audit log with 0o600 so iron-proxy inherits private
-    # perms instead of letting the daemon create it under the default
-    # umask (potentially world-readable).
-    ip.ensure_audit_log(audit_log_path)
+    # Pre-create the audit log with 0o600.  On the pinned v0.39 the
+    # daemon does NOT write to this file (no ``log.audit_path`` field in
+    # its config schema) — it's reserved for the v0.40+ upgrade where
+    # per-request records start flowing.  Because the file is
+    # non-load-bearing today, a pre-create failure (immutable parent,
+    # pre-existing foreign-owned file, full disk) is a WARNING, not a
+    # setup abort.
+    audit_log_ok = True
+    try:
+        ip.ensure_audit_log(audit_log_path)
+    except RuntimeError as exc:
+        audit_log_ok = False
+        console.print(f"  [yellow]⚠ {exc}[/yellow]")
 
     # Allow operator override of the deny list via
     # ``proxy.upstream_deny_cidrs`` — but the default (None) gives a safe
@@ -329,17 +419,112 @@ def cmd_setup(args: argparse.Namespace) -> int:
     )
     cfg_path = ip.write_proxy_config(iron_cfg)
     mappings_path = ip.write_mappings(mappings)
+    # Mint (or keep) the management-API bearer key.  The generated config
+    # enables a loopback management listener whose /v1/reload lets
+    # `hermes egress reload` apply future ruleset changes without a
+    # restart; the daemon requires the key env var to be non-empty at
+    # startup, so make sure the token exists before first start.
+    ip.ensure_management_token()
     console.print(f"  [green]✓[/green] config:   {cfg_path}")
     console.print(f"  [green]✓[/green] mappings: {mappings_path}")
-    console.print(f"  [green]✓[/green] audit log: {audit_log_path}")
+    if audit_log_ok:
+        console.print(
+            f"  [green]✓[/green] audit log: {audit_log_path} "
+            f"[dim](reserved — not written by iron-proxy v0.39; "
+            f"per-request records land in iron-proxy.log)[/dim]"
+        )
 
     # ------------------------------------------------------------------ enable
     proxy_cfg["enabled"] = True
     proxy_cfg.setdefault("auto_install", True)
     proxy_cfg.setdefault("enforce_on_docker", True)
-    proxy_cfg["credential_source"] = "bitwarden" if args.from_bitwarden else "env"
-    proxy_cfg.setdefault("fail_on_uncovered_providers", False)
+    # CRITICAL: do NOT silently downgrade credential_source on re-run.
+    # If the operator previously configured `bitwarden` mode (e.g. for
+    # rotation), running `hermes egress setup` again WITHOUT
+    # --from-bitwarden must not rewrite credential_source to "env" —
+    # that silently breaks the Bitwarden rotation guarantee the docs
+    # make.  Require an explicit --no-bitwarden to switch back.
+    existing_source = proxy_cfg.get("credential_source")
+    if args.from_bitwarden:
+        proxy_cfg["credential_source"] = "bitwarden"
+    elif getattr(args, "no_bitwarden", False):
+        proxy_cfg["credential_source"] = "env"
+        if existing_source == "bitwarden":
+            console.print(
+                "[yellow]Switched credential_source from bitwarden to env.[/yellow]"
+            )
+    elif existing_source == "bitwarden":
+        # Preserve the existing bitwarden mode.  Surface the decision so
+        # the operator knows we kept it.
+        console.print(
+            "[dim]Keeping credential_source=bitwarden from existing config. "
+            "Pass --no-bitwarden to switch to env-based credentials.[/dim]"
+        )
+    else:
+        proxy_cfg["credential_source"] = "env"
     save_config(cfg)
+
+    live_status = ip.get_status()
+    was_running = live_status.pid is not None
+    if was_running:
+        ip.stop_proxy()
+
+    # Decide whether to (re)start the daemon so the new config/tokens take
+    # effect, rather than leaving the operator to remember a manual restart
+    # (the #1 UX papercut for this feature).
+    #   --restart      → always (re)start, even if nothing was running
+    #   --no-restart   → never; leave it as-is and print the manual hint
+    #   neither + tty  → ask (only when a daemon was running)
+    #   neither + !tty → restart when a daemon was running; otherwise no-op
+    #                    (first-time setup never auto-starts — matches the
+    #                    "configured, now run start" flow)
+    import sys as _sys
+    restart_pref = getattr(args, "restart", None)
+    if restart_pref is True:
+        do_restart = True
+    elif restart_pref is False:
+        do_restart = False
+    elif was_running:
+        if _sys.stdin.isatty():
+            try:
+                ans = input(
+                    "  Restart the running proxy now with the new config? [Y/n] "
+                ).strip().lower()
+            except EOFError:
+                ans = ""
+            do_restart = ans in ("", "y", "yes")
+        else:
+            do_restart = True
+    else:
+        do_restart = False
+
+    if do_restart:
+        try:
+            new_status = ip.start_proxy(
+                install_if_missing=bool(proxy_cfg.get("auto_install", True)),
+            )
+        except Exception as exc:  # noqa: BLE001 — user-facing funnel
+            console.print(
+                f"  [yellow]⚠ could not start iron-proxy with the new "
+                f"config: {exc}[/yellow]"
+            )
+            console.print(
+                "  Run [cyan]hermes egress start[/cyan] manually before "
+                "launching new Docker sandboxes."
+            )
+        else:
+            listening = "listening" if new_status.listening else "not yet listening"
+            verb = "restarted" if was_running else "started"
+            console.print(
+                f"  [green]✓[/green] {verb} iron-proxy with the new config "
+                f"(pid={new_status.pid}, port={new_status.tunnel_port}, {listening})"
+            )
+    elif was_running:
+        console.print(
+            "  [yellow]⚠ stopped the running iron-proxy; config or tokens "
+            "changed.  Run [cyan]hermes egress restart[/cyan] (or "
+            "[cyan]start[/cyan]) before launching new Docker sandboxes.[/yellow]"
+        )
 
     console.print()
     console.print(
@@ -348,6 +533,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
     )
     console.print(
         "  Start:   [cyan]hermes egress start[/cyan]\n"
+        "  Restart: [cyan]hermes egress restart[/cyan]  (after any re-setup)\n"
+        "  Reload:  [cyan]hermes egress reload[/cyan]   (apply ruleset edits "
+        "in-place, no restart)\n"
         "  Status:  [cyan]hermes egress status[/cyan]\n"
         "  Stop:    [cyan]hermes egress stop[/cyan]\n"
         "  Disable: [cyan]hermes egress disable[/cyan]"
@@ -378,30 +566,81 @@ def cmd_start(args: argparse.Namespace) -> int:
         and bw_cfg is not None
         and bool(bw_cfg.get("enabled"))
     )
-
-    # fail_on_uncovered_providers: when true, refuse to start if any of
-    # the recognized non-bearer providers (Anthropic native, AWS Bedrock,
-    # Azure OpenAI, etc.) have env vars set in the host process — those
-    # would otherwise leak real credentials into the sandbox while
-    # bypassing the proxy.
-    if bool(proxy_cfg.get("fail_on_uncovered_providers", False)):
-        uncovered = ip.discover_uncovered_providers()
-        if uncovered:
+    # Silent-degrade guard: the operator explicitly chose
+    # ``credential_source: bitwarden``, but secrets.bitwarden has since
+    # been disabled or removed.  Proceeding would quietly start on host
+    # env — exactly the bug class the BW mode is meant to defeat.  Refuse
+    # unless the documented escape hatch is set.
+    if credential_source == "bitwarden" and not refresh_bw:
+        if bool(proxy_cfg.get("allow_env_fallback", False)):
             console.print(
-                "[red]✗ Refusing to start: provider env vars present "
-                "that bypass the proxy:[/red]"
+                "[yellow]⚠ credential_source=bitwarden but "
+                "secrets.bitwarden is disabled or missing — falling back "
+                "to host-env secrets (allow_env_fallback=true).  Rotated "
+                "Bitwarden keys will NOT propagate.[/yellow]"
             )
-            for name in uncovered:
-                console.print(f"    - {name}")
+        else:
             console.print(
-                "  Set `proxy.fail_on_uncovered_providers: false` in "
-                "config.yaml to start anyway (sandbox will hold real "
-                "credentials for those providers)."
+                "[red]✗ Refusing to start: proxy.credential_source is "
+                "'bitwarden' but secrets.bitwarden is disabled or "
+                "missing.[/red]"
+            )
+            console.print(
+                "  Re-enable it (`secrets.bitwarden.enabled: true`), switch "
+                "back to env credentials with `hermes egress setup "
+                "--no-bitwarden`, or set `proxy.allow_env_fallback: true` "
+                "to opt into the host-env fallback."
+            )
+            return 1
+    # Pass the proxy-side allow_env_fallback opt-in through to
+    # start_proxy.  This is a deliberate, documented escape hatch: when
+    # set, the daemon silently falls back to host env if BWS is
+    # unreachable, instead of raising.  Default is strict (raise).
+    if refresh_bw and bw_cfg is not None:
+        bw_cfg = dict(bw_cfg)
+        bw_cfg["allow_env_fallback"] = bool(
+            proxy_cfg.get("allow_env_fallback", False)
+        )
+
+    # fail_on_uncovered_providers is intentionally gone: the LLM-specific
+    # providers it guarded (Anthropic native, Azure OpenAI, Gemini) are now
+    # swapped via per-provider match_headers rules, so the fail-closed tier
+    # is empty and the flag would be a dead toggle.
+
+    # stephenschoettler #1: when `credential_source: bitwarden`, the
+    # operator picked BWS specifically to get the rotation guarantee —
+    # silently falling back to parent-env at start_proxy time reintroduces
+    # exactly the bug class the BW mode is supposed to defeat (host env
+    # is stale / mismatched).  Pre-check at the wizard layer so we fail
+    # loud with actionable error messages BEFORE start_proxy degrades.
+    if refresh_bw:
+        bw_access_env = (bw_cfg or {}).get("access_token_env", "BWS_ACCESS_TOKEN")
+        if not os.environ.get(bw_access_env, "").strip():
+            console.print(
+                f"[red]✗ Refusing to start: credential_source=bitwarden but "
+                f"{bw_access_env} is not set in the environment.[/red]"
+            )
+            console.print(
+                "  Either export the access token, or run "
+                "`hermes egress setup --no-bitwarden` to switch back to "
+                "env-based credentials."
+            )
+            return 1
+        if not (bw_cfg or {}).get("project_id"):
+            console.print(
+                "[red]✗ Refusing to start: credential_source=bitwarden but "
+                "secrets.bitwarden.project_id is empty.[/red]"
+            )
+            console.print(
+                "  Run `hermes secrets bitwarden setup` to configure the "
+                "project, or switch back via `hermes egress setup "
+                "--no-bitwarden`."
             )
             return 1
 
     try:
         status = ip.start_proxy(
+            install_if_missing=bool(proxy_cfg.get("auto_install", True)),
             refresh_secrets_from_bitwarden=refresh_bw,
             bitwarden_config=bw_cfg,
         )
@@ -431,6 +670,99 @@ def cmd_stop(args: argparse.Namespace) -> int:
     else:
         console.print("[dim]iron-proxy was not running[/dim]")
     return 0
+
+
+def cmd_restart(args: argparse.Namespace) -> int:
+    """Stop the running daemon (if any) and start it with the current config.
+
+    The one-command way to apply config changes (new allowlist hosts, rotated
+    tokens, a Bitwarden key rotation) without making the operator remember the
+    stop/start dance.  Delegates to ``cmd_start`` so all the credential-source
+    guards run exactly as they do for ``start``.
+    """
+    console = Console()
+    was_running = ip.stop_proxy()
+    if was_running:
+        console.print("[dim]stopped the running iron-proxy[/dim]")
+    return cmd_start(args)
+
+
+def cmd_reload(args: argparse.Namespace) -> int:
+    """Hot-reload the running daemon's ruleset via the management API.
+
+    Applies allowlist / token / mapping changes already written to
+    proxy.yaml WITHOUT restarting the daemon — no dropped connections, no
+    restart window.  When the change involves new upstream SECRETS (a
+    Bitwarden rotation, a newly added provider key), use
+    ``hermes egress restart`` instead: the daemon reads real credentials
+    from its own environment at spawn time, and a reload does not
+    re-populate that env.
+    """
+    console = Console()
+    try:
+        ip.reload_proxy()
+    except Exception as exc:  # noqa: BLE001 — top-level user-facing funnel
+        console.print(f"[red]✗ reload failed:[/red] {exc}")
+        return 1
+    console.print(
+        "[green]✓[/green] iron-proxy ruleset reloaded in-place "
+        "(no restart, connections preserved)"
+    )
+    console.print(
+        "[dim]Note: new upstream secrets (rotated keys, new providers) "
+        "still need `hermes egress restart` — the daemon reads real "
+        "credentials from its environment at spawn time.[/dim]"
+    )
+    return 0
+
+
+def format_status_text(*, show_tokens: bool = False) -> str:
+    """Plain-text egress status for slash commands, Dashboard, and Desktop."""
+    cfg = load_config()
+    proxy_cfg = cfg.get("proxy") or {}
+    status = ip.get_status()
+
+    def yn(value: bool) -> str:
+        return "yes" if value else "no"
+
+    lines = [
+        "Egress proxy status",
+        "",
+        f"Enabled: {yn(bool(proxy_cfg.get('enabled')))}",
+        f"Binary: {status.binary_path or '(missing)'}",
+        f"Binary version: {status.binary_version or '(unknown)'}",
+        f"Config: {status.config_path or '(not generated)'}",
+        f"CA cert: {status.ca_cert_path or '(not generated)'}",
+        f"Tunnel port: {status.tunnel_port}",
+        f"Process: pid {status.pid}" if status.pid else "Process: (stopped)",
+        f"Listening: {yn(status.listening)}",
+        f"Credential src: {proxy_cfg.get('credential_source', 'env')}",
+        f"Docker enforce: {yn(bool(proxy_cfg.get('enforce_on_docker', True)))}",
+        "Scope: Docker backend only in this release",
+    ]
+
+    mappings = ip.load_mappings()
+    if mappings:
+        lines.extend(["", "Token mappings:"])
+        for m in mappings:
+            tok = m.proxy_token if show_tokens else _redact_token(m.proxy_token)
+            lines.append(f"  - {m.real_env_name}: {tok} ({', '.join(m.upstream_hosts)})")
+
+    uncovered = ip.discover_uncovered_providers()
+    if uncovered:
+        lines.extend([
+            "",
+            "Uncovered providers (real credentials still visible inside the sandbox):",
+        ])
+        for name in uncovered:
+            lines.append(f"  - {name}")
+
+    if bool(proxy_cfg.get("enabled")) and not status.configured:
+        lines.extend(["", "Next: run `hermes egress setup` to mint tokens and write proxy.yaml."])
+    elif bool(proxy_cfg.get("enabled")) and not (status.pid and status.listening):
+        lines.extend(["", "Next: run `hermes egress start` before launching Docker sandboxes."])
+
+    return "\n".join(lines)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -526,6 +858,39 @@ def cmd_config(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _load_env_file_into_environ() -> int:
+    """Backfill provider keys from ``~/.hermes/.env`` into ``os.environ``.
+
+    ``hermes egress setup`` discovers providers by reading ``os.environ``, but
+    many operators keep their keys ONLY in ``~/.hermes/.env`` (which the agent
+    loads at runtime but which is NOT exported into an interactive shell).
+    Without this, ``setup`` reports "no provider keys found" even though the
+    keys plainly exist — a confusing first-run papercut.
+
+    Only fills names that aren't already set in the process env (an exported
+    value always wins), and only for known bearer-provider names so we don't
+    slurp unrelated secrets into the process. Returns the count of names added.
+    """
+    try:
+        from hermes_cli.config import load_env
+    except ImportError:
+        return 0
+    try:
+        file_env = load_env()
+    except Exception:  # noqa: BLE001 — best-effort convenience, never fatal
+        return 0
+    added = 0
+    known = set(ip._BEARER_PROVIDERS) | set(ip._NON_BEARER_PROVIDERS)
+    for name in known:
+        if name in os.environ and os.environ[name].strip():
+            continue
+        val = (file_env.get(name) or "").strip()
+        if val:
+            os.environ[name] = val
+            added += 1
+    return added
 
 
 def _yn(value: bool) -> str:

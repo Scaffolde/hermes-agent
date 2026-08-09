@@ -51,8 +51,6 @@ What makes Hermes different:
 
 This skill is a concise operating guide, not the complete source of truth for every Hermes feature. If a Hermes feature, command, or setting is not mentioned here or in a reference, do not treat that absence as evidence that it does not exist. Check the live repository and official docs before giving a negative answer.
 
-When the target is a Scaffolde projection rather than Hermes source or runtime itself, treat Scaffolde's canonical sources as authority and use `scaffolde-platform-operations`; do not patch `~/.hermes` directly.
-
 Good verification targets:
 
 - CLI commands: `hermes --help`, `hermes <command> --help`, and `hermes_cli/main.py`
@@ -123,7 +121,6 @@ Profiles use `~/.hermes/profiles/<name>/` with the same layout. When a profile i
 | Contributing code: adding tools, slash commands, tests | `references/contributor-guide.md` |
 | delegate_task "capped at N" reports | `references/delegate-task-concurrency-diagnosis.md` |
 | "Can app X use my Nous Portal subscription/OAuth?" | `references/portal-auth-for-third-party-apps.md` |
-| A gap not covered by the focused references | `references/full-cli-runtime-guide.md`, then verify against the live repo and docs |
 
 Two theming rules that hold even without loading the reference: **you apply skins yourself** (`hermes config set display.skin <name>` — every surface repaints live within ~a second; don't tell the user to run `/skin`), and **to tweak one color, edit the ACTIVE skin** (`hermes skin set <key> <hex>`) — never fork `default`, which drops the palette and resets the background.
 

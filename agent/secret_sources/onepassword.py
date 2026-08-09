@@ -42,7 +42,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import re
 import shutil
 import subprocess
 import time
@@ -55,7 +54,8 @@ from agent.secret_sources._cache import (
     FetchResult,
     is_valid_env_name,
 )
-from agent.secret_sources.base import ErrorKind, SecretSource, source_environ
+from agent.secret_sources.base import ErrorKind, SecretSource
+from agent.secret_sources.base import get_source_environment
 
 logger = logging.getLogger(__name__)
 
@@ -73,10 +73,10 @@ _OP_RUN_TIMEOUT = 30
 # looks for.
 _DEFAULT_TOKEN_ENV = "OP_SERVICE_ACCOUNT_TOKEN"
 
-# Strip whole ANSI CSI sequences (colour, cursor moves, line erases) from any
-# `op` diagnostic we surface — not just the lone ESC byte — so a control
-# sequence can't reposition the cursor or hide text after a redaction marker.
-_ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+# ANSI stripping for `op` diagnostics we surface uses the shared
+# tools.ansi_strip.strip_ansi (full ECMA-48: CSI, OSC, DCS/SOS/PM/APC,
+# C1) so a control sequence can't reposition the cursor or hide text
+# after a redaction marker.
 
 # Env vars the `op` child actually needs.  We build a minimal allowlisted env
 # rather than copying all of os.environ (which, post-dotenv, holds every
@@ -183,16 +183,16 @@ def _auth_fingerprint(token_env: str) -> str:
     previous identity is never served under a new one.  Never logged or
     displayed; the raw token never leaves this hash.
     """
-    environ = source_environ()
+    source_env = get_source_environment()
     parts: List[str] = [
-        f"token={environ.get(token_env, '')}",
-        f"account={environ.get('OP_ACCOUNT', '')}",
-        f"connect_host={environ.get('OP_CONNECT_HOST', '')}",
-        f"connect_token={environ.get('OP_CONNECT_TOKEN', '')}",
+        f"token={source_env.get(token_env, '')}",
+        f"account={source_env.get('OP_ACCOUNT', '')}",
+        f"connect_host={source_env.get('OP_CONNECT_HOST', '')}",
+        f"connect_token={source_env.get('OP_CONNECT_TOKEN', '')}",
     ]
-    for key in sorted(environ):
+    for key in sorted(source_env):
         if key.startswith("OP_SESSION_"):
-            parts.append(f"{key}={environ[key]}")
+            parts.append(f"{key}={source_env[key]}")
     material = "\n".join(parts)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
@@ -232,12 +232,15 @@ def find_op(binary_path: str = "") -> Optional[Path]:
 
 def _scrub(text: str) -> str:
     """Remove ANSI control sequences and trim, for safe message surfacing."""
-    return _ANSI_CSI_RE.sub("", text).replace("\x1b", "").strip()
+    from tools.ansi_strip import strip_ansi
+
+    # strip_ansi removes well-formed sequences; drop any stray lone ESC too.
+    return strip_ansi(text).replace("\x1b", "").strip()
 
 
 def _op_child_env(token_value: str) -> Dict[str, str]:
     """Build a minimal allowlisted environment for the ``op`` child process."""
-    source_env = source_environ()
+    source_env = get_source_environment()
     env: Dict[str, str] = {}
     for key in _OP_ENV_ALLOWLIST:
         val = source_env.get(key)
@@ -340,7 +343,7 @@ def fetch_onepassword_secrets(
     if not valid:
         return {}, warnings
 
-    token_value = source_environ().get(token_env, "").strip()
+    token_value = get_source_environment().get(token_env, "").strip()
     cache_key: _CacheKey = (
         _auth_fingerprint(token_env),
         account or "",

@@ -60,6 +60,12 @@ from agent.lsp.workspace import (
 logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
+# Floor for a configured idle timeout.  The in-flight refcount already stops
+# a sweep from shutting a server down mid-request, but a timeout below the
+# per-operation wait budget makes every request a race to finish before its
+# own server ages out — the server is reaped the instant the refcount drops
+# and the next call pays a fresh index.  0 still means "no idle bound".
+MIN_IDLE_TIMEOUT = 30.0
 DEFAULT_SWEEP_INTERVAL = 60.0  # seconds between idle sweeps
 
 # Cap derivation.  A language server's cost is dominated by the TypeScript
@@ -431,6 +437,8 @@ class LSPService:
         idle_timeout = _coerce_non_negative(
             lsp_cfg.get("idle_timeout", DEFAULT_IDLE_TIMEOUT), DEFAULT_IDLE_TIMEOUT
         )
+        if 0 < idle_timeout < MIN_IDLE_TIMEOUT:
+            idle_timeout = MIN_IDLE_TIMEOUT
         sweep_interval = _coerce_positive(
             lsp_cfg.get("sweep_interval", DEFAULT_SWEEP_INTERVAL), DEFAULT_SWEEP_INTERVAL
         )

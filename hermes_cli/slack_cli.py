@@ -81,7 +81,6 @@ def _build_full_manifest(
         "channels:history",
         "channels:read",
         "chat:write",
-        "chat:write.customize",
         "commands",
         "files:read",
         "files:write",
@@ -92,27 +91,8 @@ def _build_full_manifest(
         "im:write",
         "mpim:history",
         "mpim:read",
-        "mpim:write",
         "reactions:read",
         "users:read",
-        "users:read.email",
-    ]
-
-    user_scopes = [
-        "channels:history",
-        "channels:read",
-        "chat:write",
-        "files:read",
-        "groups:history",
-        "groups:read",
-        "im:history",
-        "im:read",
-        "im:write",
-        "mpim:history",
-        "mpim:read",
-        "mpim:write",
-        "users:read",
-        "users:read.email",
     ]
 
     bot_events = [
@@ -123,13 +103,6 @@ def _build_full_manifest(
         "message.mpim",
         "reaction_added",
         "reaction_removed",
-    ]
-
-    user_events = [
-        "message.channels",
-        "message.groups",
-        "message.im",
-        "message.mpim",
     ]
 
     if messaging_experience == "assistant":
@@ -174,17 +147,11 @@ def _build_full_manifest(
         "oauth_config": {
             "scopes": {
                 "bot": bot_scopes,
-                # User scopes are for the optional first-class-account path:
-                # a Slack user can authorize the app and Hermes can receive
-                # user_events / reply with that user's token instead of only
-                # operating as the bot transport.
-                "user": user_scopes,
             },
         },
         "settings": {
             "event_subscriptions": {
                 "bot_events": bot_events,
-                "user_events": user_events,
             },
             "interactivity": {
                 "is_enabled": True,
@@ -289,12 +256,9 @@ def slack_manifest_command(args) -> int:
     if write_target is not None:
         if isinstance(write_target, bool) and write_target:
             # --write with no value → default location
-            try:
-                from hermes_constants import get_hermes_home
+            from hermes_constants import get_hermes_home
 
-                target = Path(get_hermes_home()) / "slack-manifest.json"
-            except Exception:
-                target = Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")) / "slack-manifest.json"
+            target = Path(get_hermes_home()) / "slack-manifest.json"
         else:
             target = Path(write_target).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)

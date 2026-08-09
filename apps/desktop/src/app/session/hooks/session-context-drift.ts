@@ -37,6 +37,25 @@ interface SessionContextDriftArgs {
    * a real chat as drift.
    */
   submitTargetStoredId?: string | null
+  /**
+   * The composer scope that was actually loaded when the text was submitted
+   * (SubmitTextOptions.composerScope). The composer and the session-side refs
+   * live in separate React subtrees and can each be internally consistent yet
+   * still disagree with each other at the instant of send — this prong catches
+   * that cross-component drift (#59305). Omit for non-composer submits.
+   */
+  composerScope?: string | null
+  /**
+   * resolveComposerSessionKey(submitTargetStoredId, sessions) — the durable
+   * lineage-root form of the submit target, in the SAME domain as
+   * composerScope. Compared against composerScope instead of the raw
+   * submitTargetStoredId: the composer keys drafts/attachments on the lineage
+   * root (stable across auto-compression tip rotation) while
+   * submitTargetStoredId tracks the live tip — comparing composerScope
+   * directly against the tip would false-positive-abort every submit into any
+   * session that has ever compressed.
+   */
+  submitTargetComposerScope?: string | null
 }
 
 /**
@@ -56,16 +75,29 @@ export function sessionContextDrift({
   nowRouteToken,
   startSelectedStoredId,
   nowSelectedStoredId,
-  submitTargetStoredId
+  submitTargetStoredId,
+  composerScope,
+  submitTargetComposerScope
 }: SessionContextDriftArgs): string | null {
+  // Composer prong: the composer's loaded scope disagrees with the resolved
+  // submit target. Not a start/now comparison like the two prongs below — the
+  // composer only hands us one snapshot per submit — but it belongs in the
+  // same fail-closed gate since it's exactly the same "wrong session" failure
+  // mode. Compared against submitTargetComposerScope (lineage-pinned), NOT
+  // submitTargetStoredId (live tip) — see the field doc on
+  // SessionContextDriftArgs for why those two must not be conflated.
+  if (composerScope !== undefined && composerScope !== null && composerScope !== submitTargetComposerScope) {
+    return `composer:${composerScope}->${submitTargetComposerScope}`
+  }
+
   const targetStart = routeTargetFromToken(startRouteToken)
   const targetNow = routeTargetFromToken(nowRouteToken)
 
-  // Route prong: the routed chat changed. Navigating to a non-chat page is
-  // drift too — an in-flight create must not pull the user back from Settings.
-  // Search/hash-only churn retains the same target, and landing on the
-  // submit's own real session remains the create pipeline's expected re-home.
-  if (targetNow !== targetStart && (targetNow === null || targetNow !== submitTargetStoredId)) {
+  // Route prong: the routed chat moved to a different, real chat. A null target
+  // (navigated to settings / a non-chat overlay route) or a search/hash-only
+  // change (same target) is not drift, and neither is landing on the submit's
+  // own target.
+  if (targetNow !== targetStart && targetNow !== null && targetNow !== submitTargetStoredId) {
     return `route:${targetStart}->${targetNow}`
   }
 

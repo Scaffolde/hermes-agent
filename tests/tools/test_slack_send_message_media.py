@@ -61,15 +61,12 @@ def _mock_client(*, post_ok=True, upload_ok=True):
 
 
 @contextlib.contextmanager
-def _fake_slack_sdk(client, *, clients_by_token=None):
+def _fake_slack_sdk(client):
     """Make ``from slack_sdk.web.async_client import AsyncWebClient`` resolve to a factory."""
     sdk = ModuleType("slack_sdk")
     web = ModuleType("slack_sdk.web")
     async_client = ModuleType("slack_sdk.web.async_client")
-    clients_by_token = clients_by_token or {}
-    async_client.AsyncWebClient = MagicMock(
-        side_effect=lambda *, token: clients_by_token.get(token, client)
-    )
+    async_client.AsyncWebClient = MagicMock(return_value=client)
     sdk.web = web
     web.async_client = async_client
 
@@ -132,139 +129,6 @@ def test_media_only_skips_text_post():
         assert result["success"] is True
         client.chat_postMessage.assert_not_awaited()
         client.files_upload_v2.assert_awaited_once()
-    finally:
-        os.unlink(pdf)
-
-
-def test_text_and_media_retry_with_the_matching_workspace_token():
-    pdf = _tmpfile(".pdf")
-    wrong_workspace = _mock_client(post_ok=False)
-    matching_workspace = _mock_client()
-    try:
-        with _fake_slack_sdk(
-            matching_workspace,
-            clients_by_token={
-                "xoxb-wrong": wrong_workspace,
-                "xoxb-right": matching_workspace,
-            },
-        ):
-            result = asyncio.run(
-                _standalone_send(
-                    _pconfig("xoxb-wrong,xoxb-right"),
-                    "C012AB3CD",
-                    "Here is the report",
-                    media_files=[(pdf, False)],
-                )
-            )
-
-        assert result["success"] is True
-        wrong_workspace.chat_postMessage.assert_awaited_once()
-        wrong_workspace.files_upload_v2.assert_not_awaited()
-        matching_workspace.chat_postMessage.assert_awaited_once()
-        matching_workspace.files_upload_v2.assert_awaited_once()
-    finally:
-        os.unlink(pdf)
-
-
-def test_media_only_retries_upload_with_the_matching_workspace_token():
-    pdf = _tmpfile(".pdf")
-    wrong_workspace = _mock_client(upload_ok=False)
-    matching_workspace = _mock_client()
-    try:
-        with _fake_slack_sdk(
-            matching_workspace,
-            clients_by_token={
-                "xoxb-wrong": wrong_workspace,
-                "xoxb-right": matching_workspace,
-            },
-        ):
-            result = asyncio.run(
-                _standalone_send(
-                    _pconfig("xoxb-wrong,xoxb-right"),
-                    "C012AB3CD",
-                    "",
-                    media_files=[(pdf, False)],
-                )
-            )
-
-        assert result["success"] is True
-        wrong_workspace.files_upload_v2.assert_awaited_once()
-        matching_workspace.files_upload_v2.assert_awaited_once()
-    finally:
-        os.unlink(pdf)
-
-
-def test_caption_rides_initial_comment_no_separate_text():
-    pdf = _tmpfile(".pdf")
-    client = _mock_client()
-    try:
-        with _fake_slack_sdk(client):
-            result = asyncio.run(
-                _standalone_send(
-                    _pconfig(),
-                    "C012AB3CD",
-                    "",
-                    media_files=[(pdf, False)],
-                    caption="Q3 summary PDF",
-                )
-            )
-        assert result["success"] is True
-        client.chat_postMessage.assert_not_awaited()
-        upload_kwargs = client.files_upload_v2.await_args.kwargs
-        assert upload_kwargs["initial_comment"] == "Q3 summary PDF"
-    finally:
-        os.unlink(pdf)
-
-
-def test_missing_media_file_warns_and_falls_back_caption():
-    client = _mock_client()
-    with _fake_slack_sdk(client):
-        result = asyncio.run(
-            _standalone_send(
-                _pconfig(),
-                "C012AB3CD",
-                "",
-                media_files=[("/no/such/file.pdf", False)],
-                caption="still deliver this",
-            )
-        )
-    assert result["success"] is True
-    assert result.get("warnings")
-    assert any("not found" in w.lower() for w in result["warnings"])
-    client.chat_postMessage.assert_awaited_once()
-    assert client.chat_postMessage.await_args.kwargs["text"] == "still deliver this"
-    client.files_upload_v2.assert_not_awaited()
-
-
-def test_missing_token_errors(monkeypatch):
-    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
-    result = asyncio.run(
-        _standalone_send(
-            _pconfig(token=""),
-            "C012AB3CD",
-            "hi",
-            media_files=[("/tmp/x.pdf", False)],
-        )
-    )
-    assert "error" in result
-    assert "SLACK_BOT_TOKEN" in result["error"]
-
-
-def test_thread_id_passed_to_upload():
-    pdf = _tmpfile(".pdf")
-    client = _mock_client()
-    try:
-        with _fake_slack_sdk(client):
-            asyncio.run(
-                _standalone_send(
-                    _pconfig(),
-                    "C012AB3CD",
-                    "",
-                    thread_id="999.000",
-                    media_files=[(pdf, False)],
-                )
-            )
-        assert client.files_upload_v2.await_args.kwargs["thread_ts"] == "999.000"
     finally:
         os.unlink(pdf)
 

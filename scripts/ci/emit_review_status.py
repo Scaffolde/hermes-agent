@@ -30,7 +30,6 @@ import argparse
 import hashlib
 import json
 import sys
-from pathlib import Path
 from urllib.parse import quote
 
 # The source identifier used for error-synthesis exclusion. This must
@@ -42,7 +41,6 @@ from urllib.parse import quote
 # (lowercase, hyphens→spaces) gives "review label gate", which is a
 # substring of "review label gate / review label gate".
 SOURCE = "review-label-gate"
-SUPPLY_CHAIN_SOURCE = "supply-chain-audit"
 
 
 def _ci_review_detail(
@@ -174,35 +172,6 @@ def build_statuses(
     return [{"source": SOURCE, "results": results}]
 
 
-def build_supply_chain_status(
-    findings: str,
-    label_present: bool = False,
-) -> list[dict]:
-    """Surface the scanner's exact evidence while leaving approval to the label gate."""
-    detail = findings.strip()
-    if not detail:
-        return []
-
-    result = {
-        "kind": "info" if label_present else "action_required",
-        "title": "Critical supply chain risk",
-        "summary": (
-            "Critical supply chain risk patterns were detected and the "
-            "`ci-reviewed` label confirms maintainer review."
-            if label_present
-            else "Critical supply chain risk patterns were detected in this PR."
-        ),
-        "detail": detail,
-    }
-    if not label_present:
-        result["how_to_fix"] = (
-            "Review the flagged code carefully. If it is intentional, add the "
-            "`ci-reviewed` label to confirm maintainer review."
-        )
-
-    return [{"source": SUPPLY_CHAIN_SOURCE, "results": [result]}]
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ci-review", action="store_true",
@@ -213,8 +182,6 @@ def main() -> int:
                         help="Whether the MCP catalog / installer changed.")
     parser.add_argument("--supply-chain", action="store_true",
                         help="Whether the critical supply-chain scanner found a risk.")
-    parser.add_argument("--supply-chain-findings-file", default="",
-                        help="File containing exact critical scanner evidence.")
     parser.add_argument("--label-present", action="store_true",
                         help="Whether the ci-reviewed label is present.")
     parser.add_argument("--repo-url", default="",
@@ -227,19 +194,10 @@ def main() -> int:
                         help="Output file ('-' for stdout, or a GITHUB_OUTPUT path).")
     args = parser.parse_args()
 
-    if args.supply_chain_findings_file:
-        findings_path = Path(args.supply_chain_findings_file)
-        findings = (
-            findings_path.read_text(encoding="utf-8")
-            if findings_path.is_file()
-            else ""
-        )
-        statuses = build_supply_chain_status(findings, args.label_present)
-    else:
-        statuses = build_statuses(
-            args.ci_review, args.mcp_catalog, args.supply_chain, args.label_present,
-            args.ci_review_files, args.repo_url, args.base_sha, args.head_sha,
-        )
+    statuses = build_statuses(
+        args.ci_review, args.mcp_catalog, args.supply_chain, args.label_present,
+        args.ci_review_files, args.repo_url, args.base_sha, args.head_sha,
+    )
     json_str = json.dumps(statuses)
 
     if args.output == "-":

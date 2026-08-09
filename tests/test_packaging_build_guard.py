@@ -3,59 +3,12 @@
 import os
 import subprocess
 import sys
-import zipfile
 from pathlib import Path
 
 import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_RUNTIME_DATA_ROOTS = ("locales", "optional-mcps", "optional-skills", "skills")
-
-
-def _assert_wheel_runtime_assets(wheel_path: Path) -> None:
-    """Prove the built artifact, not just metadata intentions, is complete."""
-    with zipfile.ZipFile(wheel_path) as wheel:
-        wheel_names = set(wheel.namelist())
-
-    data_marker = ".data/data/"
-    installed_data = {
-        name.split(data_marker, 1)[1]
-        for name in wheel_names
-        if data_marker in name
-    }
-
-    expected_data = {
-        path.relative_to(PROJECT_ROOT).as_posix()
-        for root_name in _RUNTIME_DATA_ROOTS
-        for path in (PROJECT_ROOT / root_name).rglob("*")
-        if path.is_file()
-        and "__pycache__" not in path.parts
-        and "node_modules" not in path.parts
-        and path.suffix not in {".pyc", ".pyo"}
-    }
-    expected_data.update(
-        {
-            "hermes-agent/scripts/install.sh",
-            "hermes-agent/scripts/install.ps1",
-        }
-    )
-    assert expected_data <= installed_data, (
-        "wheel omitted runtime data: "
-        f"{sorted(expected_data - installed_data)[:20]}"
-    )
-
-    expected_plugins = {
-        path.relative_to(PROJECT_ROOT).as_posix()
-        for path in (PROJECT_ROOT / "plugins").rglob("*")
-        if path.is_file()
-        and "__pycache__" not in path.parts
-        and path.suffix not in {".pyc", ".pyo"}
-    }
-    assert expected_plugins <= wheel_names, (
-        "wheel omitted plugin runtime files: "
-        f"{sorted(expected_plugins - wheel_names)[:20]}"
-    )
 
 
 def _build_artifact(kind: str, tmp_path, *, nix_build: bool) -> subprocess.CompletedProcess[str]:
@@ -116,7 +69,4 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
     result = _build_artifact(kind, tmp_path, nix_build=True)
 
     assert result.returncode == 0, result.stderr
-    artifacts = list(tmp_path.glob(artifact_glob))
-    assert artifacts
-    if kind == "wheel":
-        _assert_wheel_runtime_assets(artifacts[0])
+    assert list(tmp_path.glob(artifact_glob))

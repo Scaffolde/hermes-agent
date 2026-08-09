@@ -166,7 +166,9 @@ lsp:
 
   # Seconds a server may sit unused before it is shut down (and
   # respawned on the next relevant file operation). 0 disables the idle
-  # bound only; the max_clients cap is still enforced.
+  # bound only; the max_clients cap is still enforced. Values between 0
+  # and 30 are clamped to 30, below which a server ages out as fast as
+  # requests can use it.
   idle_timeout: 600
 
   # Seconds between idle sweeps.

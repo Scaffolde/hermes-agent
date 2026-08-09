@@ -2,10 +2,9 @@
 
 `TERMINAL_CWD` is the runtime carrier for the configured working directory
 (design #19214/#19242: `terminal.cwd` is bridged once to `TERMINAL_CWD` at
-gateway/cron/CLI startup). For the local CLI, an explicit `terminal.cwd` is
-respected; placeholders such as `.`/`auto` resolve to the launch dir. Reading it
-in one place keeps the system prompt, the tool surfaces, and context-file
-discovery agreeing on where the agent lives.
+gateway/cron startup). The local-CLI backend deliberately leaves it unset and
+relies on the launch dir. Reading it in one place keeps the system prompt, the
+tool surfaces, and context-file discovery agreeing on where the agent lives.
 
 Multi-session gateways can pin a logical cwd via the `_SESSION_CWD`
 contextvar; CLI/cron fall through to `TERMINAL_CWD`/launch cwd.

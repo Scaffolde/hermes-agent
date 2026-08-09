@@ -40,7 +40,28 @@ from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
 from urllib.parse import urlparse
 import httpx
-from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+
+# ``agent.auxiliary_client`` pulls credential_pool → hermes_cli.auth → httpx
+# → rich (~50 ms cold); only vision handlers need it. Loaded lazily; both
+# names stay module attributes so tests can keep patching
+# ``tools.vision_tools.async_call_llm``. Truthy-skip: injected mocks win.
+async_call_llm: Any = None
+extract_content_or_reasoning: Any = None
+
+
+def _load_auxiliary_client() -> None:
+    global async_call_llm, extract_content_or_reasoning
+    if async_call_llm is None or extract_content_or_reasoning is None:
+        from agent.auxiliary_client import (
+            async_call_llm as _acl,
+            extract_content_or_reasoning as _ecr,
+        )
+        if async_call_llm is None:
+            async_call_llm = _acl
+        if extract_content_or_reasoning is None:
+            extract_content_or_reasoning = _ecr
+
+
 from hermes_constants import get_hermes_dir
 from tools.debug_helpers import DebugSession
 from tools.website_policy import check_website_access
@@ -1251,6 +1272,7 @@ async def vision_analyze_tool(
         }
         if model:
             call_kwargs["model"] = model
+        _load_auxiliary_client()
         # Try full-size image first; on size-related rejection, downscale and retry.
         try:
             response = await async_call_llm(**call_kwargs)
@@ -1635,8 +1657,7 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
 async def video_analyze_tool(
     video_url: str,
     user_prompt: str,
-    model: Optional[str] = None,
-    provider: Optional[str] = None,
+    model: str = None,
 ) -> str:
     """Analyze a video via multimodal LLM. Returns JSON {success, analysis}."""
     if not isinstance(user_prompt, str):
@@ -1756,11 +1777,10 @@ async def video_analyze_tool(
             "max_tokens": 4000,
             "timeout": vision_timeout,
         }
-        if provider:
-            call_kwargs["provider"] = provider
         if model:
             call_kwargs["model"] = model
 
+        _load_auxiliary_client()
         response = await async_call_llm(**call_kwargs)
         analysis = extract_content_or_reasoning(response)
 
@@ -1878,13 +1898,8 @@ def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         "including visual content, motion, audio cues, text overlays, and scene "
         f"transitions. Then answer the following question:\n\n{question}"
     )
-    # Video analysis needs a backend that accepts video_url parts. Gary's local
-    # active main provider can handle image vision but not every video_url
-    # payload reliably, while the Nous Portal multimodal path does. Prefer
-    # config.yaml auxiliary.video.model (falling back to vision); env vars remain
-    # a legacy override. Keep the provider explicit/configurable rather than
-    # letting auxiliary.vision.provider:auto route video to an image-only model.
-    provider = os.getenv("AUXILIARY_VIDEO_PROVIDER", "").strip() or "nous"
+    # Prefer config.yaml auxiliary.video.model (falling back to vision);
+    # env vars are a legacy override.
     model = None
     try:
         from hermes_cli.config import cfg_get, load_config
@@ -1896,7 +1911,7 @@ def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         pass
     if not model:
         model = os.getenv("AUXILIARY_VIDEO_MODEL", "").strip() or os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return video_analyze_tool(video_url, full_prompt, model, provider=provider)
+    return video_analyze_tool(video_url, full_prompt, model)
 
 
 registry.register(

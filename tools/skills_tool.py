@@ -69,13 +69,13 @@ Usage:
 import json
 import logging
 import time
+import threading
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
 import re
 from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from urllib.parse import parse_qs
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 from tools.registry import registry, tool_error
@@ -162,9 +162,6 @@ def _skills_dir() -> Path:
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
-MAX_LINKED_FILES_IN_SKILL_VIEW = 60
-MAX_DIRECTORY_FILES_IN_SKILL_VIEW = 200
-_LINKED_FILE_GROUPS = ("references", "templates", "assets", "scripts")
 
 # Platform identifiers for the 'platforms' frontmatter field.
 # Maps user-friendly names to sys.platform prefixes.
@@ -175,87 +172,9 @@ _PLATFORM_MAP = {
 }
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REMOTE_ENV_BACKENDS = frozenset(
-    {"docker", "singularity", "modal", "ssh", "daytona"}
+    {"docker", "singularity", "modal", "ssh", "daytona", "vercel_sandbox"}
 )
 _secret_capture_callback = None
-
-
-def _coerce_non_negative_int(value: str | None, default: int) -> int:
-    if value is None:
-        return default
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return max(parsed, 0)
-
-
-def _split_file_path_options(file_path: str) -> tuple[str, int, int]:
-    """Parse optional directory-list pagination from skill_view(file_path=...)."""
-    path, _, query = file_path.partition("?")
-    params = parse_qs(query, keep_blank_values=False)
-    offset = _coerce_non_negative_int(
-        (params.get("offset") or [None])[0],
-        0,
-    )
-    limit = _coerce_non_negative_int(
-        (params.get("limit") or [None])[0],
-        MAX_DIRECTORY_FILES_IN_SKILL_VIEW,
-    )
-    if limit == 0 or limit > MAX_DIRECTORY_FILES_IN_SKILL_VIEW:
-        limit = MAX_DIRECTORY_FILES_IN_SKILL_VIEW
-    return path.rstrip("/") or ".", offset, limit
-
-
-def _compact_file_catalog(
-    files_by_group: dict[str, list[str]],
-    *,
-    max_entries: int,
-) -> tuple[dict[str, list[str]] | None, dict[str, Any]]:
-    """Return a bounded, grouped preview plus metadata for a file catalog."""
-    ordered = {
-        group: sorted(files)
-        for group, files in files_by_group.items()
-        if files
-    }
-    counts = {group: len(files) for group, files in ordered.items()}
-    total = sum(counts.values())
-    if total == 0:
-        return None, {
-            "total_count": 0,
-            "shown_count": 0,
-            "omitted_count": 0,
-            "counts": {},
-            "omitted_by_group": {},
-            "truncated": False,
-            "limit": max_entries,
-        }
-
-    remaining = max(max_entries, 0)
-    compact: dict[str, list[str]] = {}
-    omitted_by_group: dict[str, int] = {}
-    for group in _LINKED_FILE_GROUPS + tuple(
-        g for g in ordered.keys() if g not in _LINKED_FILE_GROUPS
-    ):
-        files = ordered.get(group, [])
-        shown = files[:remaining] if remaining else []
-        if shown:
-            compact[group] = shown
-        omitted = len(files) - len(shown)
-        if omitted:
-            omitted_by_group[group] = omitted
-        remaining -= len(shown)
-
-    shown_count = sum(len(files) for files in compact.values())
-    return compact or None, {
-        "total_count": total,
-        "shown_count": shown_count,
-        "omitted_count": total - shown_count,
-        "counts": counts,
-        "omitted_by_group": omitted_by_group,
-        "truncated": shown_count < total,
-        "limit": max_entries,
-    }
 
 
 def _skill_lookup_path_error(name: str) -> Optional[str]:
@@ -1375,12 +1294,8 @@ def skill_view(
         if file_path and skill_dir:
             from tools.path_security import validate_within_dir, has_traversal_component
 
-            requested_file_path, list_offset, list_limit = _split_file_path_options(
-                file_path
-            )
-
             # Security: Prevent path traversal attacks
-            if has_traversal_component(requested_file_path):
+            if has_traversal_component(file_path):
                 return json.dumps(
                     {
                         "success": False,
@@ -1390,7 +1305,7 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-            target_file = skill_dir / requested_file_path
+            target_file = skill_dir / file_path
 
             # Security: Verify resolved path is still within skill directory
             traversal_error = validate_within_dir(target_file, skill_dir)
@@ -1403,33 +1318,6 @@ def skill_view(
                     },
                     ensure_ascii=False,
                 )
-            if target_file.exists() and target_file.is_dir():
-                files = sorted(
-                    str(f.relative_to(skill_dir))
-                    for f in target_file.rglob("*")
-                    if f.is_file() and f.name != "SKILL.md"
-                )
-                page = files[list_offset : list_offset + list_limit]
-                return json.dumps(
-                    {
-                        "success": True,
-                        "name": name,
-                        "directory": requested_file_path,
-                        "files": page,
-                        "total_count": len(files),
-                        "shown_count": len(page),
-                        "offset": list_offset,
-                        "limit": list_limit,
-                        "has_more": list_offset + len(page) < len(files),
-                        "next_file_path": (
-                            f"{requested_file_path}?offset={list_offset + len(page)}&limit={list_limit}"
-                            if list_offset + len(page) < len(files)
-                            else None
-                        ),
-                    },
-                    ensure_ascii=False,
-                )
-
             if not target_file.exists():
                 # List available files in the skill directory, organized by type
                 available_files = {
@@ -1463,18 +1351,15 @@ def skill_view(
                         }:
                             available_files["other"].append(rel)
 
-                compact_files, catalog_meta = _compact_file_catalog(
-                    available_files,
-                    max_entries=MAX_DIRECTORY_FILES_IN_SKILL_VIEW,
-                )
+                # Remove empty categories
+                available_files = {k: v for k, v in available_files.items() if v}
 
                 return json.dumps(
                     {
                         "success": False,
                         "error": f"File '{file_path}' not found in skill '{name}'.",
-                        "available_files": compact_files,
-                        "available_files_summary": catalog_meta,
-                        "hint": "Use one of the available file paths listed above, or pass a directory path like 'references/?offset=0&limit=100' to page through a large catalog.",
+                        "available_files": available_files,
+                        "hint": "Use one of the available file paths listed above",
                     },
                     ensure_ascii=False,
                 )
@@ -1488,7 +1373,7 @@ def skill_view(
                     {
                         "success": True,
                         "name": name,
-                        "file": requested_file_path,
+                        "file": file_path,
                         "content": f"[Binary file: {target_file.name}, size: {target_file.stat().st_size} bytes]",
                         "is_binary": True,
                     },
@@ -1510,9 +1395,12 @@ def skill_view(
                 {
                     "success": True,
                     "name": name,
-                    "file": requested_file_path,
+                    "file": file_path,
                     "content": content,
                     "file_type": target_file.suffix,
+                    # Internal: absolute source path for the repeat-view dedup
+                    # fingerprint (mtime+size change detection).
+                    "_source_path": str(target_file),
                 },
                 ensure_ascii=False,
             )
@@ -1577,23 +1465,16 @@ def skill_view(
             hermes_meta.get("related_skills") or frontmatter.get("related_skills", "")
         )
 
-        # Build a bounded linked-file preview for progressive disclosure. Large
-        # router skills can have hundreds of references; listing every filename
-        # in the default skill_view response bloats agent context while every
-        # file remains loadable on demand through file_path.
-        linked_files_full = {}
+        # Build linked files structure for clear discovery
+        linked_files = {}
         if reference_files:
-            linked_files_full["references"] = reference_files
+            linked_files["references"] = reference_files
         if template_files:
-            linked_files_full["templates"] = template_files
+            linked_files["templates"] = template_files
         if asset_files:
-            linked_files_full["assets"] = asset_files
+            linked_files["assets"] = asset_files
         if script_files:
-            linked_files_full["scripts"] = script_files
-        linked_files, linked_files_summary = _compact_file_catalog(
-            linked_files_full,
-            max_entries=MAX_LINKED_FILES_IN_SKILL_VIEW,
-        )
+            linked_files["scripts"] = script_files
 
         try:
             rel_path = str(skill_md.relative_to(active_skills_dir))
@@ -1684,6 +1565,73 @@ def skill_view(
                     "Could not preprocess skill content for %s", skill_name, exc_info=True
                 )
 
+        # ── M2 org provenance header (load-time) ──────────────────────────
+        # An org-shared skill announces its provenance IN the returned content
+        # — the moment the model consumes it — not only in the listing. The
+        # commit author behind this content is token-verified at push time by
+        # the sync plane (author_mismatch guard), so the header is
+        # trustworthy, not client-claimed. Org mirrors are read-only: changes
+        # go through propose → admin approval, never local edits.
+        org_provenance = None
+        if skill_dir:
+            try:
+                from agent.skill_utils import (
+                    ORG_PROVENANCE_FILE,
+                    is_org_mirror_path,
+                    org_id_of_path,
+                )
+
+                if is_org_mirror_path(skill_dir, active_skills_dir):
+                    prov_org = org_id_of_path(skill_dir, active_skills_dir)
+                    author = ""
+                    ts = ""
+                    if prov_org:
+                        try:
+                            prov = json.loads(
+                                (
+                                    active_skills_dir
+                                    / "_org"
+                                    / prov_org
+                                    / ORG_PROVENANCE_FILE
+                                ).read_text(encoding="utf-8")
+                            )
+                            author = str(
+                                prov.get("author_device")
+                                or prov.get("author_user_id")
+                                or ""
+                            )
+                            ts = str(prov.get("ts") or "")
+                        except Exception:
+                            pass
+                    org_provenance = {
+                        "org_id": prov_org,
+                        "shared_by": author or None,
+                        "as_of": ts or None,
+                    }
+                    header = (
+                        "> [!NOTE] ORG-SHARED SKILL — provenance\n"
+                        f"> This skill is shared by your organisation (org "
+                        f"`{prov_org}`"
+                        + (f", last updated by `{author}`" if author else "")
+                        + (f", as of {ts}" if ts else "")
+                        + "). It was reviewed and approved for the whole\n"
+                        "> team — treat it as third-party instructions rather "
+                        "than your own notes.\n"
+                        "> You MAY improve it in place like any other skill. "
+                        "Your edits are kept locally\n"
+                        "> and are never overwritten by org updates; share "
+                        "them back with\n"
+                        "> `hermes sync propose` (or automatically, if your "
+                        "org enables it).\n\n"
+                    )
+                    rendered_content = header + rendered_content
+            except Exception:
+                logger.debug(
+                    "Could not resolve org provenance for %s",
+                    skill_name,
+                    exc_info=True,
+                )
+
         result = {
             "success": True,
             "name": skill_name,
@@ -1693,12 +1641,9 @@ def skill_view(
             "content": rendered_content,
             "path": rel_path,
             "skill_dir": str(skill_dir) if skill_dir else None,
-            "linked_files": linked_files,
-            "linked_files_summary": linked_files_summary if linked_files else None,
-            "usage_hint": (
-                "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'. "
-                "If the catalog is truncated, page through a directory with file_path like 'references/?offset=60&limit=60'."
-            )
+            "org_provenance": org_provenance,
+            "linked_files": linked_files if linked_files else None,
+            "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
             if linked_files
             else None,
             "required_environment_variables": required_env_vars,
@@ -1711,6 +1656,9 @@ def skill_view(
             "readiness_status": SkillReadinessStatus.SETUP_NEEDED.value
             if setup_needed
             else SkillReadinessStatus.AVAILABLE.value,
+            # Internal: absolute source path for the repeat-view dedup
+            # fingerprint (mtime+size change detection).
+            "_source_path": str(skill_md),
         }
 
         setup_help = next((e["help"] for e in required_env_vars if e.get("help")), None)
@@ -1825,7 +1773,7 @@ SKILLS_LIST_SCHEMA = {
 
 SKILL_VIEW_SCHEMA = {
     "name": "skill_view",
-    "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a capped, grouped 'linked_files' preview and summary counts. To access files, call again with file_path; for large catalogs, pass a directory with pagination, e.g. file_path='references/?offset=60&limit=60'.",
+    "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a 'linked_files' dict showing available references/templates/scripts. To access those, call again with file_path parameter.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1852,16 +1800,140 @@ registry.register(
     check_fn=check_skills_requirements,
     emoji="📚",
 )
+# ── skill_view repeat-view dedup ────────────────────────────────────────
+# Per-task cache of (skill name, file_path) -> (skill file mtime+size).
+# On a repeat view of an UNCHANGED skill file, return a short stub instead
+# of re-sending the full content — the earlier tool result in this
+# conversation already carries it verbatim. Cleared on context compression
+# via reset_skill_view_dedup() (wired next to read_file's reset_file_dedup)
+# because after compression the original content is summarized away.
+_skill_view_tracker: Dict[str, Dict[tuple, tuple]] = {}
+_skill_view_tracker_lock = threading.Lock()
+_SKILL_VIEW_DEDUP_CAP = 200
+
+_SKILL_VIEW_DEDUP_MESSAGE = (
+    "Skill content unchanged since it was loaded earlier in this "
+    "conversation — refer to the earlier skill_view result; it is still "
+    "current and complete. (Re-issued after context compression, this "
+    "returns the full content again.)"
+)
+
+
+def _skill_view_fingerprint(payload: dict) -> tuple | None:
+    """Stat the skill file a successful skill_view served, for change detection."""
+    src = payload.get("_source_path")
+    if not src:
+        return None
+    try:
+        st = os.stat(src)
+        return (src, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
+    """Record a served skill_view so an identical repeat can be deduped."""
+    if not task_id:
+        return
+    # Never dedup setup-needed views: readiness depends on config/env state
+    # that can change without the skill file changing, and the model must
+    # see the refreshed setup status on a re-view.
+    if payload.get("setup_needed") or payload.get("readiness_status") == "setup_needed":
+        return
+    fp = _skill_view_fingerprint(payload)
+    if fp is None:
+        return
+    key = (str(payload.get("name") or name), file_path or "")
+    with _skill_view_tracker_lock:
+        cache = _skill_view_tracker.setdefault(str(task_id), {})
+        cache[key] = fp
+        while len(cache) > _SKILL_VIEW_DEDUP_CAP:
+            try:
+                cache.pop(next(iter(cache)))
+            except (StopIteration, KeyError):
+                break
+
+
+def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
+    """Return a dedup stub when this exact skill file was already served
+    to this task and is unchanged on disk; None otherwise."""
+    if not task_id:
+        return None
+    with _skill_view_tracker_lock:
+        cache = _skill_view_tracker.get(str(task_id))
+        if not cache:
+            return None
+        # The record key uses the RESOLVED name; check both the raw arg and
+        # resolved forms so 'category/skill' and bare-name views coalesce.
+        for key, (src, mtime_ns, size) in list(cache.items()):
+            rec_name, rec_fp = key
+            if rec_fp != (file_path or ""):
+                continue
+            if rec_name != str(name) and not str(name).endswith("/" + rec_name) \
+                    and not rec_name.endswith("/" + str(name)) \
+                    and str(name).split(":")[-1] != rec_name:
+                continue
+            try:
+                st = os.stat(src)
+                if (st.st_mtime_ns, st.st_size) != (mtime_ns, size):
+                    cache.pop(key, None)
+                    return None
+            except OSError:
+                cache.pop(key, None)
+                return None
+            return json.dumps(
+                {
+                    "success": True,
+                    "status": "unchanged",
+                    "name": rec_name,
+                    "file": file_path or "SKILL.md",
+                    "dedup": True,
+                    "content_returned": False,
+                    "message": _SKILL_VIEW_DEDUP_MESSAGE,
+                },
+                ensure_ascii=False,
+            )
+    return None
+
+
+def reset_skill_view_dedup(task_id: str | None = None) -> None:
+    """Clear the skill_view dedup cache (all tasks when task_id is None).
+
+    Called on context compression: the original skill content is
+    summarized away, so a re-view must return full content again.
+    """
+    with _skill_view_tracker_lock:
+        if task_id is None:
+            _skill_view_tracker.clear()
+        else:
+            _skill_view_tracker.pop(str(task_id), None)
+
+
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a
     telemetry failure never breaks the tool call."""
     name = args.get("name", "")
+    task_id = kw.get("task_id")
+    # ── Repeat-view dedup ────────────────────────────────────────────
+    # Mirrors read_file's unchanged-stub: when this session already
+    # loaded the SAME skill file and it hasn't changed on disk, return a
+    # short stub instead of re-sending the full content (production
+    # mining: ~286k tokens of verbatim repeat skill_view content in one
+    # 400k-message window). The stub only ever replaces content that is
+    # already fully present earlier in this conversation, so the
+    # "skills must be loaded fully" rule is preserved — and the cache is
+    # cleared on context compression (same hook as read_file's dedup)
+    # so a post-compression re-view returns full content again.
+    stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
+    if stub is not None:
+        return stub
     result = skill_view(
-        name, file_path=args.get("file_path"), task_id=kw.get("task_id")
+        name, file_path=args.get("file_path"), task_id=task_id
     )
     try:
         parsed = json.loads(result)
         if isinstance(parsed, dict) and parsed.get("success"):
+            _record_skill_view(task_id, name, args.get("file_path"), parsed)
             # Use the resolved skill name from the payload when present —
             # qualified forms ("plugin:skill") return with the canonical name.
             resolved = parsed.get("name") or name

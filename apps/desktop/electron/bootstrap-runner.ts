@@ -139,13 +139,7 @@ function installRefForStamp(installStamp) {
     }
   }
 
-  const hasFallbackCommit =
-    installStamp && typeof installStamp.commit === 'string' && FALLBACK_COMMIT_RE.test(installStamp.commit)
-
-  const hasLegacyBranchOnlyStamp =
-    installStamp && installStamp.commit == null && typeof installStamp.branch === 'string' && installStamp.branch
-
-  if (hasFallbackCommit || hasLegacyBranchOnlyStamp) {
+  if (installStamp && typeof installStamp.commit === 'string' && FALLBACK_COMMIT_RE.test(installStamp.commit)) {
     const ref = installStamp.branch || FALLBACK_BRANCH
 
     return {
@@ -663,22 +657,19 @@ function spawnBash(scriptPath, args, { emit, stageName, abortSignal, hermesHome 
 // Manifest + stage dispatch
 // ---------------------------------------------------------------------------
 
-// Build first-install provenance args from the packaged stamp. A commit is the
-// durable identity; the build branch may be ephemeral and already deleted by
-// the time a user launches the app. Once a managed checkout exists, bootstrap
-// must follow that checkout's own origin/default branch rather than repinning
-// it from an old app bundle. All-zero fallback stamps are never passed as
-// -Commit/--commit; only their branch fallback is used.
+// Build the installer branch/pin args from the install stamp. The commit pin
+// is fresh-install only: once a managed checkout already exists, bootstrap is
+// a repair/update path and must not let an old packaged app detach the checkout
+// back to the commit baked into that app. All-zero fallback stamps are never
+// passed as -Commit/--commit — only the branch is used (#50823 / #50864 review).
 function buildPinArgs(installStamp, { pinCommit = true } = {}) {
   const args = []
 
-  if (!pinCommit || !installStamp) {
-    return args
+  if (pinCommit && installStamp && isPinnedCommit(installStamp.commit)) {
+    args.push('-Commit', installStamp.commit)
   }
 
-  if (isPinnedCommit(installStamp.commit)) {
-    args.push('-Commit', installStamp.commit)
-  } else if (installStamp.branch) {
+  if (installStamp && installStamp.branch) {
     args.push('-Branch', installStamp.branch)
   }
 
@@ -688,14 +679,12 @@ function buildPinArgs(installStamp, { pinCommit = true } = {}) {
 function buildPosixPinArgs({ installStamp, activeRoot, hermesHome, pinCommit = true }) {
   const args = ['--dir', activeRoot, '--hermes-home', hermesHome]
 
-  if (!pinCommit || !installStamp) {
-    return args
+  if (installStamp && installStamp.branch) {
+    args.push('--branch', installStamp.branch)
   }
 
-  if (isPinnedCommit(installStamp.commit)) {
+  if (pinCommit && installStamp && isPinnedCommit(installStamp.commit)) {
     args.push('--commit', installStamp.commit)
-  } else if (installStamp.branch) {
-    args.push('--branch', installStamp.branch)
   }
 
   return args

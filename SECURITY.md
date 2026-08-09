@@ -64,6 +64,11 @@ pattern scanner, not any tool allowlist. Any in-process component
 that screens LLM output is a heuristic operating on an
 attacker-influenced string, and this policy treats it as such.
 
+Host-resolved [subagent execution profiles](docs/security/execution-profiles.md)
+pin in-process protocol, role, and tool policy and produce launch evidence; they
+do not create OS isolation. In particular, macOS process groups are a
+development lifecycle aid, not a production containment boundary.
+
 Hermes Agent supports two OS-level isolation postures. They address
 different threats and an operator should choose deliberately.
 
@@ -177,9 +182,12 @@ authorization model, but the rules below apply uniformly.
 
 **Surfaces in Hermes Agent:**
 
-- **Gateway platform adapters.** Messaging integrations in
-  `gateway/platforms/` (Telegram, Discord, Slack, email, SMS, etc.)
-  and analogous adapters shipped as plugins.
+- **Gateway platform adapters.** Most messaging integrations ship as
+  bundled plugins under `plugins/platforms/<name>/` (Telegram, Discord,
+  Slack, email, SMS, etc.). Shared base types and a smaller set of
+  legacy/direct adapters live under `gateway/platforms/`
+  (`base.py`, Signal, API server, webhooks, …), with discovery and
+  deferred loading via `gateway/platform_registry.py`.
 - **Network-exposed HTTP surfaces.** The API server adapter, the
   dashboard plugin, the kanban plugin's HTTP endpoints, and any
   other plugin that binds a listening socket.

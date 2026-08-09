@@ -6,14 +6,11 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
-import copy
 import json
 import logging
 import os
 import re
-import ssl
 import time
-from email.utils import formatdate
 
 from agent.redact import redact_sensitive_text
 from agent.secret_scope import get_secret
@@ -36,7 +33,6 @@ _SLACK_MENTION_RE = re.compile(r"^\s*<@(U[A-Z0-9]{8,})(?:\|[^>]+)?>\s*$")
 _SLACK_THREAD_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,}):([^\s:]+)\s*$")
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
 _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
-_WHATSAPP_JID_TARGET_RE = re.compile(r"^\s*([+]?\d+(?::\d+)?@(?:s\.whatsapp\.net|lid|g\.us))\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
 _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
 # Platforms that address recipients by phone number and accept E.164 format
@@ -46,6 +42,8 @@ _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
 # downstream adapters (signal, etc.) expect.
 _PHONE_PLATFORMS = frozenset({"photon", "signal", "sms", "whatsapp"})
 _E164_TARGET_RE = re.compile(r"^\s*\+(\d{7,15})\s*$")
+# Photon DM chat GUID (mirrors _DM_CHAT_GUID_RE in the photon adapter).
+_PHOTON_DM_GUID_RE = re.compile(r"^any;-;\+\d{6,}$")
 # WhatsApp JIDs: group chats (<digits>@g.us), individual users
 # (<phone>@s.whatsapp.net), linked identities (<id>@lid), and broadcast /
 # newsletter chats. These are explicit native targets the bridge accepts
@@ -64,8 +62,8 @@ _EMAIL_TARGET_RE = re.compile(r"^\s*[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2
 # never read. Map the exceptions so the error guidance is actually actionable.
 _HOME_CHANNEL_ENV_OVERRIDES = {"email": "EMAIL_HOME_ADDRESS"}
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
-_AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
+_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+_AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".m2a", ".wav", ".m4a", ".flac"}
 _VOICE_EXTS = {".ogg", ".opus"}
 # Telegram's Bot API sendAudio only accepts MP3 / M4A. Other audio
 # formats either route through sendVoice (Opus/OGG) or fall back to
@@ -381,26 +379,17 @@ def _handle_send(args):
             from gateway.channel_directory import resolve_channel_name
             resolved = resolve_channel_name(platform_name, target_ref)
             if resolved:
-                parsed_chat_id, parsed_thread_id, parsed_explicit = _parse_target_ref(platform_name, resolved)
-                if parsed_chat_id or parsed_explicit:
-                    chat_id, thread_id = parsed_chat_id, parsed_thread_id
-                else:
-                    # The channel directory stores already-trusted platform IDs.
-                    # Some platforms use opaque IDs that are not parseable by
-                    # the generic target grammar (for example WhatsApp JIDs in
-                    # older runtimes). Preserve the resolved ID instead of
-                    # falling through to the home channel.
-                    chat_id, thread_id = resolved, None
+                chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
             else:
-                return json.dumps({
-                    "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+                return tool_error(
+                    f"Could not resolve '{target_ref}' on {platform_name}. "
                     f"Use send_message(action='list') to see available targets."
-                })
+                )
         except Exception:
-            return json.dumps({
-                "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+            return tool_error(
+                f"Could not resolve '{target_ref}' on {platform_name}. "
                 f"Try using a numeric channel ID instead."
-            })
+            )
 
     from tools.interrupt import is_interrupted
     if is_interrupted():
@@ -469,11 +458,11 @@ def _handle_send(args):
             home_env = _HOME_CHANNEL_ENV_OVERRIDES.get(
                 platform_name, f"{platform_name.upper()}_HOME_CHANNEL"
             )
-            return json.dumps({
-                "error": f"No home channel set for {platform_name} to determine where to send the message. "
+            return tool_error(
+                f"No home channel set for {platform_name} to determine where to send the message. "
                 f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
                 f"or set a home channel via: hermes config set {home_env} <channel_id>"
-            })
+            )
 
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
@@ -489,15 +478,12 @@ def _handle_send(args):
             _slack_dm_target = f"user:{_slack_dm_target}"
         if _slack_dm_target.startswith(("user:", "user_name:")):
             from model_tools import _run_async
-            _resolved, _resolve_err, _resolved_token = _run_async(
+            _resolved, _resolve_err = _run_async(
                 _resolve_slack_user_target(pconfig.token, _slack_dm_target)
             )
             if _resolve_err:
                 return json.dumps(_resolve_err)
             chat_id = _resolved
-            if _resolved_token:
-                pconfig = copy.copy(pconfig)
-                pconfig.token = _resolved_token
 
     try:
         from model_tools import _run_async
@@ -616,6 +602,12 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if match:
             # Preserve the leading '+' — signal-cli and sms/whatsapp adapters
             # expect E.164 format for direct recipients.
+            return target_ref.strip(), None, True
+    if platform_name == "photon":
+        # Photon DM chat GUIDs ('any;-;+1555...') are platform-native ids the
+        # adapter resolves itself — pass through verbatim instead of bouncing
+        # them off the channel directory (mirrors the react handler).
+        if _PHOTON_DM_GUID_RE.fullmatch(target_ref.strip()):
             return target_ref.strip(), None, True
     if target_ref.lstrip("-").isdigit():
         return target_ref, None, True
@@ -1534,35 +1526,26 @@ async def _resolve_slack_user_target(token, chat_id):
     chat.postMessage requires a conversation ID. ``user_name:`` targets are
     first resolved to a user ID through users.list (stable handle match only).
 
-    Returns ``(chat_id, None, selected_token)`` on success or
-    ``(None, error_dict, None)`` on failure. The selected token must follow the
-    resolved DM into delivery so a multi-workspace lookup cannot resolve with
-    one workspace and then send with another.
+    Returns ``(chat_id, None)`` on success or ``(None, error_dict)`` on failure.
     """
     if not (chat_id.startswith("user:") or chat_id.startswith("user_name:")):
-        return chat_id, None, None
-    tokens = [part.strip() for part in str(token or "").split(",") if part.strip()]
-    if not tokens:
-        return None, _error("Slack DM resolution failed: no bot token configured"), None
+        return chat_id, None
     try:
         import aiohttp
     except ImportError:
-        return None, {"error": "aiohttp not installed. Run: pip install aiohttp"}, None
+        return None, {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
         _proxy = resolve_proxy_url()
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
         base_url = "https://slack.com/api"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-        async def post_api(session, bearer_token, method, payload):
-            headers = {
-                "Authorization": f"Bearer {bearer_token}",
-                "Content-Type": "application/json",
-            }
+        async def post_api(session, method, payload):
             async with session.post(f"{base_url}/{method}", headers=headers, json=payload, **_req_kw) as resp:
                 return await resp.json()
 
-        async def resolve_user_name(session, bearer_token, name):
+        async def resolve_user_name(session, name):
             query = name.strip().lstrip("@").lower()
             matches = []
             cursor = None
@@ -1570,7 +1553,7 @@ async def _resolve_slack_user_target(token, chat_id):
                 payload = {"limit": 200}
                 if cursor:
                     payload["cursor"] = cursor
-                data = await post_api(session, bearer_token, "users.list", payload)
+                data = await post_api(session, "users.list", payload)
                 if not data.get("ok"):
                     return None, f"Slack users.list error: {data.get('error', 'unknown')}"
                 for member in data.get("members", []):
@@ -1591,42 +1574,25 @@ async def _resolve_slack_user_target(token, chat_id):
             return matches[0].get("id"), None
 
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
-            last_error = "Slack DM resolution failed"
-            for bearer_token in tokens:
-                candidate = chat_id
-                if candidate.startswith("user_name:"):
-                    user_id, error = await resolve_user_name(
-                        session,
-                        bearer_token,
-                        candidate[len("user_name:"):],
-                    )
-                    if error:
-                        last_error = error
-                        continue
-                    candidate = f"user:{user_id}"
+            if chat_id.startswith("user_name:"):
+                user_id, error = await resolve_user_name(session, chat_id[len("user_name:"):])
+                if error:
+                    return None, _error(error)
+                chat_id = f"user:{user_id}"
 
-                user_id = candidate[len("user:"):]
-                opened = await post_api(
-                    session,
-                    bearer_token,
-                    "conversations.open",
-                    {"users": user_id},
+            user_id = chat_id[len("user:"):]
+            opened = await post_api(session, "conversations.open", {"users": user_id})
+            if not opened.get("ok"):
+                return None, _error(
+                    f"Slack conversations.open error: {opened.get('error', 'unknown')}. "
+                    "Check bot permissions (im:write)."
                 )
-                if not opened.get("ok"):
-                    last_error = (
-                        f"Slack conversations.open error: {opened.get('error', 'unknown')}. "
-                        "Check bot permissions (im:write)."
-                    )
-                    continue
-                dm_id = (opened.get("channel") or {}).get("id")
-                if not dm_id:
-                    last_error = "Slack conversations.open did not return a DM channel ID"
-                    continue
-                return dm_id, None, bearer_token
-
-            return None, _error(last_error), None
+            dm_id = (opened.get("channel") or {}).get("id")
+            if not dm_id:
+                return None, _error("Slack conversations.open did not return a DM channel ID")
+            return dm_id, None
     except Exception as e:
-        return None, _error(f"Slack DM resolution failed: {e}"), None
+        return None, _error(f"Slack DM resolution failed: {e}")
 
 
 async def _send_signal(extra, chat_id, message, media_files=None):
@@ -2040,10 +2006,15 @@ async def _send_qqbot(pconfig, chat_id, message):
     except ImportError:
         return _error("QQBot direct send requires httpx. Run: pip install httpx")
 
+    # Resolve credential fallbacks through the profile secret scope (with the
+    # plain-environ fallback for unscoped single-profile runs) so a multiplex
+    # profile's direct send never borrows another profile's QQ credentials.
+    from gateway.config import _getenv
+
     extra = pconfig.extra or {}
-    appid = extra.get("app_id") or os.getenv("QQ_APP_ID", "")
+    appid = extra.get("app_id") or _getenv("QQ_APP_ID", "")
     secret = (pconfig.token or extra.get("client_secret")
-              or os.getenv("QQ_CLIENT_SECRET", ""))
+              or _getenv("QQ_CLIENT_SECRET", ""))
     if not appid or not secret:
         return _error("QQBot: QQ_APP_ID / QQ_CLIENT_SECRET not configured.")
 

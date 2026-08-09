@@ -2,7 +2,7 @@ import { atom } from 'nanostores'
 
 import { capitalize } from '@/lib/text'
 
-export type SubagentStatus = 'completed' | 'error' | 'failed' | 'interrupted' | 'queued' | 'running' | 'timeout'
+export type SubagentStatus = 'completed' | 'failed' | 'interrupted' | 'queued' | 'running'
 export type SubagentStreamKind = 'progress' | 'summary' | 'thinking' | 'tool'
 
 export interface SubagentStreamEntry {
@@ -35,8 +35,6 @@ export interface SubagentProgress {
   summary?: string
   /** Active tool while running — cleared on terminal status. */
   currentTool?: string
-  /** Synthetic row created from delegation.status polling. */
-  source?: 'delegation-status'
 }
 
 export interface SubagentNode extends SubagentProgress {
@@ -45,9 +43,7 @@ export interface SubagentNode extends SubagentProgress {
 
 export type SubagentPayload = Record<string, unknown>
 
-const TERMINAL: ReadonlySet<SubagentStatus> = new Set(['completed', 'error', 'failed', 'interrupted', 'timeout'])
-const FAILED: ReadonlySet<SubagentStatus> = new Set(['error', 'failed', 'interrupted', 'timeout'])
-export const DELEGATION_STATUS_SESSION_ID = '__delegation_status__'
+const TERMINAL: ReadonlySet<SubagentStatus> = new Set(['completed', 'failed', 'interrupted'])
 const MAX_STREAM = 24
 const PREVIEW_MAX = 220
 const TOOL_PREVIEW_MAX = 96
@@ -59,31 +55,8 @@ const str = (v: unknown) => (isStr(v) ? v : '')
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
 const strList = (v: unknown) => (Array.isArray(v) ? v.filter(isStr) : [])
 
-const asStatus = (v: unknown): SubagentStatus => {
-  if (
-    v === 'completed' ||
-    v === 'error' ||
-    v === 'failed' ||
-    v === 'interrupted' ||
-    v === 'queued' ||
-    v === 'running' ||
-    v === 'timeout'
-  ) {
-    return v
-  }
-
-  return 'running'
-}
-
-const epochMs = (v: unknown) => {
-  const n = num(v)
-
-  if (n == null) {
-    return undefined
-  }
-
-  return n < 10_000_000_000 ? n * 1000 : n
-}
+const asStatus = (v: unknown): SubagentStatus =>
+  v === 'completed' || v === 'failed' || v === 'interrupted' || v === 'queued' ? v : 'running'
 
 const compact = (text: string, max = PREVIEW_MAX) => {
   const line = text.replace(/\s+/g, ' ').trim()
@@ -167,7 +140,7 @@ function streamFromPayload(
   const summary = compact(str(payload.summary) || str(payload.text))
 
   if (TERMINAL.has(status) && summary) {
-    out.push({ at, isError: FAILED.has(status), kind: 'summary', text: summary })
+    out.push({ at, isError: status === 'failed', kind: 'summary', text: summary })
   }
 
   return out
@@ -190,7 +163,7 @@ function toProgress(payload: SubagentPayload, prev: SubagentProgress | undefined
     status,
     taskCount: num(payload.task_count) ?? prev?.taskCount ?? 1,
     taskIndex: num(payload.task_index) ?? prev?.taskIndex ?? 0,
-    startedAt: prev?.startedAt ?? epochMs(payload.started_at) ?? epochMs(payload.dispatched_at) ?? at,
+    startedAt: prev?.startedAt ?? at,
     updatedAt: at,
     durationSeconds: num(payload.duration_seconds) ?? prev?.durationSeconds,
     costUsd: num(payload.cost_usd) ?? prev?.costUsd,
@@ -201,8 +174,7 @@ function toProgress(payload: SubagentPayload, prev: SubagentProgress | undefined
     filesWritten: filesWritten.length ? filesWritten : (prev?.filesWritten ?? []),
     stream,
     summary: str(payload.summary) || prev?.summary,
-    currentTool: TERMINAL.has(status) ? undefined : tool || prev?.currentTool,
-    source: payload.source === 'delegation-status' ? 'delegation-status' : prev?.source
+    currentTool: TERMINAL.has(status) ? undefined : tool || prev?.currentTool
   }
 }
 
@@ -215,6 +187,35 @@ export function clearSessionSubagents(sid: string) {
 
   const { [sid]: _drop, ...rest } = map
   $subagentsBySession.set(rest)
+}
+
+/**
+ * Prune terminal-status subagent rows for a session, leaving running/queued
+ * entries untouched. Used at the `message.start` boundary in the desktop
+ * message-stream hook so that the *previous* turn's finished rows get flushed
+ * from the display while background subagents that outlived the spawning turn
+ * remain visible (and still accept late progress/complete events).
+ *
+ * Distinct from `clearSessionSubagents` (used by the Stop action, which
+ * genuinely cancels running subagents and so should drop them all) and from
+ * `pruneDelegateFallbackSubagents` (which filters by id prefix to remove
+ * placeholder rows once the real native event arrives).
+ */
+export function pruneFinishedSessionSubagents(sid: string) {
+  const map = $subagentsBySession.get()
+  const list = map[sid]
+
+  if (!list?.length) {
+    return
+  }
+
+  const next = list.filter(item => item.status === 'running' || item.status === 'queued')
+
+  if (next.length === list.length) {
+    return
+  }
+
+  $subagentsBySession.set({ ...map, [sid]: next })
 }
 
 export function pruneDelegateFallbackSubagents(sid: string) {
@@ -288,98 +289,8 @@ export const activeSubagentCount = (items: readonly SubagentProgress[]) =>
   items.filter(item => item.status === 'queued' || item.status === 'running').length
 
 export const failedSubagentCount = (items: readonly SubagentProgress[]) =>
-  items.filter(item => FAILED.has(item.status)).length
+  items.filter(item => item.status === 'failed' || item.status === 'interrupted').length
 
 /** Flatten every session's subagents — the scope the Spawn-tree panel and the
  *  status-bar indicator must agree on. */
-export const allSubagents = (bySession: Record<string, SubagentProgress[]>) => {
-  const byId = new Map<string, SubagentProgress>()
-
-  const prefer = (current: SubagentProgress, candidate: SubagentProgress) => {
-    const currentActive = current.status === 'queued' || current.status === 'running'
-    const candidateActive = candidate.status === 'queued' || candidate.status === 'running'
-
-    if (candidateActive !== currentActive) {
-      return candidateActive ? candidate : current
-    }
-
-    if (current.source === 'delegation-status' && candidate.source !== 'delegation-status') {
-      return candidate
-    }
-
-    if (candidate.source === 'delegation-status' && current.source !== 'delegation-status') {
-      return current
-    }
-
-    return candidate.updatedAt >= current.updatedAt ? candidate : current
-  }
-
-  for (const items of Object.values(bySession)) {
-    for (const item of items) {
-      const current = byId.get(item.id)
-      byId.set(item.id, current ? prefer(current, item) : item)
-    }
-  }
-
-  return [...byId.values()]
-}
-
-/**
- * Mirror backend delegation.status active records into the desktop store.
- *
- * Native subagent.* events are still the rich source of truth, but they can be
- * silent while a child is inside a long tool call, and a new parent turn clears
- * the per-session live rows. delegation.status is the backend liveness registry;
- * keeping it in a synthetic session prevents the Agents status item and Spawn
- * tree from claiming zero while child agents are still actually running.
- */
-export function syncActiveDelegationSubagents(active: readonly Record<string, unknown>[]) {
-  const map = $subagentsBySession.get()
-  const cleaned: Record<string, SubagentProgress[]> = {}
-  const groups: Record<string, SubagentProgress[]> = {}
-
-  for (const [sid, items] of Object.entries(map)) {
-    const next = items.filter(item => item.source !== 'delegation-status')
-
-    if (next.length) {
-      cleaned[sid] = next
-    }
-  }
-
-  for (const [index, item] of active.filter(item => str(item.subagent_id)).entries()) {
-    const sid = str(item.parent_session_id) || DELEGATION_STATUS_SESSION_ID
-    const previous = (map[sid] ?? []).find(prev => prev.id === str(item.subagent_id))
-
-    const progress = toProgress(
-      {
-        ...item,
-        source: 'delegation-status',
-        status: item.status ?? 'running',
-        task_index: num(item.task_index) ?? index
-      },
-      previous,
-      'delegation.status'
-    )
-
-    groups[sid] = [...(groups[sid] ?? []), progress]
-  }
-
-  if (!Object.keys(groups).length) {
-    const hadSyntheticRows = Object.values(map).some(items => items.some(item => item.source === 'delegation-status'))
-
-    if (hadSyntheticRows) {
-      $subagentsBySession.set(cleaned)
-    }
-
-    return
-  }
-
-  $subagentsBySession.set(
-    Object.fromEntries(
-      Object.entries({ ...cleaned, ...groups }).map(([sid, items]) => [
-        sid,
-        sid in groups ? [...(cleaned[sid] ?? []), ...items] : items
-      ])
-    )
-  )
-}
+export const allSubagents = (bySession: Record<string, SubagentProgress[]>) => Object.values(bySession).flat()

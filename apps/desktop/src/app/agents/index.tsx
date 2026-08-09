@@ -3,6 +3,7 @@ import { type ReactNode, useEffect, useMemo, useState } from 'react'
 
 import { useElapsedSeconds } from '@/components/chat/activity-timer'
 import { ActivityTimerText } from '@/components/chat/activity-timer-text'
+import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { Codicon } from '@/components/ui/codicon'
 import { FadeText } from '@/components/ui/fade-text'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
@@ -35,7 +36,7 @@ function statusGlyph(status: SubagentStatus, a: Translations['agents']): ReactNo
     )
   }
 
-  if (status === 'error' || status === 'failed' || status === 'interrupted' || status === 'timeout') {
+  if (status === 'failed' || status === 'interrupted') {
     return <AlertCircle aria-label={a.failed} className="size-3.5 shrink-0 text-destructive" />
   }
 
@@ -183,26 +184,23 @@ function SubagentTree({ tree }: { tree: SubagentNode[] }) {
   const [nowMs, setNowMs] = useState(() => Date.now())
 
   const active = flat.filter(n => n.status === 'running' || n.status === 'queued').length
-
-  const failed = flat.filter(
-    n => n.status === 'error' || n.status === 'failed' || n.status === 'interrupted' || n.status === 'timeout'
-  ).length
-
+  const failed = flat.filter(n => n.status === 'failed' || n.status === 'interrupted').length
   const tools = flat.reduce((sum, n) => sum + (n.toolCount ?? 0), 0)
-
   const files = flat.reduce((sum, n) => sum + n.filesRead.length + n.filesWritten.length, 0)
   const tokens = flat.reduce((sum, n) => sum + (n.inputTokens ?? 0) + (n.outputTokens ?? 0), 0)
   const cost = flat.reduce((sum, n) => sum + (n.costUsd ?? 0), 0)
 
+  const visible = usePaneVisible()
+
   useEffect(() => {
-    if (active <= 0 || typeof window === 'undefined') {
+    if (active <= 0 || !visible || typeof window === 'undefined') {
       return
     }
 
     const id = window.setInterval(() => setNowMs(Date.now()), 500)
 
     return () => window.clearInterval(id)
-  }, [active])
+  }, [active, visible])
 
   if (tree.length === 0) {
     return (

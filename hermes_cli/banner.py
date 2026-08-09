@@ -40,7 +40,14 @@ def cprint(text: str):
     """Print ANSI-colored text through prompt_toolkit's renderer."""
     from prompt_toolkit import print_formatted_text as _pt_print
     from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
-    _pt_print(_PT_ANSI(text))
+    try:
+        _pt_print(_PT_ANSI(text))
+    except Exception:
+        # prompt_toolkit needs a real console. On Windows, a redirected or
+        # absent stdout (pythonw.exe, CI, `hermes ... > file`) raises
+        # NoConsoleScreenBufferError from its Win32Output — display helpers
+        # must never crash the caller over that, so degrade to plain print.
+        print(text)
 
 
 # =========================================================================
@@ -160,6 +167,11 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
             ["git", *args],
             capture_output=True,
             text=True,
+            # git output is UTF-8; on Windows text=True defaults to the ANSI
+            # code page and bytes like 0x90 (3rd byte of 🐛 in a commit
+            # subject) crash the stdlib reader thread (#52649).
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             cwd=str(cwd),
         )
@@ -168,6 +180,16 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
     if result.returncode != 0:
         return None
     return (result.stdout or "").strip()
+
+
+def _local_git_cache_state(repo_dir: Path) -> Dict[str, Optional[str]]:
+    """Return git state that invalidates stale update-check cache entries."""
+    return {
+        "head": _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir),
+        "branch": _git_stdout(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_dir),
+        "origin_head": _git_stdout(["rev-parse", "--verify", "origin/main"], cwd=repo_dir),
+        "origin_url": _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir),
+    }
 
 
 def _check_via_rev(local_rev: str) -> Optional[int]:
@@ -179,7 +201,8 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     try:
         result = subprocess.run(
             ["git", "ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10,
         )
     except Exception:
         return None
@@ -189,21 +212,6 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     if not upstream_rev:
         return None
     return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
-
-
-def _local_git_cache_state(repo_dir: Path) -> Dict[str, Optional[str]]:
-    """Return git state that invalidates stale update-check cache entries.
-
-    The same Hermes checkout can be on different branches over time. A stale
-    cache entry from a temporary/rebase branch must not make `hermes --version`
-    claim main is behind after the checkout returns to fork main.
-    """
-    return {
-        "head": _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir),
-        "branch": _git_stdout(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_dir),
-        "origin_head": _git_stdout(["rev-parse", "--verify", "origin/main"], cwd=repo_dir),
-        "origin_url": _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir),
-    }
 
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
@@ -228,7 +236,15 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     is_shallow = shallow == "true"
 
     try:
-        fetch_args = ["git", "fetch", "origin"]
+        # Scope the fetch to the one branch the behind-count compares against.
+        # An unscoped ``git fetch origin`` transfers every remote head (~1,400
+        # on this repo — measured 3.0 s vs 0.55 s scoped) and can burn the full
+        # 10 s timeout on slow links. ``cmd_update`` already scopes its fetch
+        # for the same reason. Modern git updates the ``origin/main`` tracking
+        # ref on a scoped fetch, so the ``HEAD..origin/main`` count below is
+        # unaffected; the shallow path compares against FETCH_HEAD, which a
+        # scoped fetch also updates.
+        fetch_args = ["git", "fetch", "origin", "main"]
         if is_shallow:
             fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
@@ -256,7 +272,8 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     try:
         result = subprocess.run(
             ["git", "rev-list", "--count", "HEAD..origin/main"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5,
             cwd=str(repo_dir),
         )
         if result.returncode == 0:
@@ -299,8 +316,7 @@ def check_for_updates() -> Optional[int]:
 
     if not embedded_rev:
         # Prefer the running code's location over the profile-scoped path.
-        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
-        # Path(__file__) always resolves to the actual installed checkout.
+        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all.
         candidate = Path(__file__).parent.parent.resolve()
         if not (candidate / ".git").exists():
             candidate = hermes_home / "hermes-agent"
@@ -314,7 +330,7 @@ def check_for_updates() -> Optional[int]:
     now = time.time()
     try:
         if cache_file.exists():
-            cached = json.loads(cache_file.read_text())
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
             if (
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
@@ -328,15 +344,23 @@ def check_for_updates() -> Optional[int]:
     if embedded_rev:
         behind = _check_via_rev(embedded_rev)
     elif repo_dir is None:
-        # No git checkout and no embedded revision — unsupported install
-        # layouts cannot produce a trustworthy update comparison.
+        # No git checkout and no embedded revision — can't determine status.
         behind = None
     else:
         behind = _check_via_local_git(repo_dir)
 
     try:
         cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION, "git": cache_state})
+            json.dumps(
+                {
+                    "ts": now,
+                    "behind": behind,
+                    "rev": embedded_rev,
+                    "ver": VERSION,
+                    "git": cache_state,
+                }
+            ),
+            encoding="utf-8",
         )
     except Exception:
         pass
@@ -365,6 +389,8 @@ def _git_short_hash(repo_dir: Path, rev: str) -> Optional[str]:
             ["git", "rev-parse", "--short=8", rev],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
             cwd=str(repo_dir),
         )
@@ -421,6 +447,8 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
             ["git", "rev-list", "--count", "origin/main..HEAD"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
             cwd=str(repo_dir),
         )
@@ -457,6 +485,8 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
             ["git", "describe", "--tags", "--abbrev=0"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=3,
             cwd=str(repo_dir),
         )
@@ -652,13 +682,22 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
         left_lines.append(f"[{accent}]MoA: {preset_name}[/]{agg_str}{ctx_str} [dim {dim}]·[/] [dim {dim}]Nous Research[/]")
     else:
-        model_short = model.split("/")[-1] if "/" in model else model
-        if model_short.endswith(".gguf"):
-            model_short = model_short[:-5]
-        if len(model_short) > 28:
-            model_short = model_short[:25] + "..."
-        ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
-        left_lines.append(f"[{accent}]{model_short}[/]{ctx_str} [dim {dim}]·[/] [dim {dim}]Nous Research[/]")
+        if not (model or "").strip() or (model or "").strip().lower() == "unknown":
+            # Unconfigured install: say so in red instead of a blank/"unknown"
+            # slug — this is the single clearest place to tell the user what
+            # is wrong and how to fix it.
+            left_lines.append(
+                f"[bold red]no model configured[/] "
+                f"[dim {dim}]— run /model or hermes setup[/]"
+            )
+        else:
+            model_short = model.split("/")[-1] if "/" in model else model
+            if model_short.endswith(".gguf"):
+                model_short = model_short[:-5]
+            if len(model_short) > 28:
+                model_short = model_short[:25] + "..."
+            ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
+            left_lines.append(f"[{accent}]{model_short}[/]{ctx_str} [dim {dim}]·[/] [dim {dim}]Nous Research[/]")
 
     if os.getenv("HERMES_YOLO_MODE"):
         left_lines.append(f"[bold red]⚠ YOLO mode[/] [dim {dim}]— all approval prompts bypassed[/]")
