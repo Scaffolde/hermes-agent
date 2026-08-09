@@ -219,6 +219,74 @@ def test_reaper_survives_sweep_error(mock_pyright):
         svc.shutdown()
 
 
+class _SteppedWallClock:
+    """Stand-in for the ``time`` module with a stepped wall clock.
+
+    ``time()`` is offset (an NTP correction or a sleep/wake resume);
+    ``monotonic()`` is untouched, which is precisely the guarantee the
+    idle bookkeeping is supposed to rely on.
+    """
+
+    def __init__(self, offset: float) -> None:
+        self._offset = offset
+
+    def time(self) -> float:
+        return time.time() + self._offset
+
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
+def test_reaper_is_immune_to_wall_clock_steps(mock_pyright, monkeypatch):
+    """A backwards wall-clock step must not stall the idle reaper.
+
+    Idle bookkeeping compares timestamps only to each other, so it must
+    read a monotonic clock.  Against ``time.time()`` an NTP correction or
+    a sleep/wake resume that steps the clock back further than
+    ``idle_timeout`` drags the cutoff into the past, no client ever looks
+    idle, and unbounded accumulation — the leak the reaper exists to
+    close — silently comes back.
+
+    Positive control: this test fails against a ``time.time()``-based
+    reaper (the client survives the sweep) and passes against a
+    monotonic one.
+    """
+    from agent.lsp import manager as manager_mod
+
+    repo = mock_pyright
+    f = repo / "x.py"
+    f.write_text("")
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+        idle_timeout=60.0,  # sweeps manually below; the loop never fires
+    )
+    try:
+        svc.get_diagnostics_sync(str(f))
+        key = next(iter(svc._clients))
+
+        # Idle for longer than the timeout, in whichever clock is in use.
+        svc._last_used[key] = svc._last_used[key] - 120.0
+
+        # Now step the wall clock an hour into the past, mid-flight.
+        monkeypatch.setattr(manager_mod, "time", _SteppedWallClock(-3600.0))
+
+        svc._loop.run(svc._reap_idle_once(), timeout=5.0)
+
+        assert key not in svc._clients, (
+            "a backwards wall-clock step stalled the reaper — idle "
+            "bookkeeping must read a monotonic clock"
+        )
+        assert svc.get_status()["clients"] == []
+    finally:
+        svc.shutdown()
+
+
 
 
 

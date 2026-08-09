@@ -62,6 +62,21 @@ DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
 
 
+def _idle_clock() -> float:
+    """Clock for idle bookkeeping — monotonic, never the wall clock.
+
+    ``_last_used`` and the reaper's cutoff are only ever compared to each
+    other, so they need elapsed time, not a date.  The wall clock supplies
+    neither guarantee: NTP correction and sleep/wake both step it, and a
+    backwards step of more than ``idle_timeout`` pushes every cutoff into
+    the past and stalls reaping until the clock catches up (a forwards step
+    does the opposite and reaps servers that are still in use).  Both
+    failure modes are silent, and reviving unbounded accumulation is the
+    exact leak the reaper exists to close.
+    """
+    return time.monotonic()
+
+
 class _BackgroundLoop:
     """A daemon thread that owns one asyncio event loop.
 
@@ -556,7 +571,7 @@ class LSPService:
         with self._state_lock:
             client = self._clients.get(key)
             if client is not None and client.is_running:
-                self._last_used[key] = time.time()
+                self._last_used[key] = _idle_clock()
                 eventlog.log_active(srv.server_id, per_server_root)
                 return client
             spawning = self._spawning.get(key)
@@ -607,7 +622,7 @@ class LSPService:
                 return None
             with self._state_lock:
                 self._clients[key] = client
-                self._last_used[key] = time.time()
+                self._last_used[key] = _idle_clock()
             eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
             return client
@@ -629,7 +644,7 @@ class LSPService:
         key = (client.server_id, client.workspace_root)
         with self._state_lock:
             if key in self._clients:
-                self._last_used[key] = time.time()
+                self._last_used[key] = _idle_clock()
 
     async def _idle_reaper_loop(self) -> None:
         interval = min(60.0, self._idle_timeout)
@@ -646,7 +661,7 @@ class LSPService:
                 logger.debug("LSP idle reaper sweep error: %s", e)
 
     async def _reap_idle_once(self) -> None:
-        cutoff = time.time() - self._idle_timeout
+        cutoff = _idle_clock() - self._idle_timeout
         with self._state_lock:
             idle_keys = [
                 key
