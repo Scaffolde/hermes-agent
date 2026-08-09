@@ -232,3 +232,55 @@ def test_the_idle_reaper_still_works_under_the_cap(workspaces):
         assert key not in svc._clients, "idle reaping must still work under the cap"
     finally:
         svc.shutdown()
+
+
+def test_a_concurrent_spawn_does_not_evict_a_client_mid_handover(workspaces, monkeypatch):
+    """A live server must survive another root's sweep during handover.
+
+    ``_get_or_spawn`` publishes into ``_clients`` and only then returns;
+    the caller runs ``_acquire`` after that return.  Across that window
+    the client is a running subprocess whose in-flight count is still
+    zero.  A concurrent spawn for a *different* root sweeps with no
+    ``protect`` — ``protect`` is per-call and names only the sweeping
+    caller's own key — so before the fix it selected this client as its
+    LRU victim and shut the process down.  The original caller then got
+    back a dead client and silently lost every diagnostic.
+
+    The window is reproduced exactly where it occurs: inside the
+    protect-sweep, which is the one call that provably runs after the
+    insert and before ``_spawning`` clears.
+    """
+    cap = 1
+    svc = _service(max_clients=cap)
+    real_enforce = svc._enforce_cap_async
+    other = ("pyright", "/a-concurrently-spawning-root")
+    ran: list[bool] = []
+
+    async def enforcing(protect=None):
+        if protect is not None and not ran:
+            ran.append(True)
+            # Stand in for a second root that has reserved its slot and
+            # is sweeping to make room for itself.
+            svc._spawning[other] = None
+            try:
+                await real_enforce()
+            finally:
+                svc._spawning.pop(other, None)
+        return await real_enforce(protect=protect)
+
+    monkeypatch.setattr(svc, "_enforce_cap_async", enforcing)
+    try:
+        svc.get_diagnostics_sync(str(workspaces("a")))
+
+        assert ran, "the handover window never ran — the test is not wired"
+        assert len(svc._clients) == 1, (
+            "the concurrent sweep evicted a client that had not reached "
+            "its caller yet"
+        )
+        client = next(iter(svc._clients.values()))
+        assert client.is_running, (
+            "the client survived in the map but its process was shut "
+            "down — the caller holds a dead server"
+        )
+    finally:
+        svc.shutdown()

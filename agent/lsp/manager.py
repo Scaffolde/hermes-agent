@@ -864,13 +864,25 @@ class LSPService:
             fut.add_done_callback(_log_cap_enforcement_result)
 
     def _evictable(self) -> List[Tuple[Tuple[str, str], float]]:
-        """(key, last_used) for clients with no outstanding request,
-        oldest first."""
+        """(key, last_used) for clients safe to shut down, oldest first.
+
+        Two things disqualify a client.  An outstanding request is the
+        obvious one.  The other is subtler: ``_get_or_spawn`` publishes
+        into ``_clients`` and only *then* returns, and its caller runs
+        ``_acquire`` after that return.  Through that whole window the
+        client is live with an in-flight count of zero, so it would
+        otherwise look idle to a concurrent spawn's sweep — which
+        carries no ``protect`` for it, since ``protect`` is per-call and
+        names only the sweeping caller's own key.  Evicting there hands
+        the victim's caller an already-shut-down client and silently
+        drops its diagnostics.  A key still registered in ``_spawning``
+        has not reached its caller yet, so it is not ours to reclaim.
+        """
         with self._state_lock:
             candidates = [
                 (key, self._last_used.get(key, 0.0))
                 for key in self._clients
-                if self._inflight.get(key, 0) == 0
+                if self._inflight.get(key, 0) == 0 and key not in self._spawning
             ]
         candidates.sort(key=lambda kv: kv[1])
         return candidates

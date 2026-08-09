@@ -203,6 +203,38 @@ def test_cap_never_evicts_the_client_that_just_spawned():
     assert protect in svc._clients
 
 
+def test_cap_never_evicts_a_client_that_has_not_reached_its_caller_yet():
+    """A concurrent spawn must not evict another spawn's fresh client.
+
+    ``_get_or_spawn`` inserts into ``_clients`` and only then returns;
+    the caller runs ``_acquire`` *after* that return.  In the window
+    between, the client is live but its in-flight count is still zero,
+    so ``_evictable`` offers it up.  ``protect`` cannot cover it — that
+    is per-call, and the sweep doing the evicting belongs to a
+    *different* root's spawn, which passes no protect at all.
+
+    The victim's caller then receives a client that has already been
+    shut down and silently loses its diagnostics.  A key still
+    registered in ``_spawning`` has not been handed over yet and must
+    be off the table.
+    """
+    svc = make_service(max_clients=1)
+    seed(svc, ("/fresh", 100.0))
+    fresh = ("pyright", "/fresh")
+    # ``/fresh`` finished starting but its caller has not acquired it.
+    # Only the *keys* of ``_spawning`` matter to the cap; the futures
+    # are awaited solely by callers that join an in-progress spawn.
+    svc._spawning[fresh] = None
+    # A second root begins spawning and sweeps with no ``protect``.
+    svc._spawning[("pyright", "/other")] = None
+
+    evicted = asyncio.run(svc._enforce_cap_async())
+
+    assert evicted == []
+    assert fresh in svc._clients
+    assert svc._clients[fresh].shutdown_calls == 0
+
+
 def test_cap_does_not_evict_a_client_with_a_request_in_flight():
     """Reaping mid-flight makes the outer wait time out, and the handler
     marks that (server, workspace) pair broken for the whole process
