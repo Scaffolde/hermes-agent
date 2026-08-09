@@ -2181,38 +2181,23 @@ def _read_cgroup_memory_limit() -> Optional[int]:
     us size the heap cap below it so V8 GCs/exits gracefully instead of being
     reaped silently.
 
-    Checks cgroup v2 (``/sys/fs/cgroup/memory.max``) then v1
-    (``/sys/fs/cgroup/memory/memory.limit_in_bytes``).  A literal ``max`` (v2)
-    or the v1 "unlimited" sentinel (a huge near-INT64 value) means no limit.
+    Resolution goes through ``/proc/self/cgroup`` so the answer is the limit on
+    *this* process.  ``/sys/fs/cgroup/memory.max`` is the hierarchy *root*, and
+    that is only this process's limit when it sits in the root cgroup: under a
+    systemd unit with ``MemoryMax=``, or in a container without a private
+    cgroup namespace, the root reads ``max``.  Sizing off it then hands V8 the
+    flat 8GB default inside a 4GiB unit — exactly the silent SIGKILL above.
+    Where ``/proc`` cannot answer (macOS, Windows, a sandbox that hides it) the
+    fixed hierarchy roots remain the fallback.
+
+    ``agent.cgroup_memory`` is stdlib-only and shared with
+    ``agent.lsp.manager``, which sizes the language-server fleet off the same
+    ceiling.  Importing the LSP manager here instead would pull asyncio and the
+    whole LSP client stack onto a CLI startup path for no reason.
     """
-    candidates = (
-        "/sys/fs/cgroup/memory.max",  # cgroup v2
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
-    )
-    for path in candidates:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                raw = f.read().strip()
-        except (OSError, ValueError):
-            continue
-        if raw == "max":
-            return None
-        if not raw:
-            # Blank/empty file: no usable value here. Fall through to the next
-            # candidate (don't mistake an empty v2 file for "unlimited").
-            continue
-        try:
-            limit = int(raw)
-        except ValueError:
-            continue
-        if limit <= 0:
-            continue
-        # cgroup v1 reports "unlimited" as a huge value (often
-        # 0x7FFFFFFFFFFFF000 ≈ 9.2 EB, sometimes PAGE_COUNTER_MAX). Anything
-        # at/above ~1 PB is effectively unconstrained — treat as no limit.
-        if limit >= (1 << 50):
-            return None
-        return limit
+    from agent.cgroup_memory import cgroup_memory_limit_bytes
+
+    return cgroup_memory_limit_bytes()
     return None
 
 
