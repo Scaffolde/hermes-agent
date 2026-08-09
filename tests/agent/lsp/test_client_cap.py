@@ -350,6 +350,32 @@ def test_mount_root_prefix_is_stripped_from_the_cgroup_path(monkeypatch, tmp_pat
     assert manager_mod._cgroup_memory_limit_bytes() == 5 * GIB
 
 
+def test_a_bind_mount_listed_first_does_not_shadow_the_real_hierarchy(monkeypatch, tmp_path):
+    """Several cgroup2 mounts can exist; the first is not always ours.
+
+    A bind mount rooted outside this process's cgroup cannot map its
+    path at all.  Accepting the first mountinfo entry reads that
+    unrelated mount's root, finds it unlimited, and reports "no limit"
+    without ever consulting the full hierarchy that holds the real one.
+    """
+    root = fake_root(
+        tmp_path,
+        cgroup="0::/system.slice/hermes-agent.service\n",
+        mountinfo=(
+            V2_MOUNTINFO.format(mount_root="/other.slice", mount_point="/sys/fs/cgroup/bind")
+            + V2_MOUNTINFO.format(mount_root="/", mount_point="/sys/fs/cgroup")
+        ),
+        limits={
+            "/sys/fs/cgroup/bind/memory.max": "max\n",
+            "/sys/fs/cgroup/memory.max": "max\n",
+            "/sys/fs/cgroup/system.slice/hermes-agent.service/memory.max": f"{4 * GIB}\n",
+        },
+    )
+    monkeypatch.setattr(manager_mod, "CGROUP_FS_ROOT", root)
+
+    assert manager_mod._cgroup_memory_limit_bytes() == 4 * GIB
+
+
 def test_absent_proc_falls_back_to_the_fixed_paths(monkeypatch, tmp_path):
     """macOS and Windows have no ``/proc``; the old behaviour is the floor."""
     limit_file = tmp_path / "memory.max"

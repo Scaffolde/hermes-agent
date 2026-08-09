@@ -143,15 +143,15 @@ def _unescape_mount_field(field: str) -> str:
     return field
 
 
-def _cgroup_mounts() -> Dict[str, Tuple[str, str]]:
-    """``{kind: (mount_root, mount_point)}`` for the memory hierarchies.
+def _cgroup_mounts() -> Dict[str, List[Tuple[str, str]]]:
+    """``{kind: [(mount_root, mount_point), ...]}`` for the memory hierarchies.
 
     A mountinfo line is ``id parent major:minor root mount_point opts
     [optional...] - fstype source super_opts``.  The optional fields are
     variable in number, which is why the ``-`` separator splits the line
     instead of a fixed index.
     """
-    mounts: Dict[str, Tuple[str, str]] = {}
+    mounts: Dict[str, List[Tuple[str, str]]] = {}
     try:
         with open(_rooted("/proc/self/mountinfo"), "r", encoding="utf-8") as fh:
             lines = fh.read().splitlines()
@@ -167,10 +167,14 @@ def _cgroup_mounts() -> Dict[str, Tuple[str, str]]:
             continue
         mount = (_unescape_mount_field(head_fields[3]), _unescape_mount_field(head_fields[4]))
         fstype, super_opts = tail_fields[0], tail_fields[2]
+        # Every match is kept.  A namespace can expose several cgroup2 or
+        # v1-memory mounts, and the first listed may be a bind mount rooted
+        # outside this process's cgroup — which can say nothing about its
+        # limit.  The caller picks among them; order here is mountinfo's.
         if fstype == "cgroup2":
-            mounts.setdefault("v2", mount)
+            mounts.setdefault("v2", []).append(mount)
         elif fstype == "cgroup" and "memory" in super_opts.split(","):
-            mounts.setdefault("memory", mount)
+            mounts.setdefault("memory", []).append(mount)
     return mounts
 
 
@@ -199,23 +203,28 @@ def _proc_self_cgroups() -> Dict[str, str]:
     return found
 
 
-def _cgroup_dir(cgroup_path: str, mount_root: str, mount_point: str) -> str:
-    """Where *cgroup_path* actually lives given a mount of *mount_root*.
+def _cgroup_dir(cgroup_path: str, mount_root: str, mount_point: str) -> Optional[str]:
+    """Where *cgroup_path* lives under a mount of *mount_root*, or ``None``.
 
     A mount can expose a subtree: with ``/system.slice`` mounted at
     ``/sys/fs/cgroup``, this process's ``/system.slice/hermes.service``
-    is on disk at ``/sys/fs/cgroup/hermes.service``.  A path outside the
-    mounted subtree is not visible at all, so the mount point itself is
-    the best available answer — which is the old fixed-path reading.
+    is on disk at ``/sys/fs/cgroup/hermes.service``.
+
+    ``None`` means this mount cannot see the path at all — a bind mount
+    of some unrelated subtree.  Its root is not a weaker answer about
+    our limit, it is an answer about a different cgroup, so the caller
+    must prefer a mount that maps rather than read this one.
     """
-    base = _rooted(mount_point)
     trimmed = mount_root.rstrip("/")
     rel = cgroup_path
     if trimmed:
-        if cgroup_path.startswith(trimmed + "/"):
+        if cgroup_path == trimmed:
+            rel = "/"
+        elif cgroup_path.startswith(trimmed + "/"):
             rel = cgroup_path[len(trimmed):]
         else:
-            rel = "/"
+            return None
+    base = _rooted(mount_point)
     if rel in ("", "/"):
         return base
     return os.path.join(base, rel.lstrip("/"))
@@ -258,19 +267,30 @@ def _proc_cgroup_memory_limit_bytes() -> Any:
     mounts = _cgroup_mounts()
     resolved = False
     best: Optional[int] = None
-    # Both are consulted rather than the first that matches: a hybrid host
-    # mounts cgroup2 without the memory controller, which lives on v1.
+    # Both hierarchies are consulted rather than the first that matches: a
+    # hybrid host mounts cgroup2 without the memory controller, which lives
+    # on v1.
     for kind, filename in _CGROUP_LIMIT_FILES:
         cgroup_path = cgroups.get(kind)
-        mount = mounts.get(kind)
-        if cgroup_path is None or mount is None:
+        if cgroup_path is None:
             continue
-        resolved = True
-        mount_root, mount_point = mount
-        start = _cgroup_dir(cgroup_path, mount_root, mount_point)
-        limit = _limit_up_to_mount(start, _rooted(mount_point), filename)
-        if limit is not None:
-            best = limit if best is None else min(best, limit)
+        candidates: List[Tuple[str, str]] = []
+        for mount_root, mount_point in mounts.get(kind, ()):
+            start = _cgroup_dir(cgroup_path, mount_root, mount_point)
+            if start is not None:
+                candidates.append((start, _rooted(mount_point)))
+        # Only when nothing maps this process's path is a mount root worth
+        # reading, and then it is the pre-existing fixed-path answer.
+        if not candidates:
+            candidates = [
+                (_rooted(mount_point), _rooted(mount_point))
+                for _, mount_point in mounts.get(kind, ())
+            ]
+        for start, ceiling in candidates:
+            resolved = True
+            limit = _limit_up_to_mount(start, ceiling, filename)
+            if limit is not None:
+                best = limit if best is None else min(best, limit)
     return best if resolved else _UNRESOLVED
 
 
