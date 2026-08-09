@@ -25,21 +25,36 @@ def _reset():
 def caplog_lsp(caplog):
     """Capture `hermes.lint.lsp` records WITHOUT letting them escape.
 
-    `caplog.set_level()` attaches caplog's own handler but leaves propagation
-    on, so records still climb to the root logger. If a production file
-    handler is installed in this process they land in the operator's real
-    `agent.log` — and at DEBUG, so even the steady-state events the eventlog
-    design deliberately keeps below INFO get written out. Disabling
-    propagation keeps them in caplog's handler, which is all these tests read.
+    `caplog.set_level()` leaves propagation on, so records still climb to the
+    root logger. If a production file handler is installed in this process they
+    land in the operator's real `agent.log` — and at DEBUG, so even the
+    steady-state events the eventlog design deliberately keeps below INFO get
+    written out. Disabling propagation keeps them in caplog's handler, which is
+    all these tests read.
+
+    Capture has to survive that. pytest's capture handler lives on the *root*
+    logger, so switching propagation off could cut these tests off from their
+    own records. Under the pinned pytest, `set_level(logger=...)` also binds the
+    handler to the named logger, so it does not — but that is an implementation
+    detail rather than a documented promise. The bind below makes the capture
+    path explicit and self-contained: it is a no-op today (pytest has already
+    attached the same handler object), and becomes load-bearing only if that
+    behaviour ever changes. Teardown removes only a handler this fixture added,
+    so pytest's own handler lifecycle is left alone.
     """
     lg = logging.getLogger("hermes.lint.lsp")
     previous = lg.propagate
-    lg.propagate = False
     caplog.set_level(logging.DEBUG, logger="hermes.lint.lsp")
+    attached_here = caplog.handler not in lg.handlers
+    if attached_here:
+        lg.addHandler(caplog.handler)
+    lg.propagate = False
     try:
         yield caplog
     finally:
         lg.propagate = previous
+        if attached_here:
+            lg.removeHandler(caplog.handler)
 
 
 # ---------------------------------------------------------------------------
