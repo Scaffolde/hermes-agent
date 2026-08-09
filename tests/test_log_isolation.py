@@ -76,6 +76,39 @@ class TestLogIsolation:
             "conftest loaded; import-time setup_logging() writes to their agent.log"
         )
 
+    def test_sandbox_overrides_a_preset_hermes_home(self):
+        """A preset HERMES_HOME must be replaced, not honored.
+
+        The sandbox used to apply only when HERMES_HOME was unset, so anyone
+        running the suite from inside a Hermes agent or gateway process (where
+        it is exported and points at the real root) got no sandbox at all and
+        wrote straight into the operator's agent.log.
+        """
+        from tests.conftest import (
+            _PRE_SANDBOX_HERMES_HOME,
+            _SESSION_HERMES_HOME,
+            HERMES_HOME_AT_CONFTEST_IMPORT,
+        )
+
+        assert HERMES_HOME_AT_CONFTEST_IMPORT == _SESSION_HERMES_HOME, (
+            "conftest must install its own sandbox unconditionally, not defer "
+            f"to an inherited HERMES_HOME ({_PRE_SANDBOX_HERMES_HOME!r})"
+        )
+
+    def test_kanban_deny_list_still_sees_the_real_root(self):
+        """The unconditional sandbox must not blind the kanban write guard.
+
+        The guard is a deny-list anchored on the operator's REAL root. If it
+        resolved from the (now always rewired) environment it would point at
+        the throwaway tempdir and silently stop protecting ~/.hermes — the
+        #69385 regression, reachable again via the sandbox change.
+        """
+        from tests.conftest import _REAL_KANBAN_ROOT, _SESSION_HERMES_HOME
+
+        sandbox = Path(_SESSION_HERMES_HOME).resolve()
+        assert _REAL_KANBAN_ROOT != sandbox
+        assert sandbox not in _REAL_KANBAN_ROOT.parents
+
     def test_importing_the_cli_does_not_target_the_real_logs(self):
         pytest.importorskip("hermes_cli.main")
 
