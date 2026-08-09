@@ -429,3 +429,165 @@ def test_config_max_clients_none_means_derive_from_the_host():
 
 def test_config_max_clients_is_clamped_to_the_ceiling():
     assert manager_mod.resolve_max_clients(10_000) == MAX_CLIENT_CAP
+
+
+# ----------------------------------------------------------------------
+# eviction handoff: keeping a wedged shutdown off the caller's budget
+# ----------------------------------------------------------------------
+
+
+class WedgedClient(FakeClient):
+    """A client whose shutdown never finishes until released."""
+
+    def __init__(self, server_id: str, workspace_root: str) -> None:
+        super().__init__(server_id, workspace_root)
+        self.released = asyncio.Event()
+        self.finished = False
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+        await self.released.wait()
+        self.finished = True
+
+
+def _wedge(svc: LSPService, root: str, last_used: float) -> WedgedClient:
+    key = ("pyright", root)
+    client = WedgedClient("pyright", root)
+    svc._clients[key] = client
+    svc._last_used[key] = last_used
+    return client
+
+
+def test_a_wedged_shutdown_does_not_hold_the_handoff_caller():
+    """With a handoff bound, the caller leaves; the shutdown keeps going.
+
+    This is the spawn path's contract: cap enforcement runs inside the
+    request's diagnostics budget, so it must be able to give up waiting
+    on a victim without giving up on killing it.
+    """
+    async def scenario():
+        svc = make_service(max_clients=1)
+        victim = _wedge(svc, "/wedged", 100.0)
+        seed(svc, ("/fresh", 300.0))
+
+        evicted = await svc._enforce_cap_async(handoff=0.05)
+
+        assert evicted == [("pyright", "/wedged")]
+        assert victim.shutdown_calls == 1, "the shutdown must still have been started"
+        assert not victim.finished, "the caller waited out the wedged shutdown"
+
+        # Still on the hook: releasing it lets the drain complete.
+        victim.released.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert victim.finished, "the detached shutdown was abandoned, not drained"
+
+    asyncio.run(scenario())
+
+
+def test_an_in_flight_shutdown_keeps_occupying_its_slot():
+    """A detached shutdown must not read as a free slot.
+
+    The process is still resident until it exits, and the cap bounds
+    resident processes.  ``_spawning`` reserves the slot of a server
+    that is about to exist; this is the same reservation for one that
+    is about to stop.
+    """
+    async def scenario():
+        svc = make_service(max_clients=1)
+        victim = _wedge(svc, "/wedged", 100.0)
+        seed(svc, ("/fresh", 300.0))
+
+        await svc._enforce_cap_async(handoff=0.05)
+
+        assert ("pyright", "/wedged") in svc._shutting_down
+        with svc._state_lock:
+            # One live client plus one process still going down, against
+            # a cap of one: the fleet is not back under the cap yet and
+            # the accounting must say so.
+            assert svc._overage_locked() == 1
+
+        victim.released.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        with svc._state_lock:
+            assert svc._overage_locked() == 0, (
+                "the reservation was never released once the process exited"
+            )
+
+    asyncio.run(scenario())
+
+
+def test_the_sweep_stops_once_enough_shutdowns_are_in_flight():
+    """Reserved slots must not drive the sweep into over-draining.
+
+    With in-flight shutdowns counted against the cap, the overage does
+    not fall when a victim is detached.  A sweep that only watched the
+    overage would keep picking victims and take the whole fleet down.
+    """
+    async def scenario():
+        svc = make_service(max_clients=2)
+        _wedge(svc, "/oldest", 100.0)
+        seed(svc, ("/middle", 200.0), ("/newest", 300.0))
+
+        evicted = await svc._enforce_cap_async(handoff=0.05)
+
+        assert evicted == [("pyright", "/oldest")], (
+            "exactly one eviction covers an overage of one — the sweep "
+            "kept going against reserved slots"
+        )
+        assert set(svc._clients) == {("pyright", "/middle"), ("pyright", "/newest")}
+
+    asyncio.run(scenario())
+
+
+def test_a_failing_shutdown_releases_its_slot_and_is_logged(caplog):
+    """A shutdown that raises must not be silent, and must not leak a slot.
+
+    Nobody calls ``.result()`` on the drain task.  If the exception
+    vanished, a raising shutdown would hold its reservation forever and
+    permanently shrink the usable fleet.
+    """
+    class ExplodingClient(FakeClient):
+        async def shutdown(self) -> None:
+            self.shutdown_calls += 1
+            raise RuntimeError("shutdown blew up")
+
+    async def scenario():
+        svc = make_service(max_clients=1)
+        key = ("pyright", "/boom")
+        svc._clients[key] = ExplodingClient("pyright", "/boom")
+        svc._last_used[key] = 100.0
+        seed(svc, ("/fresh", 300.0))
+
+        with caplog.at_level("DEBUG", logger="agent.lsp.manager"):
+            await svc._enforce_cap_async(handoff=0.05)
+
+        assert key not in svc._shutting_down, "a failed shutdown leaked its slot"
+        assert any("shutdown blew up" in r.getMessage() for r in caplog.records), (
+            "the shutdown failure was swallowed"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_the_hand_crank_still_waits_for_the_shutdown():
+    """``handoff=None`` keeps the original await-to-completion contract.
+
+    ``enforce_cap_now`` and the detached release sweep are not on any
+    request's critical path, so they have no reason to hand off — and
+    the CLI reporting an eviction that has not happened yet would be a
+    lie.
+    """
+    async def scenario():
+        svc = make_service(max_clients=1)
+        clients = seed(svc, ("/old", 100.0), ("/new", 300.0))
+
+        await svc._enforce_cap_async()
+
+        assert clients[("pyright", "/old")].shutdown_calls == 1
+        assert not svc._shutting_down, (
+            "the reservation must be gone once the shutdown completed"
+        )
+
+    asyncio.run(scenario())

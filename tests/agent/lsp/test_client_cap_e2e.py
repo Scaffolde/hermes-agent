@@ -42,13 +42,14 @@ def workspaces(tmp_path, monkeypatch):
     """
     index = next(i for i, s in enumerate(SERVERS) if s.server_id == "pyright")
     original = SERVERS[index]
+    scripts: dict[str, str] = {}
 
     def _spawn(root: str, ctx: ServerContext) -> SpawnSpec:
         return SpawnSpec(
             command=[sys.executable, MOCK_SERVER],
             workspace_root=root,
             cwd=root,
-            env={"MOCK_LSP_SCRIPT": "errors"},
+            env={"MOCK_LSP_SCRIPT": scripts.get(root, "errors")},
             initialization_options={},
         )
 
@@ -61,13 +62,14 @@ def workspaces(tmp_path, monkeypatch):
         description="mock pyright (fleet-cap e2e)",
     )
 
-    def make(name: str) -> Path:
+    def make(name: str, script: str = "errors") -> Path:
         repo = tmp_path / name
         repo.mkdir()
         (repo / ".git").mkdir()
         (repo / "pyproject.toml").write_text("")
         f = repo / "x.py"
         f.write_text("")
+        scripts[str(repo)] = script
         return f
 
     # The workspace gate requires cwd to sit inside a git worktree.
@@ -256,17 +258,17 @@ def test_a_concurrent_spawn_does_not_evict_a_client_mid_handover(workspaces, mon
     other = ("pyright", "/a-concurrently-spawning-root")
     ran: list[bool] = []
 
-    async def enforcing(protect=None):
+    async def enforcing(protect=None, *, handoff=None):
         if protect is not None and not ran:
             ran.append(True)
             # Stand in for a second root that has reserved its slot and
             # is sweeping to make room for itself.
             svc._spawning[other] = None
             try:
-                await real_enforce()
+                await real_enforce(handoff=handoff)
             finally:
                 svc._spawning.pop(other, None)
-        return await real_enforce(protect=protect)
+        return await real_enforce(protect=protect, handoff=handoff)
 
     monkeypatch.setattr(svc, "_enforce_cap_async", enforcing)
     try:
@@ -282,5 +284,97 @@ def test_a_concurrent_spawn_does_not_evict_a_client_mid_handover(workspaces, mon
             "the client survived in the map but its process was shut "
             "down — the caller holds a dead server"
         )
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.live_system_guard_bypass
+def test_a_wedged_victim_does_not_eat_the_callers_diagnostics_budget(
+    workspaces, monkeypatch
+):
+    """Evicting a hung server must not be charged to the next request.
+
+    ``get_diagnostics_sync`` runs ``_open_and_wait_async`` under a single
+    outer budget of ``wait_timeout + 2.0``.  Cap enforcement lives
+    *inside* that run, on the spawn path, so a victim that refuses to die
+    spends the client's ``shutdown`` request timeout plus
+    ``SHUTDOWN_GRACE`` — about three seconds — before the new client has
+    even opened the file.  The wait that follows still asks for the full
+    ``wait_timeout``, but the outer budget it is nested in has already
+    been drained, so it is cut short and the caller is told the server
+    had nothing to say.  That is a silent wrong answer, not a slow one.
+
+    Probe: the wall-clock already spent when the diagnostics wait begins,
+    against the budget the wrapper hands it.  The invariant is that the
+    wait still has its whole ``wait_timeout`` left when it starts —
+    anything less means eviction ate the caller's answer.
+    """
+    svc = _service(max_clients=1)
+    budget = svc._wait_timeout + 2.0  # what get_diagnostics_sync allows
+    started_at: list[float] = []
+    remaining: list[float] = []
+
+    real_wait = LSPClient.wait_for_diagnostics
+
+    async def timed_wait(self, *args, **kwargs):
+        if started_at:
+            remaining.append(budget - (time.monotonic() - started_at[-1]))
+        return await real_wait(self, *args, **kwargs)
+
+    monkeypatch.setattr(LSPClient, "wait_for_diagnostics", timed_wait)
+
+    try:
+        # 'a' is the wedged server: it serves diagnostics normally, then
+        # refuses to shut down.  It is the only client, so it is the
+        # victim when 'b' needs the one slot.
+        first = str(workspaces("a", script="hang_shutdown"))
+        second = str(workspaces("b"))
+
+        started_at.append(time.monotonic())
+        svc.get_diagnostics_sync(first)
+        remaining.clear()  # only the eviction-bearing call is under test
+
+        started_at.append(time.monotonic())
+        svc.get_diagnostics_sync(second)
+
+        assert remaining, "the diagnostics wait never ran — the test is not wired"
+        assert remaining[0] >= svc._wait_timeout, (
+            f"the diagnostics wait began with only {remaining[0]:.2f}s of the "
+            f"{budget:.2f}s budget left, so it cannot spend its full "
+            f"wait_timeout of {svc._wait_timeout:.2f}s. A wedged victim's "
+            "shutdown was charged to this caller. Keep eviction shutdown off "
+            "the request's critical path."
+        )
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.live_system_guard_bypass
+def test_the_wedged_victim_still_dies_and_the_fleet_settles_at_the_cap(workspaces):
+    """Taking eviction off the critical path must not orphan the victim.
+
+    Detaching a shutdown that is then never awaited would trade a latency
+    bug for a leak: the process the cap exists to reclaim would outlive
+    the eviction that was supposed to kill it.
+    """
+    svc = _service(max_clients=1)
+    try:
+        svc.get_diagnostics_sync(str(workspaces("a", script="hang_shutdown")))
+        victim = next(iter(svc._clients.values()))
+        assert victim.is_running
+
+        svc.get_diagnostics_sync(str(workspaces("b")))
+
+        assert victim not in svc._clients.values(), "victim must leave the map"
+        # SIGKILL lands SHUTDOWN_GRACE after the ignored SIGTERM; allow
+        # generously more than that before calling it a leak.
+        deadline = time.time() + 10.0
+        while victim.is_running and time.time() < deadline:
+            time.sleep(0.05)
+        assert not victim.is_running, (
+            "the wedged server outlived its eviction — a detached shutdown "
+            "must still be driven to completion"
+        )
+        assert len(svc._clients) == 1, "the fleet must settle at the cap"
     finally:
         svc.shutdown()
