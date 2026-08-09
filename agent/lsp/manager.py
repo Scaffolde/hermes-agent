@@ -745,6 +745,14 @@ class LSPService:
                 initialization_options=spec.initialization_options,
                 seed_diagnostics_on_first_push=spec.seed_diagnostics_on_first_push or srv.seed_first_push,
             )
+            # Make room BEFORE starting the process, not after.  ``key``
+            # is already registered in ``_spawning``, so the cap counts
+            # this server as occupying its slot and drains to leave room
+            # for it.  Evicting afterwards would let the fleet hold
+            # cap + 1 live servers, and the peak is what this bounds.
+            # No ``protect`` here: nothing is being returned yet, and a
+            # stale dead client under ``key`` should be reclaimed.
+            await self._enforce_cap_async()
             try:
                 await client.start()
             except Exception as e:  # noqa: BLE001
@@ -755,9 +763,10 @@ class LSPService:
             with self._state_lock:
                 self._clients[key] = client
                 self._last_used[key] = time.time()
-            # Bound the population at the moment it grows.  ``key`` is
-            # protected: evicting the client this call is about to return
-            # would make every spawn immediately undo itself.
+            # Second sweep, protecting the client this call returns:
+            # concurrent spawns for other roots can still have raced the
+            # reservation above. Evicting the caller's own client would
+            # make every spawn immediately undo itself.
             await self._enforce_cap_async(protect=key)
             eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
@@ -827,11 +836,19 @@ class LSPService:
         *protect* is the key that just spawned: evicting the client the
         caller is about to use would turn the cap into an infinite
         spawn/evict loop.
+
+        A key registered in ``_spawning`` but not yet in ``_clients``
+        counts against the cap.  It is a server that is about to exist,
+        and the spawn path enforces the cap *before* ``client.start()``,
+        so that reservation is what keeps the fleet off ``cap + 1`` live
+        servers.  It also stops concurrent spawns for different roots
+        from each claiming the same single free slot.
         """
         evicted: List[Tuple[str, str]] = []
         while True:
             with self._state_lock:
-                overage = len(self._clients) - self._max_clients
+                pending = sum(1 for k in self._spawning if k not in self._clients)
+                overage = len(self._clients) + pending - self._max_clients
             if overage <= 0:
                 break
             victim = next(
