@@ -207,6 +207,25 @@ def log_reaped(keys: List[Tuple[str, str]], idle_timeout: float) -> None:
     )
 
 
+def log_evicted(server_id: str, workspace_root: str, reason: str) -> None:
+    """One client was evicted to satisfy the concurrent cap.  INFO, and
+    per-client rather than per-sweep: cap evictions are driven by a spawn
+    the user just triggered, so the line explains a shutdown they did not
+    ask for at the moment it happens.
+
+    Clears the ``log_active`` announce cache for the same reason
+    :func:`log_reaped` does — a later respawn must re-announce at INFO
+    instead of logging a misleading DEBUG "reused client".
+    """
+    with _announce_lock:
+        _announced_active.discard((server_id, workspace_root))
+    _emit(
+        "reaper",
+        logging.INFO,
+        f"evicted {server_id} ({workspace_root}): {reason}",
+    )
+
+
 def reset_announce_caches() -> None:
     """Test-only: clear the dedup caches.  Production code never calls this."""
     with _announce_lock:

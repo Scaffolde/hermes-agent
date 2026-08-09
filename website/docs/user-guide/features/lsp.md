@@ -171,6 +171,12 @@ lsp:
   # clamped to 30 so a sweep can never reap a client mid-operation.
   idle_timeout: 600
 
+  # Maximum language servers held at once. `idle_timeout` bounds how long
+  # a server lives; this bounds how many exist. Leave unset (null) to
+  # derive the cap from host memory — about a quarter of RAM at ~1.3 GiB
+  # per server, clamped to 1-24 — or set an integer to pin it.
+  max_clients: null
+
   # Per-server overrides (all optional).
   servers:
     pyright:
@@ -236,6 +242,17 @@ one language-server process per workspace forever. A reaped server is
 respawned automatically on the next relevant file operation. Set
 `idle_timeout: 0` to disable reaping and hold every server's index warm
 for the life of the process.
+
+Idle reaping bounds how *long* a server lives; `lsp.max_clients` bounds
+how *many* run at once. The two are independent, and only the second one
+helps when a session touches many worktrees in quick succession — every
+server can be inside its idle window and the host can still be out of
+memory. Leave `max_clients` unset to derive the cap from host RAM (about
+a quarter of it, at ~1.3 GiB per server, clamped to 1-24), or set an
+integer to pin it. Once the cap is reached, spawning a new server shuts
+down the least-recently-used one first. A server with a request in
+flight is never chosen — the cap waits rather than interrupting a live
+diagnostic — so a burst of concurrent edits can briefly exceed it.
 
 ## Disabling
 
