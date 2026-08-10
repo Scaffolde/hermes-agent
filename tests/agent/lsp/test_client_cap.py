@@ -500,7 +500,8 @@ def test_an_in_flight_shutdown_keeps_occupying_its_slot():
 
         await svc._enforce_cap_async(handoff=0.05)
 
-        assert ("pyright", "/wedged") in svc._shutting_down
+        # Keyed by task; the workspace is the value (see the map's note).
+        assert ("pyright", "/wedged") in svc._shutting_down.values()
         with svc._state_lock:
             # One live client plus one process still going down, against
             # a cap of one: the fleet is not back under the cap yet and
@@ -563,7 +564,9 @@ def test_a_failing_shutdown_releases_its_slot_and_is_logged(caplog):
         with caplog.at_level("DEBUG", logger="agent.lsp.manager"):
             await svc._enforce_cap_async(handoff=0.05)
 
-        assert key not in svc._shutting_down, "a failed shutdown leaked its slot"
+        assert key not in svc._shutting_down.values(), (
+            "a failed shutdown leaked its slot"
+        )
         assert any("shutdown blew up" in r.getMessage() for r in caplog.records), (
             "the shutdown failure was swallowed"
         )
@@ -589,5 +592,148 @@ def test_the_hand_crank_still_waits_for_the_shutdown():
         assert not svc._shutting_down, (
             "the reservation must be gone once the shutdown completed"
         )
+
+    asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# Codex review on PR #66: the handoff bound and the reservation map
+# ----------------------------------------------------------------------
+
+
+class HangingClient(FakeClient):
+    """A victim that never finishes shutting down.
+
+    The wedged case is the only one where the handoff bound is load
+    bearing — a client that exits promptly never reaches it.
+    """
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+        await asyncio.Event().wait()
+
+
+def _seed_hanging(svc: LSPService, *roots: str) -> dict:
+    clients = {}
+    for index, root in enumerate(roots):
+        key = ("pyright", root)
+        client = HangingClient("pyright", root)
+        svc._clients[key] = client
+        svc._last_used[key] = float(index)
+        clients[key] = client
+    return clients
+
+
+async def _cancel_detached(svc: LSPService) -> None:
+    """Drop the detached drains so the loop closes without warnings."""
+    tasks = list(svc._shutting_down)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def test_handoff_bounds_the_whole_sweep_not_each_victim():
+    """One deadline for the sweep, not ``handoff`` per wedged victim.
+
+    *handoff* is the slice of its request budget the caller is willing to
+    spend making room.  Charged per victim it scaled with fleet overage:
+    four wedged victims spent 4 x 0.25s here, so ``get_diagnostics_sync``
+    could still time out before ``wait_for_diagnostics`` ever got its
+    configured budget — the silent no-diagnostics result the bound exists
+    to prevent.
+
+    Asserts wall clock rather than call counts because the defect IS
+    elapsed time: a per-victim implementation passes any assertion about
+    which clients were evicted.
+    """
+    async def scenario():
+        svc = make_service(max_clients=1)
+        _seed_hanging(svc, "/a", "/b", "/c", "/d", "/e")
+
+        start = time.monotonic()
+        evicted = await svc._enforce_cap_async(handoff=0.25)
+        elapsed = time.monotonic() - start
+
+        # Four victims, every one of them wedged.
+        assert len(evicted) == 4
+        # Per-victim would be 4 x 0.25 = 1.0s.  The midpoint discriminates
+        # without being tight enough to flake on a loaded CI box.
+        assert elapsed < 0.6, f"sweep spent {elapsed:.2f}s; budget was 0.25s"
+
+        await _cancel_detached(svc)
+
+    asyncio.run(scenario())
+
+
+def test_sweep_past_its_deadline_still_evicts_at_zero_wait():
+    """Budget exhaustion must not stop the sweep leaving the fleet over cap.
+
+    Past the deadline the remaining victims detach immediately with their
+    slots still reserved — the same trade ``_evict`` already makes for a
+    single wedged victim, applied to the tail of the sweep.
+    """
+    async def scenario():
+        svc = make_service(max_clients=1)
+        _seed_hanging(svc, "/a", "/b", "/c")
+
+        evicted = await svc._enforce_cap_async(handoff=0.05)
+
+        assert len(evicted) == 2
+        assert set(svc._clients) == {("pyright", "/c")}
+        # Every detached drain still holds its slot, so the cap sees the
+        # processes that are genuinely still resident.
+        assert len(svc._shutting_down) == 2
+
+        await _cancel_detached(svc)
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_shutdowns_of_one_workspace_keep_separate_reservations():
+    """Evict, respawn the same root, evict again before the first drains.
+
+    ``_shutting_down`` is keyed by task rather than by
+    ``(server_id, workspace_root)`` precisely for this: every reader of
+    that map counts *processes*, and one workspace can have two resident
+    at once.  Under a per-key dict the second registration overwrote the
+    first, and the first drain's ``finally`` then removed the second's
+    entry — so the replacement process was neither counted against the
+    cap nor awaited at service stop.
+    """
+    async def scenario():
+        svc = make_service(max_clients=1)
+        key = ("pyright", "/same")
+
+        # First victim exits promptly; its drain is what used to evict the
+        # replacement's reservation on the way out.
+        first = FakeClient(*key)
+        svc._clients[key] = first
+        svc._last_used[key] = 100.0
+        assert await svc._evict(key, "first", handoff=0.0)
+
+        # The replacement is spawned and evicted before that drain lands.
+        second = HangingClient(*key)
+        svc._clients[key] = second
+        svc._last_used[key] = 200.0
+        assert await svc._evict(key, "second", handoff=0.0)
+
+        assert len(svc._shutting_down) == 2, (
+            "two resident processes for one workspace must hold two slots"
+        )
+
+        # Let the first drain finish and release ONLY its own reservation.
+        for _ in range(100):
+            if first.shutdown_calls and len(svc._shutting_down) == 1:
+                break
+            await asyncio.sleep(0.01)
+
+        assert len(svc._shutting_down) == 1, (
+            "the completing drain must not release the replacement's slot"
+        )
+        # The survivor is the still-wedged replacement, not the finished one.
+        assert list(svc._shutting_down.values()) == [key]
+        assert svc._overage_locked() >= 0
+
+        await _cancel_detached(svc)
 
     asyncio.run(scenario())

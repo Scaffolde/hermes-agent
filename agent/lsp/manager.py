@@ -344,11 +344,21 @@ class LSPService:
         self._clients: Dict[Tuple[str, str], LSPClient] = {}
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
-        # Keys whose client has left ``_clients`` but whose process has
-        # not exited yet.  The mirror of ``_spawning``: it reserves the
-        # slot of a server that is about to stop, so a detached shutdown
-        # never reads as a free slot the host has not reclaimed.
-        self._shutting_down: Dict[Tuple[str, str], asyncio.Task] = {}
+        # Shutdowns whose client has left ``_clients`` but whose process
+        # has not exited yet.  The mirror of ``_spawning``: it reserves
+        # the slot of a server that is about to stop, so a detached
+        # shutdown never reads as a free slot the host has not reclaimed.
+        #
+        # Keyed by TASK, not by ``(server_id, workspace_root)``.  Every
+        # reader of this map counts *processes* — ``_overage_locked``
+        # adds ``len()`` to the resident total, and ``_shutdown_async``
+        # awaits its members — and one workspace can have several
+        # shutdowns resident at once: evict a wedged client, respawn the
+        # same root, evict the replacement before the first drain lands.
+        # A per-key dict collapses those into one entry, so the surviving
+        # process is neither counted against the cap nor awaited at
+        # service stop.  Task identity is what is one-per-process.
+        self._shutting_down: Dict[asyncio.Task, Tuple[str, str]] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
         # Refcounted per key rather than a boolean: two concurrent edits in
         # the same project share one client, and the first to finish must
@@ -870,7 +880,7 @@ class LSPService:
         ``_clients`` — a server that is about to exist occupies its
         slot, matching :meth:`_enforce_cap_async`.
 
-        Keys in ``_shutting_down`` count for the mirror-image reason: an
+        Entries in ``_shutting_down`` count for the mirror-image reason: an
         evicted server is out of ``_clients`` but its process is still
         resident until the shutdown lands, and the cap bounds resident
         processes, not map entries.  Without this the fleet would look
@@ -953,7 +963,7 @@ class LSPService:
         # awaits in between.
         task = asyncio.create_task(self._drain_shutdown(key, client))
         with self._state_lock:
-            self._shutting_down[key] = task
+            self._shutting_down[task] = key
         if handoff is None:
             await asyncio.shield(task)
         elif handoff > 0:
@@ -975,14 +985,24 @@ class LSPService:
         its handoff bound — a detached shutdown that nobody finishes would
         orphan the process the cap exists to reclaim.  Failures are logged
         rather than swallowed: nobody calls ``.result()`` on this task.
+
+        Releases its OWN reservation by task identity, so a concurrent
+        shutdown of the same workspace keeps its slot reserved instead of
+        being dropped by whichever drain happens to finish first.
         """
         try:
             await client.shutdown()
         except Exception as e:  # noqa: BLE001
             logger.debug("evicted client %s failed to shut down cleanly: %s", key, e)
         finally:
+            # Always a Task here — this coroutine only ever runs via
+            # ``create_task`` in ``_evict`` — but ``current_task()`` is
+            # typed Optional, and silently skipping the release would
+            # leak the slot rather than surface the impossible case.
+            task = asyncio.current_task()
             with self._state_lock:
-                self._shutting_down.pop(key, None)
+                if task is not None:
+                    self._shutting_down.pop(task, None)
 
     async def _enforce_cap_async(
         self,
@@ -1004,6 +1024,18 @@ class LSPService:
         from each claiming the same single free slot.
         """
         evicted: List[Tuple[str, str]] = []
+        # ONE deadline for the whole sweep, not a fresh bound per victim.
+        # *handoff* is the caller's guard band — the slice of its request
+        # budget it is willing to spend making room.  Charging it once per
+        # victim made the cost scale with fleet overage: four wedged
+        # victims spent 4 x 0.5s before the replacement even started, so
+        # ``get_diagnostics_sync`` could still time out before
+        # ``wait_for_diagnostics`` got its configured budget — the silent
+        # no-diagnostics result this bound exists to prevent.  Past the
+        # deadline eviction continues at zero wait: the shutdowns detach
+        # and keep their slots reserved, which is the same trade ``_evict``
+        # already makes for a single wedged victim.
+        deadline = None if handoff is None else time.monotonic() + handoff
         while True:
             with self._state_lock:
                 overage = self._overage_locked()
@@ -1037,8 +1069,11 @@ class LSPService:
                     overage,
                 )
                 break
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
             if await self._evict(
-                victim, f"cap {self._max_clients} exceeded", handoff=handoff
+                victim, f"cap {self._max_clients} exceeded", handoff=remaining
             ):
                 evicted.append(victim)
             elif victim in self._clients:
@@ -1125,7 +1160,7 @@ class LSPService:
             # Evictions whose handoff bound expired are still draining.
             # Stopping the loop out from under them would orphan exactly
             # the processes this shutdown exists to reclaim.
-            draining = list(self._shutting_down.values())
+            draining = list(self._shutting_down)
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
