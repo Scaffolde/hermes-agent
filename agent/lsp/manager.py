@@ -43,6 +43,7 @@ import time
 from concurrent.futures import Future
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from agent import cgroup_memory
 from agent.lsp import eventlog
 from agent.lsp.client import (
     DIAGNOSTICS_DOCUMENT_WAIT,
@@ -97,42 +98,6 @@ FALLBACK_CLIENT_CAP = 3
 # band instead of consuming it.
 EVICTION_HANDOFF_BUDGET = 0.5
 
-CGROUP_MEMORY_LIMIT_PATHS = (
-    "/sys/fs/cgroup/memory.max",  # v2
-    "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # v1
-)
-
-
-def _cgroup_memory_limit_bytes(paths: Optional[Tuple[str, ...]] = None) -> Optional[int]:
-    """The cgroup memory ceiling in bytes, or ``None`` if unlimited/absent.
-
-    Checked before trusting sysconf because in a memory-limited container
-    ``SC_PHYS_PAGES`` reports the *node's* RAM, not the share this process
-    may actually use.  cgroup v2 writes ``max`` for "no limit"; v1 writes a
-    sentinel near 2**63, so implausibly large values are treated as absent.
-
-    *paths* is read from the module attribute by default so the sentinel
-    handling stays testable off-Linux.
-    """
-    for path in paths if paths is not None else CGROUP_MEMORY_LIMIT_PATHS:
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                raw = fh.read().strip()
-        except (OSError, ValueError):
-            continue
-        if not raw or raw == "max":
-            continue
-        try:
-            limit = int(raw)
-        except ValueError:
-            continue
-        # v1's "unlimited" sentinel is page-aligned LONG_MAX; anything at
-        # petabyte scale is that sentinel rather than a real allocation.
-        if limit <= 0 or limit >= (1 << 50):
-            continue
-        return limit
-    return None
-
 
 def host_memory_bytes() -> Optional[int]:
     """Memory this process may actually use, or ``None`` if undeterminable.
@@ -154,7 +119,7 @@ def host_memory_bytes() -> Optional[int]:
     else:
         total = pages * page_size if pages > 0 and page_size > 0 else None
 
-    limit = _cgroup_memory_limit_bytes()
+    limit = cgroup_memory.cgroup_memory_limit_bytes()
     if limit is not None:
         return limit if total is None else min(total, limit)
     return total
