@@ -20,9 +20,20 @@ guards the property so a refactor cannot quietly undo it.
 
 import logging
 import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 import pytest
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+#: Set on the child pytest spawned by
+#: ``test_preset_home_guard_is_not_inert_under_ci``. The spawning test skips
+#: itself when it sees this, so the child can never re-spawn a grandchild no
+#: matter which node ids it is pointed at.
+_CHILD_SENTINEL = "HERMES_LOG_ISOLATION_NESTED"
 
 
 def _real_hermes_home() -> Path:
@@ -108,6 +119,58 @@ class TestLogIsolation:
         sandbox = Path(_SESSION_HERMES_HOME).resolve()
         assert _REAL_KANBAN_ROOT != sandbox
         assert sandbox not in _REAL_KANBAN_ROOT.parents
+
+    def test_preset_home_guard_is_not_inert_under_ci(self):
+        """`test_sandbox_overrides_a_preset_hermes_home` must have teeth in CI.
+
+        That guard can only tell the conditional sandbox apart from the
+        unconditional one when HERMES_HOME is already set at conftest import.
+        Nothing in CI sets it — so with the conditional sandbox restored, the
+        `if not os.environ.get("HERMES_HOME")` branch is taken, `_SESSION_HERMES_HOME`
+        is bound anyway, and the guard passes on the very code it exists to
+        reject. Measured on this tree: reverting conftest to the conditional
+        form fails 2 tests with HERMES_HOME preset and 0 with it unset.
+
+        A guard that only fires in an environment CI never reproduces cannot
+        stop the regression from being reintroduced. Re-run it in a child
+        pytest that does supply the distinguishing condition.
+        """
+        if os.environ.get(_CHILD_SENTINEL):
+            pytest.skip("child of the preset-HERMES_HOME re-run; would recurse")
+
+        decoy = Path(tempfile.mkdtemp(prefix="hermes-preset-home-"))
+        (decoy / "logs").mkdir(parents=True, exist_ok=True)
+        assert decoy.resolve() != _real_hermes_home().resolve()
+
+        env = {
+            **os.environ,
+            "HERMES_HOME": str(decoy),
+            _CHILD_SENTINEL: "1",
+            # The child must not inherit this process's sandbox tempdir, which
+            # would mask the preset value we are deliberately supplying.
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        node = (
+            "tests/test_log_isolation.py::TestLogIsolation"
+            "::test_sandbox_overrides_a_preset_hermes_home"
+        )
+        child = subprocess.run(
+            [sys.executable, "-m", "pytest", node, "-q", "-p", "no:randomly"],
+            cwd=PROJECT_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            # Bounded: one trivial test. An unbounded spawn here would hang a
+            # CI slice for the full job timeout instead of failing the file.
+            timeout=300,
+        )
+
+        assert child.returncode == 0, (
+            "the sandbox guard fails once HERMES_HOME is actually preset, which "
+            "is the condition it is written for and the one CI never supplies:\n"
+            f"{child.stdout}\n{child.stderr}"
+        )
 
     def test_importing_the_cli_does_not_target_the_real_logs(self):
         pytest.importorskip("hermes_cli.main")
