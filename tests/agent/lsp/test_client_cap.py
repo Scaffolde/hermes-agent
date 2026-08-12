@@ -41,11 +41,23 @@ class FakeClient:
         self.shutdown_calls += 1
 
 
-def make_service(max_clients: Optional[int] = None, idle_timeout: float = 600.0) -> LSPService:
+def make_service(
+    max_clients: Optional[int] = None,
+    idle_timeout: float = 600.0,
+    memory_budget: object = None,
+) -> LSPService:
     """A service with no background loop and no real subprocesses.
 
     ``enabled=False`` keeps ``_BackgroundLoop`` unstarted and the reaper
     unscheduled, so the eviction coroutines can be driven directly.
+
+    The byte budget is DISABLED by default so these exercise the count
+    cap and nothing else.  Left deriving from host RAM, they were
+    host-dependent: a 1 GiB worker yields a 256 MiB budget, every fake
+    ``pyright`` client is charged 800 MiB, and the byte bound evicts to
+    the floor before the count cap under test can bind — three tests
+    here failed on such a host while passing on a 16 GiB one.  The byte
+    half has its own coverage in ``test_client_footprint.py``.
     """
     return LSPService(
         enabled=False,
@@ -54,6 +66,7 @@ def make_service(max_clients: Optional[int] = None, idle_timeout: float = 600.0)
         install_strategy="manual",
         idle_timeout=idle_timeout,
         max_clients=max_clients,
+        memory_budget=memory_budget,
     )
 
 
@@ -68,7 +81,11 @@ def running_service():
     """
     services = []
 
-    def _make(max_clients: Optional[int] = None, idle_timeout: float = 0.0) -> LSPService:
+    def _make(
+        max_clients: Optional[int] = None,
+        idle_timeout: float = 0.0,
+        memory_budget: object = None,
+    ) -> LSPService:
         svc = LSPService(
             enabled=True,
             wait_mode="document",
@@ -76,6 +93,7 @@ def running_service():
             install_strategy="manual",
             idle_timeout=idle_timeout,
             max_clients=max_clients,
+            memory_budget=memory_budget,
         )
         services.append(svc)
         return svc
@@ -1007,3 +1025,32 @@ def test_concurrent_shutdowns_of_one_workspace_keep_separate_reservations():
         await _cancel_detached(svc)
 
     asyncio.run(scenario())
+
+
+def test_count_cap_behaviour_is_independent_of_host_memory(monkeypatch):
+    """These tests must not change verdict with the worker's RAM.
+
+    The byte budget derived from host memory unconditionally, so this
+    suite silently became host-dependent: on a 1 GiB worker the budget is
+    256 MiB, every fake ``pyright`` client is charged 800 MiB, and the
+    byte bound evicts down to the floor before the count cap under test
+    can bind — ``test_cap_evicts_least_recently_used_first`` and two
+    others failed there while passing on a 16 GiB host.  The fixtures now
+    pin the byte half off, so a count-cap test measures the count cap.
+    """
+    monkeypatch.setattr(manager_mod, "host_memory_bytes", lambda: 1 * GIB)
+    svc = make_service(max_clients=4)
+
+    assert svc._memory_budget is None
+    seed(svc, ("/a", 100.0), ("/b", 200.0), ("/c", 300.0), ("/d", 400.0))
+
+    evicted = asyncio.run(svc._enforce_cap_async())
+
+    assert evicted == []
+    assert len(svc._clients) == 4
+
+
+def test_the_byte_budget_can_still_be_pinned_explicitly():
+    """Disabling by default must not make the byte half untestable."""
+    svc = make_service(max_clients=24, memory_budget=1024 * 1024 * 1024)
+    assert svc._memory_budget == 1024 * 1024 * 1024

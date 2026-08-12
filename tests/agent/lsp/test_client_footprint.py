@@ -232,3 +232,160 @@ def test_shutting_down_servers_still_hold_their_memory():
         service._shutting_down[object()] = ("typescript", f"/w/draining{index}")
     with service._state_lock:
         assert service._memory_overage_locked() > 0
+
+
+# ----------------------------------------------------------------------
+# review findings on PR #67: the two-part bound's enforcement path
+# ----------------------------------------------------------------------
+
+
+def test_pending_spawn_counts_against_the_one_client_floor():
+    """One live server plus one pending one must report its overage.
+
+    The floor exists so a single server larger than the whole budget is
+    not evicted-and-respawned forever.  Applied to ``_clients`` alone it
+    also silenced the *two*-server case: one live typescript plus one
+    pending typescript is 3.4 GiB against a 1 GiB budget, but
+    ``len(_clients) - MIN_CLIENT_CAP`` is zero, so nothing was removable
+    and the overage read as zero.  ``_get_or_spawn`` sweeps BEFORE
+    ``client.start()`` precisely to keep the fleet off that peak, and a
+    zero overage let both processes index concurrently.
+
+    Evicting the live one still leaves the pending one, so honouring the
+    floor never required ignoring this.
+    """
+    service = make_service()
+    service._memory_budget = 1024 * MIB
+    live = ("typescript", "/w/live")
+    service._clients[live] = FakeClient(*live)
+    service._last_used[live] = 1.0
+    # Reserved by a concurrent spawn; only the KEY matters to the cap.
+    service._spawning[("typescript", "/w/pending")] = None
+
+    with service._state_lock:
+        assert service._memory_overage_locked() == 1
+
+
+def test_a_lone_client_over_budget_is_still_never_evicted():
+    """The floor itself must survive the fix above.
+
+    One typescript server on a 1 GiB budget is over on its own.  Evicting
+    it would respawn on the next request, forever, costing more than the
+    memory it saves — with nothing pending, the answer is still zero.
+    """
+    service = make_service()
+    service._memory_budget = 1024 * MIB
+    lone = ("typescript", "/w/lone")
+    service._clients[lone] = FakeClient(*lone)
+    service._last_used[lone] = 1.0
+
+    with service._state_lock:
+        assert service._memory_overage_locked() == 0
+
+
+def test_a_cheap_drain_does_not_satisfy_an_expensive_overage():
+    """A draining 150 MiB server must not stop the sweep for 1.7 GiB ones.
+
+    The old stop condition compared the NUMBER of drains in flight to the
+    NUMBER of victims wanted.  Those units are interchangeable only while
+    every server costs the same.  With one yaml server draining and three
+    typescript servers live against a 4 GiB budget, one drain met a
+    one-victim overage and the sweep stopped — then the cheap process
+    exited and the three typescript servers sat 1 GiB over budget with no
+    sweep scheduled to notice.
+
+    Asked as "would we still be over once the drains land?", the answer is
+    yes, so eviction must continue.
+    """
+    service = make_service()
+    service._memory_budget = 4096 * MIB
+    for index in range(3):
+        key = ("typescript", f"/w/ts{index}")
+        service._clients[key] = FakeClient(*key)
+        service._last_used[key] = float(index)
+    # The cheap victim is already detached and draining.
+    service._shutting_down[object()] = ("yaml-language-server", "/w/yaml")
+
+    with service._state_lock:
+        residual = service._overage_locked(exclude_draining=True)
+    # 3 x 1700 = 5100 MiB against 4096: the drain releases 150 MiB and
+    # cannot close that, so a victim is still required.
+    assert residual == 1
+
+
+def test_byte_triggered_eviction_does_not_report_the_count_cap():
+    """A byte-budget eviction must not log ``cap 24 exceeded``.
+
+    On a 16 GiB host three typescript servers blow the 4 GiB budget while
+    sitting far below the derived count cap of 24.  Reporting the count
+    cap there tells an operator to look at a bound that is not binding.
+    """
+    service = make_service()
+    for index in range(3):
+        key = ("typescript", f"/w/ts{index}")
+        service._clients[key] = FakeClient(*key)
+        service._last_used[key] = float(index)
+
+    with service._state_lock:
+        overage, reason = service._binding_overage_locked()
+
+    assert overage > 0
+    assert "memory budget" in reason
+    assert str(service._max_clients) not in reason
+
+
+def test_count_triggered_eviction_still_reports_the_count_cap():
+    """The count half must keep its own reason when it is the binding one."""
+    service = make_service()
+    service._memory_budget = None
+    service._max_clients = 2
+    for index in range(4):
+        key = ("yaml-language-server", f"/w/y{index}")
+        service._clients[key] = FakeClient(*key)
+        service._last_used[key] = float(index)
+
+    with service._state_lock:
+        overage, reason = service._binding_overage_locked()
+
+    assert overage == 2
+    assert reason == "cap 2 exceeded"
+
+
+def test_production_still_derives_the_byte_budget_from_the_host(monkeypatch):
+    """Omitting ``memory_budget`` must read host memory, not disable it.
+
+    The test fixtures pin the byte half OFF so a count-cap test measures
+    the count cap.  That convenience must not be able to leak into
+    production: flipping the constructor default from "derive" to ``None``
+    would silently remove the bound that holds the fleet inside RAM, and
+    every test would still pass.  The sentinel is what keeps "read the
+    host" distinguishable from "this fleet has no byte budget".
+    """
+    monkeypatch.setattr(manager_mod, "host_memory_bytes", lambda: 16 * GIB)
+    service = LSPService(
+        enabled=False,
+        wait_mode="document",
+        wait_timeout=1.0,
+        install_strategy="manual",
+        idle_timeout=600.0,
+        max_clients=None,
+    )
+    assert service._memory_budget == memory_budget_bytes(16 * GIB)
+
+
+def test_an_explicit_none_budget_disables_the_byte_bound(monkeypatch):
+    """``None`` must mean disabled even on a host with readable memory."""
+    monkeypatch.setattr(manager_mod, "host_memory_bytes", lambda: 16 * GIB)
+    service = LSPService(
+        enabled=False,
+        wait_mode="document",
+        wait_timeout=1.0,
+        install_strategy="manual",
+        idle_timeout=600.0,
+        max_clients=None,
+        memory_budget=None,
+    )
+    assert service._memory_budget is None
+    # ...and with no byte bound, a fleet that would blow the budget is
+    # admitted, so the count cap is the only thing left holding it.
+    assert admit(service, ["typescript"] * 6) == 0
