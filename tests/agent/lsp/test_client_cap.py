@@ -260,7 +260,15 @@ def test_v2_limit_read_from_this_process_cgroup_not_the_hierarchy_root(monkeypat
 
 
 def test_v2_node_memory_does_not_size_the_cap_inside_a_constrained_unit(monkeypatch, tmp_path):
-    """The consequence: 12 servers against a budget that affords 1."""
+    """The consequence: a node-sized fleet against a unit-sized budget.
+
+    Written when one flat footprint charged every server type, where the
+    whole bound was a count and the unit afforded exactly 1.  Admission is
+    now two bounds (SCA-4688), so the same defect has to be stated against
+    both halves: the count ceiling must still come from the unit's 4 GiB
+    rather than the node's 64 GiB, and the byte budget it is paired with
+    must still be the unit's.
+    """
     root = fake_root(
         tmp_path,
         cgroup="0::/system.slice/hermes-agent.service\n",
@@ -276,7 +284,19 @@ def test_v2_node_memory_does_not_size_the_cap_inside_a_constrained_unit(monkeypa
     )
 
     assert manager_mod.host_memory_bytes() == 4 * GIB
-    assert manager_mod.default_max_clients() == 1
+
+    # The count half.  Reading the node would clamp at MAX_CLIENT_CAP; the
+    # unit's 4 GiB affords a quarter of that, so the cap is still derived
+    # from the constrained unit and not from the node behind it.
+    assert manager_mod.default_max_clients(64 * GIB) == MAX_CLIENT_CAP
+    assert manager_mod.default_max_clients() == 6
+
+    # The memory half, which is what actually holds the fleet inside the
+    # unit now that the count ceiling divides by the cheapest server: the
+    # unit affords 1 GiB, which one typescript server already exceeds.
+    budget = manager_mod.memory_budget_bytes()
+    assert budget == 1024 * 1024 * 1024
+    assert budget < manager_mod.footprint_for("typescript")
 
 
 def test_an_ancestor_limit_binds_a_descendant(monkeypatch, tmp_path):

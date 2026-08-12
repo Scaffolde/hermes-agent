@@ -207,9 +207,7 @@ def default_max_clients(total_bytes: Optional[int] = None) -> int:
     if not total_bytes or total_bytes <= 0:
         return FALLBACK_CLIENT_CAP
     budget = int(total_bytes * LSP_MEMORY_BUDGET_FRACTION)
-    cheapest = min(
-        [LSP_CLIENT_FOOTPRINT_BYTES, *LSP_SERVER_FOOTPRINT_BYTES.values()]
-    )
+    cheapest = min([LSP_CLIENT_FOOTPRINT_BYTES, *LSP_SERVER_FOOTPRINT_BYTES.values()])
     derived = budget // cheapest
     return max(MIN_CLIENT_CAP, min(MAX_CLIENT_CAP, int(derived)))
 
