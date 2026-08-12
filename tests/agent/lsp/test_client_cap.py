@@ -114,17 +114,26 @@ def seed(svc: LSPService, *specs: Tuple[str, float]) -> dict:
 # ----------------------------------------------------------------------
 
 
-def test_cap_derived_from_host_memory_matches_the_incident_host():
-    """16 GiB / 4 = one quarter budget; at ~1.3 GiB per server that is 3.
+def test_count_cap_does_not_bind_a_cheap_fleet():
+    """The count ceiling is sized off the cheapest server, not typescript.
 
-    This is the number that would have held pai-mac-mini: 3 servers
-    rather than the 13 that were live when it swapped.
+    Sizing it off typescript is what produced a cap of 3 on the 16 GiB
+    host while the measured healthy working set was 7 (SCA-4688), even
+    when every live server was a 41 MiB yaml process.  The memory budget
+    is what actually holds the fleet down; see the byte-budget tests.
     """
-    assert default_max_clients(16 * GIB) == 3
+    assert default_max_clients(16 * GIB) > 7
 
 
 def test_cap_scales_with_a_larger_host():
-    assert default_max_clients(64 * GIB) == (64 * GIB // 4) // LSP_CLIENT_FOOTPRINT_BYTES
+    cheapest = min(
+        [
+            LSP_CLIENT_FOOTPRINT_BYTES,
+            *manager_mod.LSP_SERVER_FOOTPRINT_BYTES.values(),
+        ]
+    )
+    expected = min(MAX_CLIENT_CAP, (64 * GIB // 4) // cheapest)
+    assert default_max_clients(64 * GIB) == expected
 
 
 def test_cap_never_drops_below_one():
