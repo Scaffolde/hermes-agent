@@ -163,24 +163,35 @@ def _ensure_teams_mock():
         sys.modules.setdefault(name, mod)
 
 
-# The Teams SDK is stubbed below, but ``check_teams_requirements()`` also
-# needs ``aiohttp.web`` — and when aiohttp is missing it does not fail, it
-# LAZY-INSTALLS: ``ensure("platform.teams")`` shells out to
+# ``check_teams_requirements()`` is called at module scope below, and when its
+# feature is not fully installed it does not fail — it LAZY-INSTALLS:
+# ``ensure("platform.teams")`` shells out to
 # ``uv pip install microsoft-teams-apps==2.0.13.4 aiohttp==3.14.1`` against the
-# venv pytest is running in. Everything below is module scope, so that fires
-# during COLLECTION — outside every fixture-scoped guard (SCA-4714). aiohttp is
-# not in the ``dev`` extra, so a ``uv sync --extra dev`` checkout had its
-# ``.venv`` mutated by every whole-``tests/`` run, and then could not reproduce
-# it, because the packages it installed satisfied the next run.
+# venv pytest is running in. All of this is module scope, so it fires during
+# COLLECTION, outside every fixture-scoped guard (SCA-4714).
 #
-# Skipping is the honest statement of the dependency: these tests mock the
-# Teams SDK but exercise the real aiohttp. CI installs the extras, so CI runs
-# them unchanged.
+# Two separate deps, and they need two different treatments — the SDK is mocked
+# here, aiohttp is not:
 #
-# The probe is the installed DISTRIBUTION, not ``importorskip``: sibling test
-# modules plant a bare ``aiohttp`` stub in ``sys.modules`` (which is why the
-# webhook modules fail with "'aiohttp' is not a package"), and an import-based
-# probe happily returns that stub while the real package is absent.
+# 1. The Teams SDK. ``_ensure_teams_mock()`` plants it in ``sys.modules``, which
+#    is the whole point of this module: run these tests WITHOUT the real SDK.
+#    But ``ensure()`` gates on ``feature_missing()``, which probes installed
+#    DISTRIBUTIONS — something a ``sys.modules`` mock can never satisfy. So the
+#    mock silences the import and the install ladder runs anyway. That is why
+#    pinning the skip to aiohttp alone was not enough: CI HAS aiohttp and does
+#    NOT have microsoft-teams-apps, so the skip never fired and the blocked
+#    install turned into a collection error. ``ensure`` is therefore neutralised
+#    for this one bind — it is precisely the step being mocked out, and the real
+#    install path keeps its own coverage in
+#    ``test_check_teams_requirements_lazy_installs_when_missing``.
+#
+# 2. aiohttp. Genuinely exercised, never mocked, and not in the ``dev`` extra —
+#    so a ``uv sync --extra dev`` checkout must skip rather than install. The
+#    probe is the installed DISTRIBUTION, not ``importorskip``: sibling test
+#    modules plant a bare ``aiohttp`` stub in ``sys.modules`` (which is why the
+#    webhook modules fail with "'aiohttp' is not a package"), and an
+#    import-based probe happily returns that stub while the real package is
+#    absent.
 try:
     _md.distribution("aiohttp")
 except _md.PackageNotFoundError:  # pragma: no cover - depends on installed extras
@@ -199,7 +210,18 @@ _teams_mod = load_plugin_adapter("teams")
 
 _teams_mod.AIOHTTP_AVAILABLE = True
 # SDK import is deferred (#62935); bind mocked symbols the same way connect() does.
-assert _teams_mod.check_teams_requirements() is True
+# ``ensure`` is stubbed for the duration: the SDK it would install is already
+# mocked above, so letting it run would install the real one over the mock (see
+# the note above). ``ensure_and_bind`` resolves ``ensure`` from its module
+# globals at call time, so patching the attribute is enough.
+import tools.lazy_deps as _lazy_deps
+
+_real_ensure = _lazy_deps.ensure
+_lazy_deps.ensure = lambda feature, *, prompt=True: None
+try:
+    assert _teams_mod.check_teams_requirements() is True
+finally:
+    _lazy_deps.ensure = _real_ensure
 _teams_mod.TEAMS_SDK_AVAILABLE = True
 
 # Ensure SDK symbols that were None (import failed on Python <3.12) are

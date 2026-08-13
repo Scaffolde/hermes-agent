@@ -1435,6 +1435,14 @@ _ENV_GUARD_BYPASS = [False]
 #: ``(module, attribute, original)`` triples restored in ``pytest_unconfigure``.
 _SESSION_ENV_GUARD_RESTORE: list = []
 
+# Prior value of HERMES_DISABLE_LAZY_INSTALLS, captured in pytest_configure so
+# pytest_unconfigure can restore the caller's environment exactly (None = it was
+# unset and must be removed, not set to ""). ``_ARMED`` keeps a nested
+# pytest_configure (pytester) from capturing our own "1" as the prior value and
+# leaking it into the parent environment on the outer unconfigure.
+_SESSION_LAZY_INSTALL_PRIOR: "str | None" = None
+_SESSION_LAZY_INSTALL_ARMED = False
+
 
 def _session_env_guard_check_cmd(name, cmd, kwargs=None) -> None:
     if _ENV_GUARD_BYPASS[0]:
@@ -1547,6 +1555,16 @@ def _disarm_session_env_guard() -> None:
         module, attr, real = _SESSION_ENV_GUARD_RESTORE.pop()
         setattr(module, attr, real)
 
+    # Restore the caller's HERMES_DISABLE_LAZY_INSTALLS exactly: unset if it was
+    # unset, rather than leaving a "1" behind in the parent environment.
+    global _SESSION_LAZY_INSTALL_ARMED
+    if _SESSION_LAZY_INSTALL_ARMED:
+        _SESSION_LAZY_INSTALL_ARMED = False
+        if _SESSION_LAZY_INSTALL_PRIOR is None:
+            os.environ.pop("HERMES_DISABLE_LAZY_INSTALLS", None)
+        else:
+            os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = _SESSION_LAZY_INSTALL_PRIOR
+
 
 def _wal_is_usable() -> bool:
     """True when Hermes will actually put a database into WAL mode here.
@@ -1636,6 +1654,34 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     # Armed here, not in a fixture: collection runs after this hook and before
     # any fixture, and collection is where the venv mutation happens (SCA-4714).
     _arm_session_env_guard()
+
+    # The suite's own lazy-install kill switch, moved ahead of collection.
+    #
+    # The hermetic fixture already sets this (see the note beside its
+    # ``monkeypatch.setenv``), and .github/workflows/tests.yml documents the
+    # resulting contract as fact: "The hermetic test env forbids mid-run pip
+    # installs (HERMES_DISABLE_LAZY_INSTALLS=1 in tests/conftest.py)". But a
+    # fixture only wraps test EXECUTION, so the switch was off for the whole
+    # collection phase — and collection is exactly when a module-scope
+    # ``ensure()`` fires (SCA-4714: 31 packages added to the live venv by a run
+    # that executed zero tests). Setting it here makes that documented contract
+    # true for the whole session.
+    #
+    # This closes the class at the production kill switch rather than only at
+    # the subprocess boundary: every lazy install routes through ``ensure()``,
+    # which now raises FeatureUnavailable immediately. The subprocess teeth
+    # armed above remain the backstop for anything that never goes through
+    # tools/lazy_deps.py.
+    #
+    # Set on os.environ directly because monkeypatch has no session-wide,
+    # pre-collection scope; restored in pytest_unconfigure. Tests that need the
+    # other value (tests/tools/test_lazy_deps.py, in both directions) use
+    # monkeypatch, which overrides and restores it per test.
+    global _SESSION_LAZY_INSTALL_PRIOR, _SESSION_LAZY_INSTALL_ARMED
+    if not _SESSION_LAZY_INSTALL_ARMED:
+        _SESSION_LAZY_INSTALL_PRIOR = os.environ.get("HERMES_DISABLE_LAZY_INSTALLS")
+        _SESSION_LAZY_INSTALL_ARMED = True
+    os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
 
     config.addinivalue_line(
         "markers",

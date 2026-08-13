@@ -49,6 +49,12 @@ from pathlib import Path
 
 import pytest
 
+# Read at IMPORT time — i.e. during collection, before any fixture has run.
+# This is the observation window the SCA-4714 bug lived in, so the value has to
+# be sampled here; sampling inside a test body would read the hermetic
+# fixture's monkeypatched value and pass no matter what.
+_LAZY_INSTALL_FLAG_AT_COLLECTION = os.environ.get("HERMES_DISABLE_LAZY_INSTALLS")
+
 
 def _conftest_module():
     """The exact ``tests/conftest.py`` module object pytest loaded.
@@ -548,6 +554,28 @@ class TestSessionScopedEnvGuard:
                 "lazy install reached through it would mutate the running "
                 "venv during collection (SCA-4714)"
             )
+
+    def test_lazy_install_kill_switch_is_set_before_collection(self):
+        """The suite's own lazy-install kill switch must cover collection.
+
+        ``HERMES_DISABLE_LAZY_INSTALLS=1`` was set by the hermetic *fixture*,
+        so it was off for the entire collection phase — while
+        .github/workflows/tests.yml documents the contract as already true
+        ("The hermetic test env forbids mid-run pip installs
+        (HERMES_DISABLE_LAZY_INSTALLS=1 in tests/conftest.py)"). Every
+        collection-time ``ensure()`` therefore ran a real install.
+
+        This closes the class at the production kill switch: ``ensure()``
+        raises FeatureUnavailable instead of shelling out at all, so the
+        subprocess teeth never have to be the only thing standing between a
+        module-scope import and the developer's venv.
+        """
+        assert _LAZY_INSTALL_FLAG_AT_COLLECTION == "1", (
+            "HERMES_DISABLE_LAZY_INSTALLS was "
+            f"{_LAZY_INSTALL_FLAG_AT_COLLECTION!r} during collection, not '1' "
+            "— a module-scope ensure() can reach a real pip/uv install again "
+            "(SCA-4714)"
+        )
 
     def test_guarded_popen_is_still_a_Popen_subclass(self):
         """``isinstance(p, Popen)`` and ``Popen[bytes]`` must keep working."""
