@@ -1,5 +1,6 @@
 """Tests for the Microsoft Teams platform adapter plugin."""
 
+import importlib.metadata as _md
 import json
 import sys
 import types
@@ -161,6 +162,34 @@ def _ensure_teams_mock():
     }.items():
         sys.modules.setdefault(name, mod)
 
+
+# The Teams SDK is stubbed below, but ``check_teams_requirements()`` also
+# needs ``aiohttp.web`` — and when aiohttp is missing it does not fail, it
+# LAZY-INSTALLS: ``ensure("platform.teams")`` shells out to
+# ``uv pip install microsoft-teams-apps==2.0.13.4 aiohttp==3.14.1`` against the
+# venv pytest is running in. Everything below is module scope, so that fires
+# during COLLECTION — outside every fixture-scoped guard (SCA-4714). aiohttp is
+# not in the ``dev`` extra, so a ``uv sync --extra dev`` checkout had its
+# ``.venv`` mutated by every whole-``tests/`` run, and then could not reproduce
+# it, because the packages it installed satisfied the next run.
+#
+# Skipping is the honest statement of the dependency: these tests mock the
+# Teams SDK but exercise the real aiohttp. CI installs the extras, so CI runs
+# them unchanged.
+#
+# The probe is the installed DISTRIBUTION, not ``importorskip``: sibling test
+# modules plant a bare ``aiohttp`` stub in ``sys.modules`` (which is why the
+# webhook modules fail with "'aiohttp' is not a package"), and an import-based
+# probe happily returns that stub while the real package is absent.
+try:
+    _md.distribution("aiohttp")
+except _md.PackageNotFoundError:  # pragma: no cover - depends on installed extras
+    pytest.skip(
+        "aiohttp is not installed (teams/webhook extra); the Teams adapter's "
+        "module-scope check_teams_requirements() would lazy-install it into "
+        "the venv pytest is running in (SCA-4714)",
+        allow_module_level=True,
+    )
 
 _ensure_teams_mock()
 
