@@ -8,62 +8,28 @@ operator footgun that only manifests in long-running setups.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import os
 import sys
 import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-
-def _hermes_module_names() -> list[str]:
-    return [
-        name
-        for name in list(sys.modules.keys())
-        if name.startswith("hermes_cli")
-        or name.startswith("hermes_state")
-        or name == "hermes_constants"
-    ]
-
-
-@contextlib.contextmanager
-def _isolated_hermes_modules():
-    """Evict the hermes modules for the duration of the block, then restore.
-
-    The eviction forces the hermes modules to re-import against the caller's
-    temporary ``HERMES_HOME`` instead of whatever the process already had
-    bound. It MUST be undone: ``sys.modules`` is process-global, and every
-    other test module in the run captured its imports at collection time.
-    Leaving the eviction in place means a later ``patch("hermes_cli.x.y")``
-    re-imports a SECOND module object and patches that, while the test under
-    test still calls the function bound to the original object — so the patch
-    silently does nothing and unrelated tests fail for a cause they never
-    triggered (SCA-4692).
-    """
-    saved = {name: sys.modules[name] for name in _hermes_module_names()}
-    for name in saved:
-        del sys.modules[name]
-    try:
-        yield saved
-    finally:
-        # Drop whatever the block imported against the temp HERMES_HOME,
-        # then put the original module objects back so identities that other
-        # test modules already hold stay valid.
-        for name in _hermes_module_names():
-            del sys.modules[name]
-        sys.modules.update(saved)
+from tests.hermes_cli.conftest import isolated_hermes_modules
 
 
 @pytest.fixture()
-def isolated_kanban_home(monkeypatch):
+def isolated_kanban_home(monkeypatch, hermes_module_isolation):
     """Spin up a fresh HERMES_HOME with a clean kanban DB."""
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    with _isolated_hermes_modules():
-        yield test_home
+    # Module eviction AND its restore are owned by hermes_module_isolation:
+    # deleting from the process-global sys.modules without putting the
+    # originals back corrupts the rest of the run (SCA-4692).
+    yield test_home
 
 
 def test_isolated_hermes_modules_restores_module_identity():
@@ -77,8 +43,8 @@ def test_isolated_hermes_modules_restores_module_identity():
 
     before = sys.modules["hermes_cli.models"]
 
-    with _isolated_hermes_modules():
-        # The eviction still happens — that is what the fixture is for.
+    with isolated_hermes_modules():
+        # The eviction still happens — that is what the fixtures are for.
         assert "hermes_cli.models" not in sys.modules
         import hermes_cli.models as reimported
 
@@ -86,6 +52,28 @@ def test_isolated_hermes_modules_restores_module_identity():
 
     # ...but the original object is what the rest of the session keeps seeing.
     assert sys.modules["hermes_cli.models"] is before
+
+
+def test_no_unrestored_sys_modules_eviction_in_hermes_cli_tests():
+    """SCA-4692 class guard: no test file may evict hermes modules by hand.
+
+    The one legal mechanism is conftest's ``isolated_hermes_modules`` /
+    ``hermes_module_isolation``, which restores what it evicted. A bare
+    hand-rolled eviction in a fixture leaks process-global state into every
+    test file collected after it.
+    """
+    # Assembled at runtime so this guard does not match its own source.
+    needle = "del sys." + "modules"
+    tests_dir = Path(__file__).parent
+    offenders = sorted(
+        path.name
+        for path in tests_dir.glob("test_*.py")
+        if needle in path.read_text(encoding="utf-8")
+    )
+    assert offenders == [], (
+        "these hermes_cli test files evict hermes modules by hand; use the "
+        f"hermes_module_isolation fixture instead: {offenders}"
+    )
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):

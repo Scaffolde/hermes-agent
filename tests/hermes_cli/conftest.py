@@ -2,7 +2,64 @@
 
 from __future__ import annotations
 
+import contextlib
+import sys
+
 import pytest
+
+
+def hermes_module_names() -> list[str]:
+    """Every currently-imported hermes module an isolation fixture evicts."""
+    return [
+        name
+        for name in list(sys.modules.keys())
+        if name.startswith("hermes_cli")
+        or name.startswith("hermes_state")
+        or name == "hermes_constants"
+    ]
+
+
+@contextlib.contextmanager
+def isolated_hermes_modules():
+    """Evict the hermes modules for the duration of the block, then restore.
+
+    The eviction forces the hermes modules to re-import against the caller's
+    temporary ``HERMES_HOME`` instead of whatever the process already had
+    bound. It MUST be undone: ``sys.modules`` is process-global, and every
+    other test module in the run captured its imports at collection time.
+
+    Leaving the eviction in place means a later ``patch("hermes_cli.x.y")``
+    re-imports a SECOND module object and patches that, while the test under
+    test still calls the function bound to the original object — so the patch
+    silently does nothing and unrelated tests fail for a cause they never
+    triggered (SCA-4692).
+    """
+    saved = {name: sys.modules[name] for name in hermes_module_names()}
+    for name in saved:
+        del sys.modules[name]
+    try:
+        yield saved
+    finally:
+        # Drop whatever the block imported against the temp HERMES_HOME,
+        # then put the original module objects back so identities that other
+        # test modules already hold stay valid.
+        for name in hermes_module_names():
+            del sys.modules[name]
+        sys.modules.update(saved)
+
+
+@pytest.fixture()
+def hermes_module_isolation():
+    """Fixture form of :func:`isolated_hermes_modules`.
+
+    Request it from any fixture that needs a fresh ``HERMES_HOME`` to be
+    re-imported. Eviction happens during this fixture's setup, so a
+    requesting fixture's own body (which sets ``HERMES_HOME`` and then
+    imports) still sees a cleared module cache; the restore runs after the
+    requesting fixture tears down.
+    """
+    with isolated_hermes_modules() as saved:
+        yield saved
 
 
 @pytest.fixture
