@@ -41,11 +41,23 @@ class FakeClient:
         self.shutdown_calls += 1
 
 
-def make_service(max_clients: Optional[int] = None, idle_timeout: float = 600.0) -> LSPService:
+def make_service(
+    max_clients: Optional[int] = None,
+    idle_timeout: float = 600.0,
+    memory_budget: object = None,
+) -> LSPService:
     """A service with no background loop and no real subprocesses.
 
     ``enabled=False`` keeps ``_BackgroundLoop`` unstarted and the reaper
     unscheduled, so the eviction coroutines can be driven directly.
+
+    The byte budget is DISABLED by default so these exercise the count
+    cap and nothing else.  Left deriving from host RAM, they were
+    host-dependent: a 1 GiB worker yields a 256 MiB budget, every fake
+    ``pyright`` client is charged 800 MiB, and the byte bound evicts to
+    the floor before the count cap under test can bind — three tests
+    here failed on such a host while passing on a 16 GiB one.  The byte
+    half has its own coverage in ``test_client_footprint.py``.
     """
     return LSPService(
         enabled=False,
@@ -54,6 +66,7 @@ def make_service(max_clients: Optional[int] = None, idle_timeout: float = 600.0)
         install_strategy="manual",
         idle_timeout=idle_timeout,
         max_clients=max_clients,
+        memory_budget=memory_budget,
     )
 
 
@@ -68,7 +81,11 @@ def running_service():
     """
     services = []
 
-    def _make(max_clients: Optional[int] = None, idle_timeout: float = 0.0) -> LSPService:
+    def _make(
+        max_clients: Optional[int] = None,
+        idle_timeout: float = 0.0,
+        memory_budget: object = None,
+    ) -> LSPService:
         svc = LSPService(
             enabled=True,
             wait_mode="document",
@@ -76,6 +93,7 @@ def running_service():
             install_strategy="manual",
             idle_timeout=idle_timeout,
             max_clients=max_clients,
+            memory_budget=memory_budget,
         )
         services.append(svc)
         return svc
@@ -115,17 +133,26 @@ def seed(svc: LSPService, *specs: Tuple[str, float]) -> dict:
 # ----------------------------------------------------------------------
 
 
-def test_cap_derived_from_host_memory_matches_the_incident_host():
-    """16 GiB / 4 = one quarter budget; at ~1.3 GiB per server that is 3.
+def test_count_cap_does_not_bind_a_cheap_fleet():
+    """The count ceiling is sized off the cheapest server, not typescript.
 
-    This is the number that would have held pai-mac-mini: 3 servers
-    rather than the 13 that were live when it swapped.
+    Sizing it off typescript is what produced a cap of 3 on the 16 GiB
+    host while the measured healthy working set was 7 (SCA-4688), even
+    when every live server was a 41 MiB yaml process.  The memory budget
+    is what actually holds the fleet down; see the byte-budget tests.
     """
-    assert default_max_clients(16 * GIB) == 3
+    assert default_max_clients(16 * GIB) > 7
 
 
 def test_cap_scales_with_a_larger_host():
-    assert default_max_clients(64 * GIB) == (64 * GIB // 4) // LSP_CLIENT_FOOTPRINT_BYTES
+    cheapest = min(
+        [
+            LSP_CLIENT_FOOTPRINT_BYTES,
+            *manager_mod.LSP_SERVER_FOOTPRINT_BYTES.values(),
+        ]
+    )
+    expected = min(MAX_CLIENT_CAP, (64 * GIB // 4) // cheapest)
+    assert default_max_clients(64 * GIB) == expected
 
 
 def test_cap_never_drops_below_one():
@@ -251,7 +278,15 @@ def test_v2_limit_read_from_this_process_cgroup_not_the_hierarchy_root(monkeypat
 
 
 def test_v2_node_memory_does_not_size_the_cap_inside_a_constrained_unit(monkeypatch, tmp_path):
-    """The consequence: 12 servers against a budget that affords 1."""
+    """The consequence: a node-sized fleet against a unit-sized budget.
+
+    Written when one flat footprint charged every server type, where the
+    whole bound was a count and the unit afforded exactly 1.  Admission is
+    now two bounds (SCA-4688), so the same defect has to be stated against
+    both halves: the count ceiling must still come from the unit's 4 GiB
+    rather than the node's 64 GiB, and the byte budget it is paired with
+    must still be the unit's.
+    """
     root = fake_root(
         tmp_path,
         cgroup="0::/system.slice/hermes-agent.service\n",
@@ -267,7 +302,19 @@ def test_v2_node_memory_does_not_size_the_cap_inside_a_constrained_unit(monkeypa
     )
 
     assert manager_mod.host_memory_bytes() == 4 * GIB
-    assert manager_mod.default_max_clients() == 1
+
+    # The count half.  Reading the node would clamp at MAX_CLIENT_CAP; the
+    # unit's 4 GiB affords a quarter of that, so the cap is still derived
+    # from the constrained unit and not from the node behind it.
+    assert manager_mod.default_max_clients(64 * GIB) == MAX_CLIENT_CAP
+    assert manager_mod.default_max_clients() == 6
+
+    # The memory half, which is what actually holds the fleet inside the
+    # unit now that the count ceiling divides by the cheapest server: the
+    # unit affords 1 GiB, which one typescript server already exceeds.
+    budget = manager_mod.memory_budget_bytes()
+    assert budget == 1024 * 1024 * 1024
+    assert budget < manager_mod.footprint_for("typescript")
 
 
 def test_an_ancestor_limit_binds_a_descendant(monkeypatch, tmp_path):
@@ -978,3 +1025,32 @@ def test_concurrent_shutdowns_of_one_workspace_keep_separate_reservations():
         await _cancel_detached(svc)
 
     asyncio.run(scenario())
+
+
+def test_count_cap_behaviour_is_independent_of_host_memory(monkeypatch):
+    """These tests must not change verdict with the worker's RAM.
+
+    The byte budget derived from host memory unconditionally, so this
+    suite silently became host-dependent: on a 1 GiB worker the budget is
+    256 MiB, every fake ``pyright`` client is charged 800 MiB, and the
+    byte bound evicts down to the floor before the count cap under test
+    can bind — ``test_cap_evicts_least_recently_used_first`` and two
+    others failed there while passing on a 16 GiB host.  The fixtures now
+    pin the byte half off, so a count-cap test measures the count cap.
+    """
+    monkeypatch.setattr(manager_mod, "host_memory_bytes", lambda: 1 * GIB)
+    svc = make_service(max_clients=4)
+
+    assert svc._memory_budget is None
+    seed(svc, ("/a", 100.0), ("/b", 200.0), ("/c", 300.0), ("/d", 400.0))
+
+    evicted = asyncio.run(svc._enforce_cap_async())
+
+    assert evicted == []
+    assert len(svc._clients) == 4
+
+
+def test_the_byte_budget_can_still_be_pinned_explicitly():
+    """Disabling by default must not make the byte half untestable."""
+    svc = make_service(max_clients=24, memory_budget=1024 * 1024 * 1024)
+    assert svc._memory_budget == 1024 * 1024 * 1024

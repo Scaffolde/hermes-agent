@@ -84,6 +84,12 @@ def workspaces(tmp_path, monkeypatch):
 
 
 def _service(max_clients: int) -> LSPService:
+    # Byte budget pinned off for the same reason as the unit fixtures: these
+    # assert exact client populations against a COUNT cap, and a budget
+    # derived from host RAM makes that host-dependent.  The mock server
+    # registers as ``pyright`` (charged 800 MiB), so on a small worker the
+    # byte bound would evict below the cap under test and these would fail
+    # for a reason none of them is about.
     return LSPService(
         enabled=True,
         wait_mode="document",
@@ -91,6 +97,7 @@ def _service(max_clients: int) -> LSPService:
         install_strategy="manual",
         idle_timeout=600.0,  # long: nothing is idle-reapable during these tests
         max_clients=max_clients,
+        memory_budget=None,
     )
 
 
