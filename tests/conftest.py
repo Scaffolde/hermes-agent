@@ -898,17 +898,69 @@ _REQUIRES_WAL_MARK = "requires_wal"
 _PKG_MUTATING_VERBS = frozenset({"sync", "install", "uninstall", "remove", "add"})
 #: Flags that name the environment/interpreter a package manager should act on.
 _PKG_TARGET_FLAGS = ("--python", "--prefix", "--target", "--python-executable")
+#: Files whose presence makes a directory a uv project root.
+_UV_PROJECT_MARKERS = ("pyproject.toml", "uv.toml")
+#: Read-only modes: they report what WOULD change and mutate nothing.
+_PKG_READ_ONLY_FLAGS = frozenset({"--check", "--dry-run"})
 
 
-def _env_root_of(path_str: str):
+def _uv_project_root(tokens: list[str], cwd):
+    """The project directory a ``uv`` invocation actually resolves to.
+
+    Per ``uv help sync``, uv searches the current directory *and every parent*
+    for a project. Assuming ``<cwd>/.venv`` therefore under-reads the blast
+    radius: a ``uv sync`` launched from any subdirectory of the checkout
+    discovers the repository root and prunes the live root ``.venv`` — exactly
+    the corruption this guard exists to prevent (SCA-4712).
+
+    ``--project`` names the project directory outright; ``--directory``
+    changes the directory uv starts its search from. Both are honoured in
+    argv order so ``--directory sub --project .`` composes the way uv reads
+    it.
+    """
+    base = Path(cwd) if cwd else Path(os.getcwd())
+    for i, tok in enumerate(tokens):
+        low = tok.lower()
+        for flag in ("--project", "--directory"):
+            value = None
+            if low == flag and i + 1 < len(tokens):
+                value = tokens[i + 1]
+            elif low.startswith(flag + "="):
+                value = tok.split("=", 1)[1]
+            if value:
+                candidate = Path(value).expanduser()
+                base = candidate if candidate.is_absolute() else base / candidate
+
+    try:
+        base = base.resolve()
+    except OSError:
+        return base
+    for directory in (base, *base.parents):
+        for marker in _UV_PROJECT_MARKERS:
+            if (directory / marker).exists():
+                return directory
+    return base
+
+
+def _env_root_of(path_str: str, base=None):
     """Best-effort environment root for an interpreter or prefix path.
 
     ``/x/.venv/bin/python`` and ``/x/.venv`` both resolve to ``/x/.venv``.
+
+    *base* is the directory a RELATIVE path should be read against — the
+    guarded subprocess's ``cwd``, never pytest's. A test running
+    ``uv pip install --python .venv/bin/python`` with ``cwd=tmp_path`` names
+    the throwaway env under *tmp_path*; resolving that against pytest's own
+    working directory would attribute it to the checkout's live ``.venv`` and
+    block a safe command. The inverse arrangement misses a live target, which
+    is the worse direction.
     """
     try:
         p = Path(path_str).expanduser()
     except (OSError, ValueError):
         return None
+    if not p.is_absolute() and base is not None:
+        p = Path(base) / p
     # An interpreter path: strip bin/python or Scripts\python.exe.
     if p.name.lower().startswith("python") and p.parent.name.lower() in {
         "bin",
@@ -1118,7 +1170,13 @@ def _looks_like_package_manager(tokens: list[str]):
     while i < n:
         tok = tokens[i]
         head = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
-        stem = head[:-4] if head.endswith(".exe") else head
+        # Windows installs uv/pip as ``uv.exe`` and as ``.cmd``/``.bat`` shims;
+        # all three are the same invocation.
+        stem = head
+        for suffix in (".exe", ".cmd", ".bat"):
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
         if stem == "uv":
             return "uv", i
         if stem in {"pip", "pip3"} or stem.startswith("pip3."):
@@ -1152,6 +1210,13 @@ def _pkg_command_mutates_an_env(tokens: list[str], manager: str, index: int) -> 
     provision throwaway runtimes.
     """
     rest = [t.lower() for t in tokens[index + 1:] if not t.startswith("-")]
+    # ``uv sync --check`` only reports whether the environment is already
+    # synchronized, and ``--dry-run`` explicitly avoids touching the lockfile
+    # or the project environment (``uv help sync``); pip's ``--dry-run`` is the
+    # same contract. Tests that validate dependency state against the running
+    # checkout mutate nothing and must not be rejected.
+    if any(t.lower() in _PKG_READ_ONLY_FLAGS for t in tokens[index + 1:]):
+        return False
     if manager == "ensurepip":
         return True
     if manager == "pip":
@@ -1182,13 +1247,17 @@ def _pkg_mutation_target(tokens: list[str], manager: str, index: int, env, cwd):
 
     lowered = [t.lower() for t in tokens]
 
+    # Relative paths in argv and in the env belong to the CHILD's working
+    # directory, not pytest's.
+    cwd_base = cwd if cwd else None
+
     # 1. An explicit target flag wins.
     for i, tok in enumerate(lowered):
         for flag in _PKG_TARGET_FLAGS:
             if tok == flag and i + 1 < len(tokens):
-                return _env_root_of(tokens[i + 1])
+                return _env_root_of(tokens[i + 1], base=cwd_base)
             if tok.startswith(flag + "="):
-                return _env_root_of(tokens[i].split("=", 1)[1])
+                return _env_root_of(tokens[i].split("=", 1)[1], base=cwd_base)
 
     # 2. ``--system`` explicitly means the running interpreter's environment.
     if "--system" in lowered:
@@ -1198,7 +1267,7 @@ def _pkg_mutation_target(tokens: list[str], manager: str, index: int, env, cwd):
     env = env or {}
     project_env = env.get("UV_PROJECT_ENVIRONMENT")
     if project_env:
-        return _env_root_of(str(project_env))
+        return _env_root_of(str(project_env), base=cwd_base)
 
     # 3b. ``uv sync`` resolves to the PROJECT's environment, not the activated
     # one: uv syncs ``<project>/.venv`` and merely warns when an unrelated
@@ -1208,11 +1277,7 @@ def _pkg_mutation_target(tokens: list[str], manager: str, index: int, env, cwd):
     # activated and lets a real sync of the running env slip past whenever the
     # two differ.
     if manager == "uv" and "sync" in lowered and "--active" not in lowered:
-        base = Path(cwd) if cwd else Path(os.getcwd())
-        try:
-            return (base / ".venv").resolve()
-        except OSError:
-            return base / ".venv"
+        return _uv_project_root(tokens, cwd) / ".venv"
 
     # 3c. ``<interpreter> -m pip install`` names its target in the argv, so it
     # outranks the env vars below: pip installs into the interpreter it is
@@ -1221,26 +1286,23 @@ def _pkg_mutation_target(tokens: list[str], manager: str, index: int, env, cwd):
         head = tokens[0] if tokens else ""
         stem = head.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
         if stem.startswith("python"):
-            return _env_root_of(head)
+            return _env_root_of(head, base=cwd_base)
 
     # 4. The environment variables uv/pip otherwise honour.
     for key in ("VIRTUAL_ENV", "CONDA_PREFIX"):
         value = env.get(key)
         if value:
-            return _env_root_of(str(value))
+            return _env_root_of(str(value), base=cwd_base)
 
     # 4b. Bare ``pip install`` resolves through PATH — assume the running env,
     # which is what an unsandboxed test would actually hit.
     if manager in {"pip", "ensurepip"}:
         return _env_root_of(sys.executable)
 
-    # 5. ``uv sync`` with no target syncs ``<cwd>/.venv`` for the project at cwd.
+    # 5. ``uv sync --active`` with no other target: uv's discovered project
+    # still owns the environment name.
     if manager == "uv" and "sync" in lowered:
-        base = Path(cwd) if cwd else Path(os.getcwd())
-        try:
-            return (base / ".venv").resolve()
-        except OSError:
-            return base / ".venv"
+        return _uv_project_root(tokens, cwd) / ".venv"
 
     # 6. ``uv pip install`` with no target falls back to the active env.
     if manager == "uv":
