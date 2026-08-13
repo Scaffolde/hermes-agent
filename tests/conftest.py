@@ -23,6 +23,7 @@ import asyncio
 import atexit
 import functools
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -982,13 +983,140 @@ def _targets_running_env(path_str) -> str | None:
     return None
 
 
+#: Shells whose ``-c`` argument is a script the guard should look inside.
+_SHELL_STEMS = frozenset({"sh", "bash", "zsh", "dash", "ash", "ksh"})
+#: Words that precede the real command without being it. Wrappers
+#: (``env FOO=1 uv sync``, ``sudo pip install``) and the shell keywords that
+#: can share a line with a command (``if uv sync; then ...``).
+_CMD_PREFIX_SKIP = frozenset({
+    "env", "sudo", "command", "exec", "nohup", "time", "nice", "builtin",
+    "if", "then", "else", "elif", "do", "while", "until", "!",
+})
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _shell_segments(script: str):
+    """Split a shell script into per-command word lists, or ``None``.
+
+    Quote- and comment-aware, so a package-manager name that merely appears
+    inside a quoted string or a ``#`` comment never reaches command position.
+
+    Returns ``None`` when the script cannot be parsed unambiguously — a
+    heredoc, or unbalanced quotes. That is deliberate. The predecessor of
+    this function ``shlex.split`` the whole script and scanned every token,
+    which desynchronised on the first apostrophe inside a comment
+    (``didn't``) and on ``<<EOF`` bodies; downstream, words landed in
+    positions they never occupied. ``scripts/install.sh`` both logs the
+    literal text ``uv pip install -e '.[all]'`` from a ``log_info`` string
+    and mentions "the venv pip entry point" in an English comment, and the
+    old scan blocked the unrelated test that runs it (SCA-4712, CI slice
+    1/8). Refusing to guess is the correct failure mode here: the
+    in-process rename guard below is the backstop for the actual defect.
+    """
+    segments: list[list[str]] = []
+    current: list[str] = []
+    buf: list[str] = []
+    have_word = False
+    i = 0
+    n = len(script)
+
+    def end_word():
+        nonlocal buf, have_word
+        if have_word or buf:
+            current.append("".join(buf))
+        buf = []
+        have_word = False
+
+    def end_segment():
+        nonlocal current
+        end_word()
+        if current:
+            segments.append(current)
+        current = []
+
+    while i < n:
+        ch = script[i]
+
+        if ch == "\\":
+            # Line continuation joins the next line onto this command.
+            if i + 1 < n and script[i + 1] == "\n":
+                i += 2
+                continue
+            if i + 1 < n:
+                buf.append(script[i + 1])
+                have_word = True
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if ch == "'":
+            j = script.find("'", i + 1)
+            if j == -1:
+                return None  # unbalanced — refuse to guess
+            buf.append(script[i + 1:j])
+            have_word = True
+            i = j + 1
+            continue
+
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if script[j] == "\\" and j + 1 < n:
+                    buf.append(script[j + 1])
+                    j += 2
+                    continue
+                if script[j] == '"':
+                    break
+                buf.append(script[j])
+                j += 1
+            if j >= n:
+                return None  # unbalanced — refuse to guess
+            have_word = True
+            i = j + 1
+            continue
+
+        if ch == "#" and not have_word and not buf:
+            while i < n and script[i] != "\n":
+                i += 1
+            continue
+
+        if script.startswith("<<", i):
+            return None  # heredoc body is not parseable as commands
+
+        if ch in ";\n|&()":
+            end_segment()
+            i += 1
+            continue
+
+        if ch in " \t\r":
+            end_word()
+            i += 1
+            continue
+
+        buf.append(ch)
+        have_word = True
+        i += 1
+
+    end_segment()
+    return segments
+
+
 def _looks_like_package_manager(tokens: list[str]):
-    """Return ``(kind, index)`` for the package-manager token, else ``None``.
+    """Return ``(kind, index)`` for a package manager in COMMAND position.
+
+    Command position only, deliberately: see :func:`_shell_segments` for the
+    false positive that scanning every token produced. Env-var assignments
+    and wrappers are skipped so ``env FOO=1 uv sync`` and ``sudo pip
+    install`` still resolve to the manager they invoke.
 
     The index matters: the subcommand check below has to read the arguments
     that follow the manager, not the whole argv.
     """
-    for i, tok in enumerate(tokens):
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
         head = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
         stem = head[:-4] if head.endswith(".exe") else head
         if stem == "uv":
@@ -998,10 +1126,19 @@ def _looks_like_package_manager(tokens: list[str]):
         if stem == "ensurepip":
             return "ensurepip", i
         # ``python -m pip`` / ``python -m ensurepip``
-        if head == "-m" and i + 1 < len(tokens):
-            nxt = tokens[i + 1].lower()
-            if nxt in {"pip", "ensurepip"}:
-                return nxt, i + 1
+        if stem.startswith("python"):
+            j = i + 1
+            while j < n and tokens[j].startswith("-") and tokens[j] != "-m":
+                j += 1
+            if j + 1 < n and tokens[j] == "-m":
+                nxt = tokens[j + 1].lower()
+                if nxt in {"pip", "ensurepip"}:
+                    return nxt, j + 1
+            return None
+        if _ENV_ASSIGN_RE.match(tok) or stem in _CMD_PREFIX_SKIP:
+            i += 1
+            continue
+        return None
     return None
 
 
@@ -1057,21 +1194,44 @@ def _pkg_mutation_target(tokens: list[str], manager: str, index: int, env, cwd):
     if "--system" in lowered:
         return _env_root_of(sys.executable)
 
-    # 3. The environment variables uv/pip honour.
+    # 3. ``UV_PROJECT_ENVIRONMENT`` overrides uv's environment choice outright.
     env = env or {}
-    for key in ("UV_PROJECT_ENVIRONMENT", "VIRTUAL_ENV", "CONDA_PREFIX"):
-        value = env.get(key)
-        if value:
-            return _env_root_of(str(value))
+    project_env = env.get("UV_PROJECT_ENVIRONMENT")
+    if project_env:
+        return _env_root_of(str(project_env))
 
-    # 4. ``<interpreter> -m pip install`` mutates that interpreter's env.
+    # 3b. ``uv sync`` resolves to the PROJECT's environment, not the activated
+    # one: uv syncs ``<project>/.venv`` and merely warns when an unrelated
+    # VIRTUAL_ENV is active (``--active`` opts into the activated env). So the
+    # project root has to be consulted before the env vars below — checking
+    # VIRTUAL_ENV first attributes the sync to whatever venv happens to be
+    # activated and lets a real sync of the running env slip past whenever the
+    # two differ.
+    if manager == "uv" and "sync" in lowered and "--active" not in lowered:
+        base = Path(cwd) if cwd else Path(os.getcwd())
+        try:
+            return (base / ".venv").resolve()
+        except OSError:
+            return base / ".venv"
+
+    # 3c. ``<interpreter> -m pip install`` names its target in the argv, so it
+    # outranks the env vars below: pip installs into the interpreter it is
+    # invoked with whatever VIRTUAL_ENV happens to say.
     if manager in {"pip", "ensurepip"}:
         head = tokens[0] if tokens else ""
         stem = head.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
         if stem.startswith("python"):
             return _env_root_of(head)
-        # Bare ``pip install`` resolves through PATH — assume the running env,
-        # which is what an unsandboxed test would actually hit.
+
+    # 4. The environment variables uv/pip otherwise honour.
+    for key in ("VIRTUAL_ENV", "CONDA_PREFIX"):
+        value = env.get(key)
+        if value:
+            return _env_root_of(str(value))
+
+    # 4b. Bare ``pip install`` resolves through PATH — assume the running env,
+    # which is what an unsandboxed test would actually hit.
+    if manager in {"pip", "ensurepip"}:
         return _env_root_of(sys.executable)
 
     # 5. ``uv sync`` with no target syncs ``<cwd>/.venv`` for the project at cwd.
@@ -1460,49 +1620,52 @@ def _live_system_guard(request, monkeypatch):
         # subprocess calls in the suite mention none of these.
         if not any(tok in low for tok in ("uv", "pip", "ensurepip")):
             return None
-        try:
-            raw_tokens = (
-                [str(t) for t in cmd]
-                if isinstance(cmd, (list, tuple))
-                else _shlex.split(cmd_str)
-            )
-        except ValueError:
-            raw_tokens = cmd_str.split()
-        # Split argv elements that are themselves command strings, so
-        # ``["bash", "-c", "uv pip install modal"]`` is inspected as the
-        # command it wraps. Without this the third element's basename is the
-        # whole string and no package manager is ever recognised — measured:
-        # a wrapped `uv pip install` walked straight past the guard.
-        tokens: list[str] = []
-        for token in raw_tokens:
-            if " " in token or "\t" in token or "\n" in token:
-                try:
-                    tokens.extend(_shlex.split(token))
-                except ValueError:
-                    tokens.extend(token.split())
-            else:
-                tokens.append(token)
-        if not tokens:
-            return None
+        if isinstance(cmd, (list, tuple)):
+            argv = [str(t) for t in cmd]
+        else:
+            # A shell string (``shell=True``, ``os.system``, ``os.popen``).
+            argv = None
 
-        # ``_looks_like_package_manager`` scans every token, so wrapped forms
-        # (``bash -c "uv sync"``, ``env FOO=1 uv sync``, ``sudo pip install``)
-        # are caught without special-casing the wrapper executable.
-        found = _looks_like_package_manager(tokens)
-        if found is None:
-            return None
-        manager, index = found
+        # Candidate command word-lists to inspect. Each entry is ONE command's
+        # argv, so a package-manager name only ever counts when it stands in
+        # that command's own command position.
+        candidates: list[list[str]] = []
+        if argv:
+            candidates.append(argv)
+            # ``["bash", "-c", "uv pip install modal"]`` — inspect the script
+            # it wraps, or the wrapped mutation launders straight past.
+            head = argv[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+            stem = head[:-4] if head.endswith(".exe") else head
+            if stem in _SHELL_STEMS:
+                for k, tok in enumerate(argv[1:], 1):
+                    if tok == "-c" and k + 1 < len(argv):
+                        wrapped = _shell_segments(argv[k + 1])
+                        if wrapped:
+                            candidates.extend(wrapped)
+                        break
+        else:
+            parsed = _shell_segments(cmd_str)
+            if parsed:
+                candidates.extend(parsed)
 
         kwargs = kwargs or {}
         env = kwargs.get("env")
         if env is None:
             env = _os.environ
-        target = _pkg_mutation_target(
-            tokens, manager, index, env, kwargs.get("cwd")
-        )
-        if target is None:
-            return None
-        return str(target) if target in _running_env_roots() else None
+
+        for tokens in candidates:
+            if not tokens:
+                continue
+            found = _looks_like_package_manager(tokens)
+            if found is None:
+                continue
+            manager, index = found
+            target = _pkg_mutation_target(
+                tokens, manager, index, env, kwargs.get("cwd")
+            )
+            if target is not None and target in _running_env_roots():
+                return str(target)
+        return None
 
     def _check_subprocess_cmd(name, cmd, kwargs=None):
         offending_env = _is_live_env_package_mutation(cmd, kwargs)

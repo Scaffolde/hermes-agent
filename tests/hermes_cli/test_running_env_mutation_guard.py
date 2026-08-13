@@ -144,6 +144,36 @@ class TestPackageManagerTooth:
                 env={**os.environ, "VIRTUAL_ENV": str(fake_running_env)},
             )
 
+    def test_allows_a_script_that_only_mentions_a_package_manager_in_text(
+        self, fake_running_env, tmp_path
+    ):
+        """A mention is not an invocation — command position is what counts.
+
+        Regression control for the CI breakage this guard caused on its first
+        run: ``tests/test_install_macos_launcher.py`` executes the real
+        ``setup_path`` from ``scripts/install.sh``, which *logs* the literal
+        text ``uv pip install -e '.[all]'`` and has an English comment about
+        "the venv pip entry point". The first revision tokenised the whole
+        script and scanned every token, so both were treated as invocations
+        and the unrelated test was blocked (CI slices 1/8 and 3/8).
+
+        The script below reproduces all three shapes that broke it: a
+        package-manager name inside a double-quoted argument, one inside a
+        ``#`` comment, and an apostrophe (``didn't``) that desynchronised the
+        old ``shlex`` pass.
+        """
+        script = (
+            'echo "Try: cd /x && uv pip install -e \'.[all]\'"\n'
+            "# the venv pip entry point is rewritten here; it didn't exist before\n"
+            "echo done\n"
+        )
+        completed = subprocess.run(
+            ["bash", "-c", script],
+            env={**os.environ, "VIRTUAL_ENV": str(fake_running_env)},
+            capture_output=True,
+        )
+        assert completed.returncode == 0
+
     def test_allows_a_sandboxed_target(self, fake_running_env, tmp_path):
         """The behaviour under test is legitimate — only the blast radius isn't.
 
