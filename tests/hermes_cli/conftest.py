@@ -69,10 +69,14 @@ def _restore_dashboard_auth_required():
     branch and gets 401 — ``test_dashboard_param_clamps.py`` alone loses 9 tests
     that way, and the whole-tree run loses 138+ across 57 files (SCA-4692).
 
-    CI never saw it because those files are pinned to one xdist worker, so the
-    leak stayed inside that worker: the green was a property of the sharding,
-    not of the code. Restoring here fixes the leak at its source rather than
-    codifying the partition.
+    CI never saw it because ``scripts/run_tests.sh`` gives every test FILE its
+    own freshly-spawned ``python -m pytest <file>`` subprocess (no xdist, no
+    shared workers — see ``.github/workflows/tests.yml`` and the run_tests.sh
+    header). That mapping is 1:1 at any slice count, so no CI process ever runs
+    two of these files together and the leak has nowhere to land. CI's green is
+    isolation-shaped, not partition-shaped — which is why a plain
+    ``pytest tests/hermes_cli`` still reports a red that CI cannot reproduce.
+    Restoring here fixes the leak at its source.
 
     Deliberately does NOT import web_server — only restores it when a test (or
     its module) has already imported it, so this stays free for the ~490 files

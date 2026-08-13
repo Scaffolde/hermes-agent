@@ -1,9 +1,12 @@
 """Regression pins for the two SCA-4692 test-isolation root causes.
 
-Both defects were invisible to CI because the dashboard-auth files are pinned to
-a single xdist worker: the leaks stayed inside that worker, so the suite was
-green as a property of the sharding rather than of the code. Running
-``tests/hermes_cli`` as one process failed 138+ tests across 57 files.
+Both defects were invisible to CI because ``scripts/run_tests.sh`` runs every
+test FILE in its own freshly-spawned ``python -m pytest <file>`` subprocess — no
+xdist, no shared workers. That file-to-process mapping is 1:1 at any slice count,
+so no CI process ever runs two of these files together and the leaks have nowhere
+to land. CI's green is isolation-shaped, not partition-shaped, which is exactly
+why a plain ``pytest tests/hermes_cli`` failed 138+ tests across 57 files with a
+red CI could never reproduce.
 """
 
 from __future__ import annotations
