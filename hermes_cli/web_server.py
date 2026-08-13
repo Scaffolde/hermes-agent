@@ -331,14 +331,49 @@ def _resolve_session_token() -> str:
     return os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
 
 
+# Per-process fallback, used only when neither the SSH override nor
+# HERMES_DASHBOARD_SESSION_TOKEN supplies one. Generated once so it stays stable
+# for the life of the interpreter: it is injected into the SPA HTML and compared
+# against on later requests, so it must not change between the two.
+#
+# This is deliberately NOT the authoritative token — read `_session_token()`
+# instead. Binding the authoritative value at import time made the token depend
+# on WHICH MODULE IMPORTED web_server FIRST: a caller that exports
+# HERMES_DASHBOARD_SESSION_TOKEN after the first import got a server that had
+# already pinned a different token, and every subsequent request 401'd. Under
+# pytest that made 138 tests across 57 files pass alone and fail in a batch
+# (SCA-4692); in production it is the same hazard for any embedder that sets the
+# variable after importing the module.
+#
+# The name stays module-level because callers legitimately read it as an
+# attribute (`web_deps.get_session_token`, and tests that import it by value).
 _SESSION_TOKEN = _resolve_session_token()
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
+_SSH_SESSION_TOKEN: Optional[str] = None
+
+
+def _session_token() -> str:
+    """The authoritative session token, resolved at call time.
+
+    Precedence: SSH-applied override, then ``HERMES_DASHBOARD_SESSION_TOKEN``,
+    then the stable per-process fallback. Resolving here rather than at import
+    means the environment is read when the token is USED, so import order
+    cannot pin a stale value.
+    """
+    if _SSH_SESSION_TOKEN:
+        return _SSH_SESSION_TOKEN
+    return os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or _SESSION_TOKEN
 
 
 def _apply_ssh_session_token(token: str) -> None:
-    global _SESSION_TOKEN
+    # Sets both: `_SSH_SESSION_TOKEN` is what `_session_token()` gives
+    # precedence, while `_SESSION_TOKEN` is kept in step so callers that read
+    # the attribute by value (`web_deps.get_session_token`, tests) still observe
+    # the SSH token exactly as they did when this function assigned it directly.
+    global _SSH_SESSION_TOKEN, _SESSION_TOKEN
     if token:
+        _SSH_SESSION_TOKEN = token
         _SESSION_TOKEN = token
 
 
@@ -406,12 +441,12 @@ def _has_valid_session_token(request: Request) -> bool:
     session_header = request.headers.get(_SESSION_HEADER_NAME, "")
     if session_header and hmac.compare_digest(
         session_header.encode(),
-        _SESSION_TOKEN.encode(),
+        _session_token().encode(),
     ):
         return True
 
     auth = request.headers.get("authorization", "")
-    expected = f"Bearer {_SESSION_TOKEN}"
+    expected = f"Bearer {_session_token()}"
     return hmac.compare_digest(auth.encode(), expected.encode())
 
 
@@ -425,7 +460,7 @@ def _has_valid_query_token(request: Request, path: str) -> bool:
     if path not in _QUERY_TOKEN_API_PATHS:
         return False
     token = request.query_params.get("token", "")
-    return bool(token) and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
+    return bool(token) and hmac.compare_digest(token.encode(), _session_token().encode())
 
 
 def _require_token(request: Request) -> None:
@@ -793,7 +828,7 @@ async def _dashboard_selftest_once() -> None:
         ) as client:
             resp = await client.get(
                 _DASHBOARD_SELFTEST_ROUTE,
-                headers={_SESSION_HEADER_NAME: _SESSION_TOKEN},
+                headers={_SESSION_HEADER_NAME: _session_token()},
             )
         DASHBOARD_HEALTH.record_selftest(resp.status_code == 200, resp.status_code)
     except Exception:
@@ -14741,7 +14776,7 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     token = ws.query_params.get("token", "")
     if not token:
         return "no_credential", "none"
-    if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+    if hmac.compare_digest(token.encode(), _session_token().encode()):
         return None, "token"
     return "token_mismatch", "token"
 
@@ -14939,7 +14974,7 @@ def _build_gateway_ws_url() -> Optional[str]:
 
         qs = urllib.parse.urlencode({"internal": internal_ws_credential()})
     else:
-        qs = urllib.parse.urlencode({"token": _SESSION_TOKEN})
+        qs = urllib.parse.urlencode({"token": _session_token()})
 
     return f"ws://{netloc}/api/ws?{qs}"
 
@@ -15006,7 +15041,7 @@ def _build_sidecar_url(channel: str) -> Optional[str]:
             {"internal": internal_ws_credential(), "channel": channel}
         )
     else:
-        qs = urllib.parse.urlencode({"token": _SESSION_TOKEN, "channel": channel})
+        qs = urllib.parse.urlencode({"token": _session_token(), "channel": channel})
 
     return f"ws://{netloc}/api/pub?{qs}"
 
@@ -16093,7 +16128,7 @@ def mount_spa(application: FastAPI):
             )
         else:
             bootstrap_script = (
-                f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
+                f'<script>window.__HERMES_SESSION_TOKEN__="{_session_token()}";'
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"

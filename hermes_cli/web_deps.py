@@ -139,8 +139,12 @@ class LateState:
 
 
 def get_session_token() -> str:
-    """Current dashboard session token (``web_server._SESSION_TOKEN``)."""
-    return _server()._SESSION_TOKEN
+    """Current dashboard session token (``web_server._session_token()``).
+
+    Resolved at call time so a ``HERMES_DASHBOARD_SESSION_TOKEN`` exported after
+    web_server was first imported is still honoured (SCA-4692).
+    """
+    return _server()._session_token()
 
 
 def get_dashboard_health():
