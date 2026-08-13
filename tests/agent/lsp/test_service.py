@@ -219,6 +219,195 @@ def test_reaper_survives_sweep_error(mock_pyright):
         svc.shutdown()
 
 
+class _SteppedWallClock:
+    """Stand-in for the ``time`` module with a stepped wall clock.
+
+    ``time()`` is offset (an NTP correction); ``monotonic()`` is
+    untouched, which is precisely the guarantee the idle bookkeeping is
+    supposed to rely on.
+
+    This models an NTP correction *only*.  Suspend/resume is a different
+    failure mode with the opposite shape — see :class:`_SuspendedClock`.
+    """
+
+    def __init__(self, offset: float) -> None:
+        self._offset = offset
+
+    def time(self) -> float:
+        return time.time() + self._offset
+
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
+class _SuspendedClock:
+    """Stand-in for the ``time`` module across a Linux suspend/resume.
+
+    Models what the kernel actually does, which is the inverse of an NTP
+    step: ``CLOCK_MONOTONIC`` **stops** while the machine is suspended,
+    while ``CLOCK_BOOTTIME`` keeps counting.  So after a resume the wall
+    clock and BOOTTIME have both advanced by the suspend duration and
+    ``monotonic()`` has not moved at all.
+
+    ``has_boottime=False`` models a platform without ``CLOCK_BOOTTIME``
+    (macOS), where the resolver must fall back to ``monotonic()``.
+    """
+
+    # Linux's real value; only identity across the two calls matters.
+    _BOOTTIME_ID = 7
+
+    def __init__(self, suspended_for: float, *, has_boottime: bool = True) -> None:
+        self._suspended_for = suspended_for
+        self._base_monotonic = time.monotonic()
+        # Set per-instance so ``getattr(time, "CLOCK_BOOTTIME", None)``
+        # genuinely misses on the no-BOOTTIME platform.
+        if has_boottime:
+            self.CLOCK_BOOTTIME = self._BOOTTIME_ID
+
+    def time(self) -> float:
+        return time.time() + self._suspended_for
+
+    def monotonic(self) -> float:
+        # Frozen: no awake time has elapsed since the fixture was built.
+        return self._base_monotonic
+
+    def clock_gettime(self, clk_id: int) -> float:
+        if clk_id != self._BOOTTIME_ID:
+            raise ValueError(f"unexpected clock id {clk_id}")
+        return self._base_monotonic + self._suspended_for
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
+def test_idle_clock_counts_suspended_time(monkeypatch):
+    """``_idle_clock`` must read a suspend-inclusive clock where one exists.
+
+    ``CLOCK_MONOTONIC`` stops while the machine is suspended, so a laptop
+    that sleeps longer than ``idle_timeout`` wakes with every ``_last_used``
+    stamp still inside the window.  Reading ``CLOCK_BOOTTIME`` instead
+    counts the suspended time and keeps the cutoff honest.
+
+    Positive control: this fails against a ``time.monotonic()`` resolver,
+    which returns the frozen base instead of the advanced value.
+    """
+    from agent.lsp import manager as manager_mod
+
+    clock = _SuspendedClock(3600.0)
+    monkeypatch.setattr(manager_mod, "time", clock)
+
+    assert manager_mod._idle_clock() == pytest.approx(
+        clock._base_monotonic + 3600.0
+    ), "idle bookkeeping ignored suspended time — it must read CLOCK_BOOTTIME"
+
+
+def test_idle_clock_falls_back_to_monotonic_without_boottime(monkeypatch):
+    """No ``CLOCK_BOOTTIME`` (macOS) must degrade to ``monotonic``, not crash."""
+    from agent.lsp import manager as manager_mod
+
+    clock = _SuspendedClock(3600.0, has_boottime=False)
+    monkeypatch.setattr(manager_mod, "time", clock)
+
+    assert not hasattr(clock, "CLOCK_BOOTTIME")
+    assert manager_mod._idle_clock() == pytest.approx(clock._base_monotonic)
+
+
+def test_reaper_is_immune_to_suspend(mock_pyright, monkeypatch):
+    """A suspend longer than ``idle_timeout`` must not stall the reaper.
+
+    The inverse of the NTP case below: here the wall clock jumps *forward*
+    and ``monotonic()`` freezes.  Against a ``monotonic()``-based cutoff the
+    client looks freshly used no matter how long the machine slept, so the
+    fleet accumulates across every sleep/wake cycle — exactly the leak the
+    reaper exists to close.
+
+    Positive control: this test fails against a ``monotonic()``-based
+    reaper (the client survives the sweep) and passes against a
+    BOOTTIME-based one.
+    """
+    from agent.lsp import manager as manager_mod
+
+    repo = mock_pyright
+    f = repo / "x.py"
+    f.write_text("")
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+        idle_timeout=60.0,  # sweeps manually below; the loop never fires
+    )
+    try:
+        svc.get_diagnostics_sync(str(f))
+        key = next(iter(svc._clients))
+
+        # The client was last used "just now" — well inside the timeout.
+        # Then the machine suspends for an hour, which advances BOOTTIME
+        # but leaves monotonic exactly where it was.
+        svc._last_used[key] = manager_mod._idle_clock()
+        monkeypatch.setattr(manager_mod, "time", _SuspendedClock(3600.0))
+
+        svc._loop.run(svc._reap_idle_once(), timeout=5.0)
+
+        assert key not in svc._clients, (
+            "an hour of suspend did not age the client — idle bookkeeping "
+            "must count suspended time (CLOCK_BOOTTIME), not awake time only"
+        )
+        assert svc.get_status()["clients"] == []
+    finally:
+        svc.shutdown()
+
+
+def test_reaper_is_immune_to_wall_clock_steps(mock_pyright, monkeypatch):
+    """A backwards wall-clock step must not stall the idle reaper.
+
+    Idle bookkeeping compares timestamps only to each other, so it must
+    read a monotonic clock.  Against ``time.time()`` an NTP correction or
+    a sleep/wake resume that steps the clock back further than
+    ``idle_timeout`` drags the cutoff into the past, no client ever looks
+    idle, and unbounded accumulation — the leak the reaper exists to
+    close — silently comes back.
+
+    Positive control: this test fails against a ``time.time()``-based
+    reaper (the client survives the sweep) and passes against a
+    monotonic one.
+    """
+    from agent.lsp import manager as manager_mod
+
+    repo = mock_pyright
+    f = repo / "x.py"
+    f.write_text("")
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+        idle_timeout=60.0,  # sweeps manually below; the loop never fires
+    )
+    try:
+        svc.get_diagnostics_sync(str(f))
+        key = next(iter(svc._clients))
+
+        # Idle for longer than the timeout, in whichever clock is in use.
+        svc._last_used[key] = svc._last_used[key] - 120.0
+
+        # Now step the wall clock an hour into the past, mid-flight.
+        monkeypatch.setattr(manager_mod, "time", _SteppedWallClock(-3600.0))
+
+        svc._loop.run(svc._reap_idle_once(), timeout=5.0)
+
+        assert key not in svc._clients, (
+            "a backwards wall-clock step stalled the reaper — idle "
+            "bookkeeping must read a monotonic clock"
+        )
+        assert svc.get_status()["clients"] == []
+    finally:
+        svc.shutdown()
+
+
 
 
 
