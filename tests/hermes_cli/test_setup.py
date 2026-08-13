@@ -160,6 +160,19 @@ def test_modal_setup_persists_direct_mode_when_user_chooses_their_own_account(tm
         ),
     )
     monkeypatch.setitem(sys.modules, "swe_rex", object())
+    # Present the modal SDK as already installed (same pattern as the vercel
+    # tests below). Without this, ``__import__("modal")`` fails and the
+    # direct-mode branch runs the REAL ``_pip_install(["modal"])``, which
+    # calls ``managed_uv.ensure_uv()`` → the runtime-repair chain → a venv
+    # cut-over that renames the checkout's live ``.venv`` (the one pytest is
+    # executing in) aside and promotes an ``--extra all`` replacement with no
+    # ``dev`` extra. pytest disappears mid-run, so the remaining ~47% of a
+    # whole-tree run executes against a different environment than the first
+    # half and a second run cannot start at all (SCA-4712).
+    #
+    # The install path itself is not what this test covers — it asserts that
+    # choosing "my own account" persists ``modal_mode == "direct"``.
+    monkeypatch.setitem(sys.modules, "modal", types.ModuleType("modal"))
 
     from hermes_cli.setup import setup_terminal_backend
 
