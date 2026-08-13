@@ -352,18 +352,53 @@ _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
 _SSH_SESSION_TOKEN: Optional[str] = None
 
+# The authoritative token, frozen ONCE at the first of (start_server, first auth
+# check) and never re-read from the environment afterwards.
+#
+# Both halves matter, and they are in tension:
+#
+# * Reading the env at IMPORT time is wrong (SCA-4692): import order decides the
+#   value, so anything exporting the var after the first import silently 401s.
+# * Reading the env on EVERY check is also wrong: `PUT /api/env` →
+#   `save_provider_env_credential()` → `save_env_value()` assigns straight into
+#   `os.environ` in this process, and that key is not on the writer denylist. So
+#   a loopback user rotating HERMES_DASHBOARD_SESSION_TOKEN through the
+#   authenticated env editor would swap the authoritative credential mid-flight
+#   while the browser kept sending the token injected into the SPA HTML —
+#   401ing every subsequent REST and WebSocket request from a live session.
+#
+# Freezing at the serve boundary satisfies both: the environment is read late
+# enough that import order cannot pin it, and exactly once, so a later in-process
+# write cannot invalidate credentials already handed to clients.
+_SERVING_SESSION_TOKEN: Optional[str] = None
+
+
+def _freeze_session_token() -> str:
+    """Resolve the authoritative token once and freeze it for this process.
+
+    Idempotent: the first caller wins and every later caller observes the same
+    value. `start_server` calls this before the bind so the freeze happens
+    before any request is served; the auth path calls it too, so an in-process
+    `TestClient(app)` (which never goes through `start_server`) still resolves
+    the environment lazily rather than at import.
+    """
+    global _SERVING_SESSION_TOKEN
+    if _SERVING_SESSION_TOKEN is None:
+        _SERVING_SESSION_TOKEN = (
+            os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or _SESSION_TOKEN
+        )
+    return _SERVING_SESSION_TOKEN
+
 
 def _session_token() -> str:
-    """The authoritative session token, resolved at call time.
+    """The authoritative session token.
 
-    Precedence: SSH-applied override, then ``HERMES_DASHBOARD_SESSION_TOKEN``,
-    then the stable per-process fallback. Resolving here rather than at import
-    means the environment is read when the token is USED, so import order
-    cannot pin a stale value.
+    Precedence: SSH-applied override, then the frozen resolution of
+    ``HERMES_DASHBOARD_SESSION_TOKEN``, then the stable per-process fallback.
     """
     if _SSH_SESSION_TOKEN:
         return _SSH_SESSION_TOKEN
-    return os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or _SESSION_TOKEN
+    return _freeze_session_token()
 
 
 def _apply_ssh_session_token(token: str) -> None:
@@ -17470,6 +17505,12 @@ def start_server(
     """
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
+
+    # Freeze the session token BEFORE the bind. After this point an in-process
+    # write to HERMES_DASHBOARD_SESSION_TOKEN (the authenticated `PUT /api/env`
+    # editor assigns into `os.environ` directly) can no longer swap the
+    # credential out from under clients that already hold the injected token.
+    _freeze_session_token()
 
     import uvicorn
 

@@ -85,9 +85,18 @@ def _restore_dashboard_auth_required():
 
     missing = object()
     previous = getattr(module.app.state, "auth_required", missing)
+    # `_SERVING_SESSION_TOKEN` is the once-frozen authoritative session token.
+    # Freezing is correct for a real server (it stops an in-process env write
+    # from invalidating live sessions) but process-global, so without a reset the
+    # first test to touch the auth path would pin the token for every later test
+    # — the same class of leak as `auth_required`, just one layer down. Clearing
+    # it here gives each test a fresh resolution of the environment it set up.
+    previous_frozen = getattr(module, "_SERVING_SESSION_TOKEN", None)
+    module._SERVING_SESSION_TOKEN = None
     try:
         yield
     finally:
+        module._SERVING_SESSION_TOKEN = previous_frozen
         if previous is missing:
             # The test introduced the attribute; drop it so the next test sees
             # the same absent-attribute state this one started from.
