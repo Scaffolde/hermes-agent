@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,6 +82,11 @@ DIAGNOSTICS_FULL_WAIT = 10.0
 DIAGNOSTICS_REQUEST_TIMEOUT = 3.0
 PUSH_DEBOUNCE = 0.15
 SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
+
+# POSIX process groups let us reap a language server together with the
+# workers it supervises.  Windows has no equivalent primitive, so the
+# shutdown path there stays on the single-PID calls it has always used.
+_HAS_PROCESS_GROUPS = hasattr(os, "killpg") and hasattr(os, "getpgid")
 
 # Retry policy for transient ContentModified errors.
 MAX_CONTENT_MODIFIED_RETRIES = 3
@@ -492,17 +498,64 @@ class LSPClient:
             return
         if proc.returncode is None:
             try:
-                proc.terminate()
+                self._signal_process(proc, signal.SIGTERM)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
                 except asyncio.TimeoutError:
                     try:
-                        proc.kill()
+                        self._signal_process(proc, signal.SIGKILL)
                         await proc.wait()
                     except ProcessLookupError:
                         pass
             except ProcessLookupError:
                 pass
+
+    def _signal_process(self, proc, sig: int) -> None:
+        """Signal the server *and its workers*, not just the supervisor PID.
+
+        Real language servers are supervisors: ``typescript-language-server``
+        runs ``tsserver``, ``pyright-langserver`` forks node workers, and it
+        is the worker that holds the project graph.  Signalling ``proc.pid``
+        alone leaves that worker resident and reparented to init, so the
+        fleet cap bounds the supervisor count while the memory it exists to
+        bound walks away unowned.
+
+        ``start()`` spawns with ``start_new_session=True``, so this server
+        leads its own process group.  That is what makes a group-directed
+        signal safe *and* correct here: the group holds the server and its
+        descendants and nothing else -- in particular not the gateway or the
+        TUI parent, which is the accident the ``start_new_session`` comment
+        in ``start()`` exists to prevent.  Group membership also survives
+        reparenting, so a worker whose supervisor already exited is still
+        reached -- which a PPID-based tree walk would miss.
+
+        Falls back to the single PID when the group cannot be resolved or
+        signalled (Windows has no process groups; ``proc.kill()`` there
+        keeps the previous behaviour).
+        """
+        if not _HAS_PROCESS_GROUPS:
+            _single = proc.kill if sig == signal.SIGKILL else proc.terminate
+            _single()
+            return
+        try:
+            pgid = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            raise
+        except OSError:
+            pgid = None
+        # Never signal our own group: if the spawn silently lost its new
+        # session we would take down the gateway and every sibling server.
+        if pgid is None or pgid == os.getpgrp():
+            _single = proc.kill if sig == signal.SIGKILL else proc.terminate
+            _single()
+            return
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            raise
+        except OSError:
+            _single = proc.kill if sig == signal.SIGKILL else proc.terminate
+            _single()
 
     # ------------------------------------------------------------------
     # request / notification plumbing

@@ -68,12 +68,49 @@ def write_message(obj):
     sys.stdout.buffer.flush()
 
 
+def _spawn_grandchild():
+    """Fork a long-lived worker the way a real language server does.
+
+    ``typescript-language-server`` runs ``tsserver`` as a child, and
+    ``pyright-langserver`` forks node workers.  The worker inherits this
+    process's group -- we are the group leader, courtesy of
+    ``start_new_session=True`` in the client -- and it ignores SIGTERM, so
+    it survives anything aimed at this PID alone.  Its PID goes to
+    ``MOCK_LSP_CHILD_PIDFILE`` so the test can go looking for the corpse.
+    """
+    import subprocess
+
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal,time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "while True: time.sleep(0.05)\n",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pidfile = os.environ.get("MOCK_LSP_CHILD_PIDFILE")
+    if pidfile:
+        with open(pidfile, "w") as fh:
+            fh.write(str(worker.pid))
+            fh.flush()
+            os.fsync(fh.fileno())
+    return worker
+
+
 def main():
     script = os.environ.get("MOCK_LSP_SCRIPT", "clean")
     if script == "hang_shutdown":
         # Survive the SIGTERM in ``_cleanup_process`` so the eviction has
         # to spend the whole SHUTDOWN_GRACE before SIGKILL lands.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if script == "spawns_child":
+        # Hold the handle so the worker is not reaped by GC; it outlives
+        # us on purpose.
+        _spawn_grandchild()
 
     while True:
         msg = read_message()
