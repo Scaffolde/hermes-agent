@@ -122,12 +122,20 @@ def _cmd_status(emit_json: bool) -> int:
         out.append(f"  wait_mode:       {info.get('wait_mode')}")
         out.append(f"  wait_timeout:    {info.get('wait_timeout')}s")
         out.append(f"  install_strategy:{info.get('install_strategy')}")
+        # The bounds in force, so a host pinned at its cap can be
+        # diagnosed from the CLI instead of by re-deriving the cap from
+        # host RAM by hand.
+        out.append(f"  idle_timeout:    {info.get('idle_timeout')}s")
+        out.append(f"  max_clients:     {info.get('max_clients')}")
         clients = info.get("clients") or []
         if clients:
             out.append(f"  active clients:  {len(clients)}")
             for c in clients:
                 out.append(
-                    f"    - {c['server_id']:20s} state={c['state']:10s} root={c['workspace_root']}"
+                    f"    - {c['server_id']:20s} state={c['state']:10s}"
+                    f" idle={c.get('idle_seconds', 0.0):.0f}s"
+                    f" inflight={c.get('inflight', 0)}"
+                    f" root={c['workspace_root']}"
                 )
         else:
             out.append("  active clients:  none")
