@@ -113,6 +113,8 @@ def inject(svc: LSPService, root: str, idle_for: float = 0.0) -> FakeClient:
         (float("nan"), DEFAULT_IDLE_TIMEOUT),
         (float("inf"), DEFAULT_IDLE_TIMEOUT),
         (float("-inf"), DEFAULT_IDLE_TIMEOUT),
+        (False, DEFAULT_IDLE_TIMEOUT),  # YAML 1.1 `off`/`no`, not a 0
+        (True, DEFAULT_IDLE_TIMEOUT),   # YAML 1.1 `on`/`yes`, not a 1
     ],
 )
 def test_resolve_idle_timeout_matches_the_max_clients_treatment(raw, expected):
@@ -124,6 +126,54 @@ def test_resolve_idle_timeout_matches_the_max_clients_treatment(raw, expected):
     the same place by accident.
     """
     assert manager_mod.resolve_idle_timeout(raw) == expected
+
+
+def test_boolean_bounds_fall_back_instead_of_coercing_to_a_number():
+    """``idle_timeout: off`` is a bool, and ``float(False)`` is a silent 0.
+
+    YAML 1.1 resolves ``off``/``no`` to ``False`` and ``on``/``yes`` to
+    ``True``, so an operator who writes ``idle_timeout: off`` meaning
+    "no timeout" hands the resolver a ``bool``.  ``bool`` is a subclass
+    of ``int``, so it never raises on the way through ``float()``:
+
+        idle_timeout: off -> 0.0  -> reads as the documented "0", which
+                                     disables the reaper outright
+        idle_timeout: on  -> 1.0  -> clamped up to MIN_IDLE_TIMEOUT
+        max_clients:  on  -> 1    -> a one-server fleet, silently
+
+    ``off`` reaching ``0.0`` is the same disarmed reaper this whole
+    module exists to prevent, arrived at by a different door — and none
+    of the three warn, because ``_bound_was_overridden`` compares
+    numerically and ``float(False) == 0.0`` is the value it resolved to.
+    A bool is not a number an operator can have meant; it derives the
+    default, matching the ``isinstance(raw, bool)`` rejection already
+    used in ``agent/retry_utils.py`` and ``agent/image_routing.py``.
+    """
+    for raw in (False, True):
+        assert manager_mod.resolve_idle_timeout(raw) == DEFAULT_IDLE_TIMEOUT, raw
+        assert manager_mod.resolve_max_clients(raw) == default_max_clients(), raw
+
+
+def test_a_boolean_bound_is_logged_as_an_override(monkeypatch, caplog):
+    """The fallback is loud: a bool must not disarm the reaper in silence.
+
+    ``_bound_was_overridden`` decides whether the operator hears about a
+    rejected value, and it compares numerically — so ``False`` against a
+    resolved ``600.0`` must still read as an override rather than being
+    coerced back to ``0.0`` for the comparison and passing as unchanged.
+    """
+    cfg = {"lsp": {"enabled": False, "max_clients": True, "idle_timeout": False}}
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: cfg)
+    with caplog.at_level(logging.WARNING):
+        svc = LSPService.create_from_config()
+    assert svc is not None
+    try:
+        assert svc._idle_timeout == DEFAULT_IDLE_TIMEOUT
+        assert svc._max_clients == default_max_clients()
+        assert "idle_timeout" in caplog.text
+        assert "max_clients" in caplog.text
+    finally:
+        svc.shutdown()
 
 
 def test_non_finite_bounds_fall_back_instead_of_crashing_the_lsp_path(monkeypatch):

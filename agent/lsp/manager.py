@@ -231,11 +231,11 @@ def resolve_max_clients(raw: Any) -> int:
     """Turn a configured ``lsp.max_clients`` into an enforceable cap.
 
     ``None`` means "derive from the host".  Anything unusable — zero, a
-    negative, a string, ``.nan``/``.inf`` (both valid YAML that survive
-    ``float()``) — also derives, because garbage must not silently
+    negative, a string, a ``bool``, ``.nan``/``.inf`` (all valid YAML that
+    survive ``float()``) — also derives, because garbage must not silently
     restore the unbounded accumulation this cap exists to stop.
     """
-    if raw is None:
+    if raw is None or isinstance(raw, bool):
         return default_max_clients()
     try:
         parsed = float(raw)
@@ -267,8 +267,16 @@ def resolve_idle_timeout(raw: Any) -> float:
     documents it as "hold every server's index warm for the life of the
     process".  A negative reaches that same disabled state by accident
     rather than by request, so it derives the default instead.
+
+    A ``bool`` is rejected before coercion for the same reason, and it is
+    the sharpest case: YAML 1.1 resolves ``off``/``no`` to ``False``, and
+    ``bool`` subclasses ``int``, so ``idle_timeout: off`` would sail
+    through ``float()`` as ``0.0`` and read as the documented disable —
+    silently reaching the dead reaper above by a different door.  ``on``
+    would land at ``1.0`` and clamp up to ``MIN_IDLE_TIMEOUT``.  Neither
+    is a duration anyone can have meant.
     """
-    if raw is None:
+    if raw is None or isinstance(raw, bool):
         return float(DEFAULT_IDLE_TIMEOUT)
     try:
         parsed = float(raw)
@@ -291,9 +299,17 @@ def _bound_was_overridden(raw: Any, resolved: float) -> bool:
     otherwise every string-typed config would warn about an override
     that never happened, and a warning on every startup is a warning
     nobody reads.
+
+    A ``bool`` is always an override, decided before the numeric
+    comparison can excuse it.  ``MIN_CLIENT_CAP`` is 1, so on a small
+    host ``max_clients: on`` resolves to a default of 1 and would
+    compare equal to ``float(True)`` — leaving the one case where a
+    rejected value is corrected in silence.
     """
     if raw is None:
         return False
+    if isinstance(raw, bool):
+        return True
     try:
         return float(raw) != float(resolved)
     except (TypeError, ValueError):
