@@ -14,6 +14,7 @@ test pins that it does *not* flag independent work.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -90,7 +91,10 @@ def pr(number: int, head: str, base: str = "main", **kwargs) -> pmo.PullRequest:
 
 def sweep(repo: Path, prs: list[pmo.PullRequest]) -> pmo.MergeOrderReport:
     suite = pmo.GitProbeSuite(repo, lambda p: p.base_ref if p.base_ref == "main" else "main")
-    return pmo.compute_merge_order(prs, suite.probe, suite.is_ancestor, preflight=suite.preflight)
+    return pmo.compute_merge_order(
+        prs, suite.probe, suite.is_ancestor,
+        preflight=suite.preflight, replay=suite.replay,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -328,9 +332,16 @@ def test_undeclared_ancestry_records_an_ordering_edge(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_pr_conflicting_with_its_own_base_is_held_unverified(tmp_path: Path):
+def test_pr_conflicting_with_its_own_base_is_blocked_with_a_verdict(tmp_path: Path):
     """A single-PR queue takes every pair skip, so without the preflight the
-    report would print a viable order backed by zero probe calls."""
+    report would print a viable order backed by zero probe calls.
+
+    Such a PR is BLOCKED, not UNVERIFIED. The distinction is what the exit code
+    turns on: the sweep examined it and the answer is "this cannot land" (the
+    board shows it DIRTY), which is a verdict. Filing it as unverified made the
+    sweep claim it could not verify the queue — exit 2, job red, and the
+    collision issue suppressed — on every run while any DIRTY PR was open.
+    """
     repo = base_repo(tmp_path)
     branch_from(repo, "feat-a", "main", BASE_FILE, edited(1, "A2"), "a")
     # main moves under it, conflicting.
@@ -338,9 +349,29 @@ def test_pr_conflicting_with_its_own_base_is_held_unverified(tmp_path: Path):
 
     report = sweep(repo, [pr(1, "feat-a")])
 
-    assert report.unverified == [1]
+    assert report.unverified == [], "a measured 'cannot land' is not a failure to measure"
+    assert report.blocked == [1]
     assert report.merge_order == []
     assert any("does not merge cleanly into main" in e for e in report.errors)
+    assert pmo.exit_code_for(report) == pmo.EXIT_NO_ORDER
+
+
+def test_a_dirty_pr_does_not_mask_a_landable_queue(tmp_path: Path):
+    """The regression guard for the split: one DIRTY PR must not stop the rest
+    of the queue being reported, nor turn the run into "could not verify"."""
+    repo = base_repo(tmp_path)
+    main = git(repo, "rev-parse", "main").stdout.strip()
+    branch_from(repo, "dirty", main, BASE_FILE, edited(1, "DIRTY"), "dirty")
+    branch_from(repo, "fine", main, "other.txt", "fine\n", "fine")
+    # main moves under `dirty` only.
+    write_commit(repo, BASE_FILE, edited(1, "MAIN2"), "main moves")
+
+    report = sweep(repo, [pr(1, "dirty"), pr(2, "fine")])
+
+    assert report.unverified == []
+    assert 1 in report.blocked
+    assert report.merge_order == [2], "the healthy PR still has a verdict"
+    assert pmo.exit_code_for(report) == pmo.EXIT_NO_ORDER
 
 
 def test_unresolvable_head_is_reported_never_silently_dropped(tmp_path: Path):
@@ -507,19 +538,314 @@ def test_collision_verdict_reaches_a_human():
     assert "GITHUB_STEP_SUMMARY" in text
 
 
-def test_sweep_failure_is_not_reported_as_a_clean_queue():
-    """Exit 2 means the sweep could not run. A broken detector must fail the
-    job: treating "could not verify" as "verified" is the false-green this
-    whole tool exists to end."""
+GATE = REPO_ROOT / "scripts" / "ci" / "pr_merge_order_gate.sh"
+
+
+def run_gate(status: str) -> subprocess.CompletedProcess[str]:
+    """Executes the real status gate the workflow calls."""
+    return subprocess.run(
+        ["bash", str(GATE), status],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+
+
+def test_gate_passes_the_job_only_for_a_real_verdict():
+    """0 (landable) and 1 (collision detected) are both successful detections.
+    Failing on 1 would make a working detector look like a broken one."""
+    clean = run_gate("0")
+    assert clean.returncode == 0
+    assert "landable order" in clean.stdout
+
+    collision = run_gate("1")
+    assert collision.returncode == 0
+    assert "cannot land" in collision.stdout
+
+
+@pytest.mark.parametrize("status", ["2", "127", "137", "3"])
+def test_gate_fails_the_job_for_every_unverified_status(status):
+    """Treating "could not verify" as "verified" is the false green this whole
+    tool exists to end. Checking only for 2 let 127 (no interpreter) pass as
+    clean and reported a parse failure's exit 1 as a real queue collision."""
+    result = run_gate(status)
+
+    assert result.returncode == 1, f"status {status} did not fail the job"
+    assert "NOT verified" in result.stdout
+    assert "::error::" in result.stderr
+
+
+def test_gate_rejects_a_missing_status():
+    """An unset status is the shape a mis-wired caller produces; it must not
+    fall through to the clean branch."""
+    result = subprocess.run(
+        ["bash", str(GATE)], capture_output=True, text=True, encoding="utf-8"
+    )
+    assert result.returncode == 1
+
+
+def test_workflow_delegates_its_outcome_to_the_tested_gate():
+    """The tests above only bind the workflow's behaviour while the workflow
+    actually calls the gate rather than re-deriving the decision inline."""
     text = WORKFLOW.read_text(encoding="utf-8")
-    assert 'status" -eq 2' in text
-    assert "queue was NOT verified" in text
+    assert "scripts/ci/pr_merge_order_gate.sh" in text
+    assert GATE.is_file()
 
 
 def test_sweep_is_pinned_to_the_fork_queue():
     """Upstream carries tens of thousands of open PRs; an all-pairs sweep there
     is meaningless for this repository and enormously expensive."""
     assert "github.repository == 'pai-scaffolde/hermes-agent'" in WORKFLOW.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# cumulative replay — "every pair is clean" is not "this order lands"
+# ---------------------------------------------------------------------------
+
+
+def test_replay_confirms_a_genuinely_landable_sequence(tmp_path: Path):
+    """Negative control for the replay: three non-overlapping edits do land in
+    sequence, and the replay must not invent a collision."""
+    repo = base_repo(tmp_path)
+    main = git(repo, "rev-parse", "main").stdout.strip()
+    branch_from(repo, "one", main, BASE_FILE, edited(0, "ONE"), "one")
+    branch_from(repo, "two", main, BASE_FILE, edited(2, "TWO"), "two")
+    branch_from(repo, "three", main, BASE_FILE, edited(4, "THREE"), "three")
+
+    suite = pmo.GitProbeSuite(repo, "main")
+    culprit = suite.replay([pr(1, "one"), pr(2, "two"), pr(3, "three")])
+
+    assert culprit is None
+
+
+def test_replay_names_the_pr_that_cannot_land_on_the_accumulated_result(tmp_path: Path):
+    """Positive control: a PR that collides with what is already landed is
+    named, so the order can be recomputed without it."""
+    repo = base_repo(tmp_path)
+    main = git(repo, "rev-parse", "main").stdout.strip()
+    branch_from(repo, "one", main, BASE_FILE, edited(0, "ONE"), "one")
+    branch_from(repo, "clash", main, BASE_FILE, edited(0, "CLASH"), "clash")
+
+    suite = pmo.GitProbeSuite(repo, "main")
+    culprit = suite.replay([pr(1, "one"), pr(2, "clash")])
+
+    assert culprit == 2, "the second PR is the one that fails against the accumulation"
+
+
+def test_a_sequence_only_the_replay_can_reject_is_held_back():
+    """Wiring test with an injected replay, independent of git's own merge
+    behaviour: when the replay rejects a PR that every PAIR probe called clean,
+    that PR must leave merge_order rather than be reported as landable.
+
+    Git merges are not associative in general, so a pairwise-clean order is a
+    hypothesis; the replay is what measures the claim the report actually
+    makes. A replay rejection is never a false positive: it is a conflict
+    observed on the real landing sequence.
+    """
+    prs = [_pr(1), _pr(2), _pr(3)]
+
+    report = pmo.compute_merge_order(
+        prs,
+        lambda a, b: pmo.ProbeVerdict(False),          # every pair is clean
+        lambda a, b: False,
+        preflight=lambda p: pmo.ProbeVerdict(False),
+        replay=lambda seq: 3 if any(p.number == 3 for p in seq) else None,
+    )
+
+    assert 3 not in report.merge_order, "the replay's rejection was ignored"
+    assert 3 in report.blocked
+    assert set(report.merge_order) == {1, 2}, "the rest still has a viable order"
+    assert any("pairwise-clean is not sequence-clean" in e for e in report.errors)
+    assert pmo.exit_code_for(report) == pmo.EXIT_NO_ORDER
+
+
+def test_replay_rejection_does_not_loop_forever():
+    """The bounded re-search must terminate even when the replay rejects
+    whatever it is handed."""
+    report = pmo.compute_merge_order(
+        [_pr(1), _pr(2), _pr(3)],
+        lambda a, b: pmo.ProbeVerdict(False),
+        lambda a, b: False,
+        preflight=lambda p: pmo.ProbeVerdict(False),
+        replay=lambda seq: seq[-1].number,  # always rejects
+    )
+
+    assert report.merge_order in ([], [1]), report.merge_order
+    assert pmo.exit_code_for(report) == pmo.EXIT_NO_ORDER
+
+
+# ---------------------------------------------------------------------------
+# probe identity — commit-tree needs an author on a fresh CI checkout
+# ---------------------------------------------------------------------------
+
+
+def test_probe_commits_carry_an_explicit_identity(tmp_path: Path):
+    """``git commit-tree`` exits 128 "Author identity unknown" when it cannot
+    derive an identity, which is the state actions/checkout leaves behind. Every
+    pair probe would then raise, and — before the exit contract gained teeth —
+    the sweep reported a landable queue having merged nothing."""
+    repo = base_repo(tmp_path)
+    main = git(repo, "rev-parse", "main").stdout.strip()
+    branch_from(repo, "one", main, BASE_FILE, edited(0, "ONE"), "one")
+
+    # Strip the identity this repo's fixture configured, leaving the CI shape.
+    git(repo, "config", "--unset", "user.email")
+    git(repo, "config", "--unset", "user.name")
+
+    suite = pmo.GitProbeSuite(repo, "main")
+    landed = suite._land(pr(1, "one"))
+
+    assert landed, "no probe commit was synthesized"
+    author = git(repo, "show", "-s", "--format=%an <%ae>", landed).stdout.strip()
+    assert author == "pr-merge-order <pr-merge-order@invalid>"
+
+
+# ---------------------------------------------------------------------------
+# exit contract — a sweep that measured nothing must not read as a clean one
+# ---------------------------------------------------------------------------
+
+
+def _pr(number: int, base: str = "main") -> "pmo.PullRequest":
+    return pmo.PullRequest(
+        number=number, head_ref=f"r/{number}", base_ref=base, title=f"pr {number}"
+    )
+
+
+def test_total_verification_failure_is_not_exit_zero():
+    """The regression this contract exists for. On a fresh checkout that could
+    not synthesize probe commits, EVERY probe raised, so no PR got a verdict --
+    and the old expression (mutual_conflicts or diverged) still returned 0,
+    announcing a landable queue on zero measurements."""
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("Author identity unknown (clean CI checkout)")
+
+    report = pmo.compute_merge_order(
+        [_pr(1), _pr(2), _pr(3)], boom, lambda a, b: False, preflight=boom
+    )
+
+    assert report.unverified == [1, 2, 3]
+    assert report.merge_order == []
+    assert not report.mutual_conflicts, "no collision was ever measured"
+    assert pmo.exit_code_for(report) == pmo.EXIT_UNVERIFIED
+
+
+def test_fully_verified_clean_queue_is_exit_zero():
+    """The paired negative control: the same shape, but with real verdicts."""
+    report = pmo.compute_merge_order(
+        [_pr(1), _pr(2)],
+        lambda a, b: pmo.ProbeVerdict(False),
+        lambda a, b: False,
+        preflight=lambda pr: pmo.ProbeVerdict(False),
+    )
+
+    assert report.unverified == []
+    assert set(report.merge_order) == {1, 2}
+    assert pmo.exit_code_for(report) == pmo.EXIT_LANDABLE
+
+
+def test_measured_collision_is_exit_one_not_two():
+    """A real mutual conflict is a verdict, not a verification failure: the
+    queue was fully measured and the answer is "no order exists"."""
+    report = pmo.compute_merge_order(
+        [_pr(1), _pr(2)],
+        lambda a, b: pmo.ProbeVerdict(True, ("shared.txt",)),
+        lambda a, b: False,
+        preflight=lambda pr: pmo.ProbeVerdict(False),
+    )
+
+    assert report.mutual_conflicts
+    assert report.unverified == []
+    assert pmo.exit_code_for(report) == pmo.EXIT_NO_ORDER
+
+
+def test_a_diverged_stack_that_sequences_cleanly_is_not_a_failure():
+    """Divergence alone used to force exit 1 even when the sibling probes had
+    produced a complete clean order. Divergence is a reason to PROBE, not a
+    verdict of its own."""
+    report = pmo.compute_merge_order(
+        [_pr(1), pmo.PullRequest(number=2, head_ref="r/2", base_ref="r/1", title="two")],
+        lambda a, b: pmo.ProbeVerdict(False),
+        lambda a, b: False,  # ancestry refuses to confirm the declared link
+        preflight=lambda pr: pmo.ProbeVerdict(False),
+    )
+
+    assert report.diverged, "the declared stack link was not confirmed"
+    assert set(report.merge_order) == {1, 2}
+    assert pmo.exit_code_for(report) == pmo.EXIT_LANDABLE
+
+
+# ---------------------------------------------------------------------------
+# coverage of the queue itself
+# ---------------------------------------------------------------------------
+
+
+def test_a_truncated_queue_is_refused_rather_than_answered(monkeypatch, tmp_path: Path):
+    """``--limit`` is a maximum and gh truncates silently. A sweep that saw part
+    of the queue has not verified the queue: a collision involving an omitted PR
+    would otherwise read as a clean, landable verdict."""
+    payload = [
+        {"number": n, "headRefName": f"b{n}", "baseRefName": "main",
+         "title": "t", "isDraft": False, "isCrossRepository": False}
+        for n in range(1, 4)
+    ]
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(pmo.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="truncated"):
+        pmo.fetch_open_pull_requests(tmp_path, "owner/repo", limit=3)
+
+
+def test_a_queue_under_the_limit_is_answered_normally(monkeypatch, tmp_path: Path):
+    """Paired negative control: the guard must not fire on a healthy queue."""
+    payload = [
+        {"number": n, "headRefName": f"b{n}", "baseRefName": "main",
+         "title": "t", "isDraft": False, "isCrossRepository": False}
+        for n in range(1, 4)
+    ]
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(pmo.subprocess, "run", fake_run)
+
+    prs = pmo.fetch_open_pull_requests(tmp_path, "owner/repo", limit=100)
+
+    assert [p.number for p in prs] == [1, 2, 3]
+
+
+def test_blocked_state_propagates_across_every_ancestry_parent():
+    """A head that merged two feature branches contains two open PRs, but the
+    scalar ``stacked_on`` chain remembers only the last one written. Propagating
+    along that chain alone let the descendant reach merge_order still carrying
+    the forgotten ancestor's unmergeable commits."""
+    parents = {3: {1, 2}, 4: {3}}
+
+    assert pmo.ancestor_closure(3, parents) == {1, 2}
+    assert pmo.ancestor_closure(4, parents) == {1, 2, 3}
+
+
+def test_ancestor_closure_is_cycle_safe():
+    assert pmo.ancestor_closure(1, {1: {2}, 2: {1}}) == {2}
+
+
+def test_probe_refs_are_pruned_even_when_the_queue_empties(tmp_path: Path, monkeypatch, capsys):
+    """When the last open PR closes, the early return used to skip pruning,
+    leaving every ref an earlier run created — so the cleanup meant to bound
+    disk growth stopped running exactly when it had the most to collect."""
+    repo = base_repo(tmp_path)
+    head = git(repo, "rev-parse", "main").stdout.strip()
+    git(repo, "update-ref", "refs/pr-merge-order/8", head)
+
+    monkeypatch.setattr(pmo, "REPO_ROOT", repo)
+    monkeypatch.setattr(pmo, "resolve_repo_slug", lambda *a, **k: "owner/repo")
+    monkeypatch.setattr(pmo, "fetch_open_pull_requests", lambda *a, **k: [])
+
+    assert pmo.main([]) == pmo.EXIT_LANDABLE
+    capsys.readouterr()
+
+    assert git(repo, "rev-parse", "--verify", "refs/pr-merge-order/8", check=False).returncode != 0
 
 
 def test_parse_merge_tree_output_separates_paths_from_prose():

@@ -36,7 +36,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Checkout with full history
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           # merge-base/merge-tree need real history. A shallow clone makes every
           # ancestry answer wrong, which would silently disable the stack
@@ -54,27 +54,24 @@ jobs:
             | tee merge-order-report.txt || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
 
+          # The status -> outcome decision lives in a script so it can be
+          # executed by the test suite. Only 0 and 1 are verdicts; the gate
+          # rejects every other status (2 = unverified, 127 = no interpreter,
+          # 137 = killed) rather than letting it read as a clean queue.
+          gate_status=0
+          verdict=$(bash scripts/ci/pr_merge_order_gate.sh "$status") || gate_status=$?
+
           {
             echo "## PR merge-order sweep"
             echo
-            if [ "$status" -eq 0 ]; then
-              echo "The queue has a landable order."
-            else
-              echo "**The queue cannot land as it stands.** See the collisions below."
-            fi
+            echo "$verdict"
             echo
             echo '```'
             cat merge-order-report.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Exit 2 means the sweep could not run at all — a broken detector is
-          # not a clean queue, and it must fail loudly rather than pass by
-          # having examined nothing.
-          if [ "$status" -eq 2 ]; then
-            echo "::error::pr-merge-order could not complete; the queue was NOT verified"
-            exit 1
-          fi
+          exit "$gate_status"
 
       - name: Open or update the collision issue
         if: steps.sweep.outputs.status == '1'
