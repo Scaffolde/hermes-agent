@@ -252,6 +252,14 @@ respawned automatically on the next relevant file operation. Set
 `idle_timeout: 0` to disable reaping and hold every server's index warm
 for the life of the process.
 
+Write that `0` as a number, not as `off`. YAML resolves `off`/`no` to a
+boolean, and a boolean is rejected rather than read as `0` — both knobs
+fall back to their default instead, and log a warning naming the value
+that was not usable. The same goes
+for `on`/`yes`, and for a negative or non-finite value such as `.nan` or
+`.inf`: none of them is a duration or a count anyone can have meant, so
+none of them is allowed to quietly disarm the reaper or pin the fleet.
+
 Idle reaping bounds how *long* a server lives; `lsp.max_clients` bounds
 how *many* run at once. The two are independent, and only the second one
 helps when a session touches many worktrees in quick succession — every
