@@ -246,6 +246,53 @@ def resolve_max_clients(raw: Any) -> int:
     return max(MIN_CLIENT_CAP, min(MAX_CLIENT_CAP, int(parsed)))
 
 
+def resolve_idle_timeout(raw: Any, *, clamp_floor: bool = True) -> float:
+    """Turn a configured ``lsp.idle_timeout`` into an enforceable timeout.
+
+    The sibling of :func:`resolve_max_clients`, and deliberately shaped
+    like it: these are the two knobs that bound the fleet — one by
+    population, one by lifetime — and parsing them differently is how
+    the lifetime bound ended up with no guard at all.
+
+    ``0`` is the documented off switch and is honoured.  Anything else
+    unusable — a negative, a string, ``.nan``/``.inf`` (both valid YAML
+    that survive ``float()`` without raising) — falls back to the
+    default, because garbage must not silently switch idle reaping off.
+
+    Non-finite input is the case worth naming: ``nan`` fails the
+    ``_idle_timeout > 0`` start gate so the reaper never runs, and
+    ``inf`` passes it but yields a ``-inf`` reap cutoff, so the reaper
+    runs and reaps nothing.  Both read as "reaper on" to an operator.
+
+    ``clamp_floor`` separates the two responsibilities this function
+    carries, because they have different scopes:
+
+    * Rejecting unusable input is a safety invariant and applies
+      everywhere, including direct construction.
+    * The ``MIN_IDLE_TIMEOUT`` floor is *config hygiene* — it protects
+      an operator from a foot-gun in ``config.yaml``.  In-process
+      callers legitimately pass a sub-floor timeout to drive the reaper
+      loop deterministically, so the floor stays off that path.
+    """
+    if raw is None:
+        return float(DEFAULT_IDLE_TIMEOUT)
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return float(DEFAULT_IDLE_TIMEOUT)
+    if not math.isfinite(parsed) or parsed < 0:
+        return float(DEFAULT_IDLE_TIMEOUT)
+    if parsed == 0:
+        # Explicitly disables the reaper; the count/byte cap still binds.
+        return 0.0
+    if not clamp_floor:
+        return parsed
+    # Below the per-operation wait budget a client can be reaped
+    # mid-flight, and the resulting outer timeout marks the
+    # (server, workspace) pair broken for the process lifetime.
+    return max(float(MIN_IDLE_TIMEOUT), parsed)
+
+
 def _log_cap_enforcement_result(fut: Future) -> None:
     """Drain a fire-and-forget cap sweep so its failure is not silent.
 
@@ -418,7 +465,11 @@ class LSPService:
         self._env_overrides = env_overrides or {}
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
-        self._idle_timeout = idle_timeout
+        # Both bounds are resolved HERE rather than at their call sites,
+        # so a non-config caller cannot reintroduce an unusable value.
+        # The config-hygiene floor is deliberately NOT applied here --
+        # see ``resolve_idle_timeout``.
+        self._idle_timeout = resolve_idle_timeout(idle_timeout, clamp_floor=False)
         self._max_clients = resolve_max_clients(max_clients)
         # The byte half of the bound.  ``None`` on a host whose memory
         # cannot be read, where the count cap is the only bound available.
@@ -498,24 +549,24 @@ class LSPService:
         wait_mode = lsp_cfg.get("wait_mode", "document")
         wait_timeout = float(lsp_cfg.get("wait_timeout", DIAGNOSTICS_DOCUMENT_WAIT))
         install_strategy = lsp_cfg.get("install_strategy", "auto")
-        try:
-            idle_timeout = float(lsp_cfg.get("idle_timeout", DEFAULT_IDLE_TIMEOUT))
-        except (TypeError, ValueError):
-            idle_timeout = DEFAULT_IDLE_TIMEOUT
-        if 0 < idle_timeout < MIN_IDLE_TIMEOUT:
-            # A timeout below the per-operation wait budget could reap a
-            # client mid-flight; the resulting outer timeout would then
-            # mark the (server, workspace) pair broken for the process
-            # lifetime.  Clamp to a safe floor (0 still disables).
-            idle_timeout = MIN_IDLE_TIMEOUT
+        raw_idle_timeout = lsp_cfg.get("idle_timeout")
+        idle_timeout = resolve_idle_timeout(raw_idle_timeout)
+        if raw_idle_timeout is not None and idle_timeout != raw_idle_timeout:
+            # WARNING, not debug: the operator asked for a bound and did
+            # not get it, and the reaper reports itself as on either way.
+            logger.warning(
+                "lsp.idle_timeout=%r is unusable; using %gs",
+                raw_idle_timeout,
+                idle_timeout,
+            )
         # Omitted (or unusable) derives the cap from host memory rather
         # than pinning a constant: a 64 GiB CI box and a 16 GiB laptop
         # cannot afford the same number of language servers.
         raw_max_clients = lsp_cfg.get("max_clients")
         max_clients = resolve_max_clients(raw_max_clients)
         if raw_max_clients is not None and max_clients != raw_max_clients:
-            logger.debug(
-                "lsp.max_clients=%r resolved to %d",
+            logger.warning(
+                "lsp.max_clients=%r is unusable; using %d",
                 raw_max_clients,
                 max_clients,
             )
@@ -1380,6 +1431,7 @@ class LSPService:
 
     def get_status(self) -> Dict[str, Any]:
         """Return a snapshot of the service for the CLI status command."""
+        now = _idle_clock()
         with self._state_lock:
             clients = [
                 {
@@ -1387,6 +1439,12 @@ class LSPService:
                     "workspace_root": k[1],
                     "state": c.state,
                     "running": c.is_running,
+                    # How close this client is to being reaped, and why
+                    # it might not be: an in-flight request holds it.
+                    "idle_seconds": (
+                        None if k not in self._last_used else now - self._last_used[k]
+                    ),
+                    "inflight": self._inflight.get(k, 0),
                 }
                 for k, c in self._clients.items()
             ]
@@ -1396,6 +1454,10 @@ class LSPService:
             "wait_mode": self._wait_mode,
             "wait_timeout": self._wait_timeout,
             "install_strategy": self._install_strategy,
+            # The bounds actually in force after resolution -- this is
+            # how an operator audits them without reading source.
+            "max_clients": self._max_clients,
+            "idle_timeout": self._idle_timeout,
             "clients": clients,
             "broken": broken,
             "disabled_servers": sorted(self._disabled_servers),

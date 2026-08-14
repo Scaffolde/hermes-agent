@@ -122,12 +122,22 @@ def _cmd_status(emit_json: bool) -> int:
         out.append(f"  wait_mode:       {info.get('wait_mode')}")
         out.append(f"  wait_timeout:    {info.get('wait_timeout')}s")
         out.append(f"  install_strategy:{info.get('install_strategy')}")
+        out.append(f"  max_clients:     {info.get('max_clients')}")
+        idle = info.get("idle_timeout")
+        out.append(
+            f"  idle_timeout:    {idle}s"
+            + ("  (reaper disabled)" if idle == 0 else "")
+        )
         clients = info.get("clients") or []
         if clients:
             out.append(f"  active clients:  {len(clients)}")
             for c in clients:
+                idle_s = c.get("idle_seconds")
+                idle_txt = "never used" if idle_s is None else f"idle={idle_s:.0f}s"
                 out.append(
-                    f"    - {c['server_id']:20s} state={c['state']:10s} root={c['workspace_root']}"
+                    f"    - {c['server_id']:20s} state={c['state']:10s} "
+                    f"{idle_txt} inflight={c.get('inflight', 0)} "
+                    f"root={c['workspace_root']}"
                 )
         else:
             out.append("  active clients:  none")
