@@ -88,6 +88,12 @@ SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
 # shutdown path there stays on the single-PID calls it has always used.
 _HAS_PROCESS_GROUPS = hasattr(os, "killpg") and hasattr(os, "getpgid")
 
+# Windows has no SIGKILL at all -- referencing it raises AttributeError --
+# and SIGTERM is the strongest signal available there.  ``proc.kill()`` on
+# Windows is itself an alias for ``terminate()``, so collapsing the two is
+# exactly what the platform already does.
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
 # Retry policy for transient ContentModified errors.
 MAX_CONTENT_MODIFIED_RETRIES = 3
 RETRY_BASE_DELAY = 0.5  # 0.5, 1.0, 2.0 — exponential
@@ -503,7 +509,7 @@ class LSPClient:
                     await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
                 except asyncio.TimeoutError:
                     try:
-                        self._signal_process(proc, signal.SIGKILL)
+                        self._signal_process(proc, _SIGKILL)
                         await proc.wait()
                     except ProcessLookupError:
                         pass
@@ -533,9 +539,11 @@ class LSPClient:
         signalled (Windows has no process groups; ``proc.kill()`` there
         keeps the previous behaviour).
         """
+        def _signal_pid_only() -> None:
+            (proc.kill if sig == _SIGKILL else proc.terminate)()
+
         if not _HAS_PROCESS_GROUPS:
-            _single = proc.kill if sig == signal.SIGKILL else proc.terminate
-            _single()
+            _signal_pid_only()
             return
         try:
             pgid = os.getpgid(proc.pid)
@@ -546,16 +554,14 @@ class LSPClient:
         # Never signal our own group: if the spawn silently lost its new
         # session we would take down the gateway and every sibling server.
         if pgid is None or pgid == os.getpgrp():
-            _single = proc.kill if sig == signal.SIGKILL else proc.terminate
-            _single()
+            _signal_pid_only()
             return
         try:
-            os.killpg(pgid, sig)
+            os.killpg(pgid, sig)  # windows-footgun: ok — gated on _HAS_PROCESS_GROUPS
         except ProcessLookupError:
             raise
         except OSError:
-            _single = proc.kill if sig == signal.SIGKILL else proc.terminate
-            _single()
+            _signal_pid_only()
 
     # ------------------------------------------------------------------
     # request / notification plumbing
