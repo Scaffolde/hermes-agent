@@ -6044,30 +6044,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # in state_meta so it only actually executes once per
         # sessions.min_interval_hours.  Gateway is long-lived so blocking
         # a few seconds once per day is acceptable; failures are logged
-        # but never raised.
-        if self._session_db is not None:
-            try:
-                from hermes_cli.config import load_config as _load_full_config
-                _sess_cfg = (_load_full_config().get("sessions") or {})
-                # Non-destructive stale-session archive, independent of prune.
-                if _sess_cfg.get("auto_archive", False):
-                    self._session_db._db.maybe_auto_archive(
-                        idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
-                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
-                    )
-                if _sess_cfg.get("auto_prune", False):
-                    # Construction-time, before the loop serves traffic; sync DB is fine.
-                    self._session_db._db.maybe_auto_prune_and_vacuum(
-                        retention_days=int(_sess_cfg.get("retention_days", 90)),
-                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
-                        min_vacuum_interval_days=int(
-                            _sess_cfg.get("min_vacuum_interval_days", 30)
-                        ),
-                        vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
-                        sessions_dir=self.config.sessions_dir,
-                    )
-            except Exception as exc:
-                logger.debug("state.db auto-maintenance skipped: %s", exc)
+        # but never raised.  This construction-time pass covers startup;
+        # the supervised _state_db_maintenance_watcher (spawned in start())
+        # re-runs the same self-throttled sweep periodically so a gateway
+        # that stays up for weeks keeps pruning instead of only doing so
+        # on its next restart (2026-08-15 disk-pressure incident:
+        # state.db reached 3GB because maintenance only ever ran at
+        # process startup).
+        self._run_state_db_maintenance_once()
 
         # Opportunistic shadow-repo cleanup — deletes stale checkpoint repos
         # under ~/.hermes/checkpoints/.  Opt-in via checkpoints.auto_prune,
@@ -11440,6 +11424,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # engages drain on the first tick.
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
 
+        # Periodic state.db retention sweep (heartbeat cadence). Construction
+        # already ran one pass; this keeps a weeks-resident gateway pruning
+        # on schedule instead of only at its next restart. Config-gated
+        # inside the sweep itself (sessions.auto_prune / auto_archive), and
+        # self-throttled via state_meta, so the watcher is a cheap no-op
+        # when maintenance is disabled or not yet due.
+        self._spawn_supervised(
+            self._state_db_maintenance_watcher, "state_db_maintenance_watcher"
+        )
+
         logger.info("Press Ctrl+C to stop")
         
         return True
@@ -11548,6 +11542,79 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         task.add_done_callback(_done)
         return task
+
+    # Tick interval for the state.db maintenance watcher. The tick itself is
+    # deliberately much shorter than the maintenance cadence: every tick
+    # delegates to the SessionDB ``maybe_*`` helpers, which self-throttle via
+    # ``state_meta`` last-run markers (``sessions.min_interval_hours``,
+    # default 24h; VACUUM additionally via ``min_vacuum_interval_days``), so
+    # an hourly tick is a cheap point-read almost every time and the actual
+    # prune/VACUUM runs at most once per configured interval — shared across
+    # every hermes process, not just this gateway.
+    _STATE_DB_MAINTENANCE_TICK_SECS: float = 3600.0
+
+    def _run_state_db_maintenance_once(self) -> None:
+        """One opportunistic state.db auto-maintenance pass. Never raises.
+
+        Row-level retention for ~/.hermes/state.db: archives stale sessions
+        (``sessions.auto_archive``) and prunes ended sessions inactive for
+        ``sessions.retention_days``, deleting their ``messages`` rows and
+        unreferenced ``system_prompts`` and following up with a throttled
+        VACUUM (``sessions.vacuum_after_prune`` /
+        ``min_vacuum_interval_days``) so SQLite actually returns the freed
+        pages.  Both sweeps are opt-in via config and self-throttled inside
+        SessionDB, so calling this repeatedly is safe and cheap.
+
+        Config is re-read on every call so an operator can flip
+        ``sessions.auto_prune`` on a long-lived gateway without restarting
+        it — the next watcher tick picks the change up.
+        """
+        if self._session_db is None:
+            return
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            _sess_cfg = (_load_full_config().get("sessions") or {})
+            # Non-destructive stale-session archive, independent of prune.
+            if _sess_cfg.get("auto_archive", False):
+                self._session_db._db.maybe_auto_archive(
+                    idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
+                    min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                )
+            if _sess_cfg.get("auto_prune", False):
+                self._session_db._db.maybe_auto_prune_and_vacuum(
+                    retention_days=int(_sess_cfg.get("retention_days", 90)),
+                    min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                    min_vacuum_interval_days=int(
+                        _sess_cfg.get("min_vacuum_interval_days", 30)
+                    ),
+                    vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
+                    sessions_dir=self.config.sessions_dir,
+                )
+        except Exception as exc:
+            logger.debug("state.db auto-maintenance skipped: %s", exc)
+
+    async def _state_db_maintenance_watcher(self) -> None:
+        """Periodic state.db retention sweep for long-lived gateways.
+
+        The construction-time maintenance pass only covers process startup.
+        A gateway that stays resident for weeks (launchd/systemd daemon)
+        otherwise never prunes again, so state.db grows without bound even
+        with ``sessions.auto_prune`` enabled — the 2026-08-15 disk-pressure
+        incident found a 3GB state.db of ~97% real rows on exactly that
+        profile.  This watcher is the heartbeat cadence: it re-runs the
+        same sweep every ``_STATE_DB_MAINTENANCE_TICK_SECS``, and the
+        SessionDB ``maybe_*`` helpers' state_meta throttles keep the real
+        work at once per ``sessions.min_interval_hours``.
+
+        The sweep runs in a worker thread (``asyncio.to_thread``): the
+        prune takes SessionDB's write lock and a due VACUUM can hold it for
+        seconds per 100MB, which must not stall the event loop.
+        """
+        while self._running:
+            await asyncio.sleep(self._STATE_DB_MAINTENANCE_TICK_SECS)
+            if not self._running:
+                return
+            await asyncio.to_thread(self._run_state_db_maintenance_once)
 
     async def _handoff_watcher(self, interval: float = 2.0) -> None:
         """Background task that processes pending CLI→gateway session handoffs.
