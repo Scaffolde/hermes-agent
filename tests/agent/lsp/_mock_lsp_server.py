@@ -80,24 +80,32 @@ def _spawn_grandchild():
     """
     import subprocess
 
+    # The worker publishes its OWN pid, and only after SIG_IGN is armed.
+    # Writing it here (right after Popen returns) would race: shutdown could
+    # win, the still-default SIGTERM would kill the worker, and the test
+    # would pass without ever exercising the SIGKILL escalation it exists
+    # to prove.  The rename is atomic, so the reader never sees a partial
+    # write and never has to retry a half-written pid.
     worker = subprocess.Popen(
         [
             sys.executable,
             "-c",
-            "import signal,time\n"
+            "import os,signal,time\n"
             "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "pf = os.environ.get('MOCK_LSP_CHILD_PIDFILE')\n"
+            "if pf:\n"
+            "    tmp = pf + '.tmp'\n"
+            "    with open(tmp, 'w', encoding='utf-8') as fh:\n"
+            "        fh.write(str(os.getpid()))\n"
+            "        fh.flush()\n"
+            "        os.fsync(fh.fileno())\n"
+            "    os.replace(tmp, pf)\n"
             "while True: time.sleep(0.05)\n",
         ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    pidfile = os.environ.get("MOCK_LSP_CHILD_PIDFILE")
-    if pidfile:
-        with open(pidfile, "w") as fh:
-            fh.write(str(worker.pid))
-            fh.flush()
-            os.fsync(fh.fileno())
     return worker
 
 

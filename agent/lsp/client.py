@@ -82,6 +82,7 @@ DIAGNOSTICS_FULL_WAIT = 10.0
 DIAGNOSTICS_REQUEST_TIMEOUT = 3.0
 PUSH_DEBOUNCE = 0.15
 SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
+GROUP_REAP_POLL = 0.02  # seconds between process-group liveness probes
 
 # POSIX process groups let us reap a language server together with the
 # workers it supervises.  Windows has no equivalent primitive, so the
@@ -97,6 +98,28 @@ _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 # Retry policy for transient ContentModified errors.
 MAX_CONTENT_MODIFIED_RETRIES = 3
 RETRY_BASE_DELAY = 0.5  # 0.5, 1.0, 2.0 — exponential
+
+
+def _group_alive(pgid: Optional[int]) -> bool:
+    """True while any process still sits in ``pgid``.
+
+    Signal 0 performs the permission and existence checks without
+    delivering anything, so this is the cheapest honest probe of whether
+    the workers we are trying to reap are still resident.
+    """
+    if pgid is None or not _HAS_PROCESS_GROUPS:
+        return False
+    try:
+        os.killpg(pgid, 0)  # windows-footgun: ok — gated on _HAS_PROCESS_GROUPS
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Someone in the group outlived us and changed credentials; it is
+        # still resident, which is what the caller is asking about.
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def file_uri(path: str) -> str:
@@ -217,6 +240,10 @@ class LSPClient:
 
         # Process + streams
         self._proc: Optional[asyncio.subprocess.Process] = None
+        # Captured at spawn, not at cleanup: a cooperative server may have
+        # already exited by the time we tear down, and ``os.getpgid`` on a
+        # reaped PID raises -- which would strand its workers unaddressable.
+        self._pgid: Optional[int] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._reader_task: Optional[asyncio.Task] = None
 
@@ -338,6 +365,25 @@ class LSPClient:
             raise LSPProtocolError(
                 f"LSP server binary not found: {cmd[0]} ({e})"
             ) from e
+
+        # Resolve the group NOW, while the leader is guaranteed alive.
+        # start_new_session=True makes this server its own group leader, so
+        # the group holds it and its workers and nothing else.  Reading it
+        # at cleanup instead would raise once a cooperative server has
+        # already exited on our `exit` notification, and the workers that
+        # outlive it -- the ones actually holding the memory -- would never
+        # be signalled.
+        self._pgid = None
+        if _HAS_PROCESS_GROUPS:
+            try:
+                pgid = os.getpgid(self._proc.pid)
+            except OSError:
+                pgid = None
+            # Never retain our own group: if the spawn silently lost its new
+            # session, group-directed signals would take down the gateway
+            # and every sibling server.
+            if pgid is not None and pgid != os.getpgrp():
+                self._pgid = pgid
 
         # Drain stderr at debug level — if we don't, the pipe buffer
         # fills and the server hangs.
@@ -499,24 +545,76 @@ class LSPClient:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         proc = self._proc
+        pgid = self._pgid
         self._proc = None
+        self._pgid = None
         if proc is None:
             return
-        if proc.returncode is None:
+
+        # One budget for the whole teardown, not one per wait: a slow victim
+        # must not cost the caller two graces (SCA-4628).
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SHUTDOWN_GRACE
+
+        if proc.returncode is None or _group_alive(pgid):
+            # The `or` matters: a cooperative supervisor can exit on our
+            # `exit` notification while its workers keep running, and those
+            # workers have not been asked to stop yet.
             try:
-                self._signal_process(proc, signal.SIGTERM)
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
-                except asyncio.TimeoutError:
-                    try:
-                        self._signal_process(proc, _SIGKILL)
-                        await proc.wait()
-                    except ProcessLookupError:
-                        pass
+                self._signal_process(proc, signal.SIGTERM, pgid)
             except ProcessLookupError:
                 pass
 
-    def _signal_process(self, proc, sig: int) -> None:
+        if proc.returncode is None:
+            try:
+                await asyncio.wait_for(
+                    proc.wait(), timeout=max(0.0, deadline - loop.time())
+                )
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
+
+        # `proc.wait()` observes the *supervisor* alone.  When a worker
+        # ignores SIGTERM but its supervisor honours it, that wait returns
+        # immediately, the timeout never fires, and a PID-shaped teardown
+        # would skip the SIGKILL that reaps the worker -- the exact leak
+        # this path exists to close.  Escalate on the group instead.
+        await self._reap_group(proc, pgid, deadline)
+
+    async def _reap_group(
+        self,
+        proc,
+        pgid: Optional[int],
+        deadline: float,
+    ) -> None:
+        """Wait out the grace on the *group*, then SIGKILL what remains."""
+        loop = asyncio.get_running_loop()
+
+        if pgid is None:
+            # No group to reap (Windows, or a spawn that lost its session).
+            # Keep the previous single-PID escalation.
+            if proc.returncode is None:
+                try:
+                    self._signal_process(proc, _SIGKILL, None)
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+            return
+
+        while _group_alive(pgid):
+            if loop.time() >= deadline:
+                try:
+                    os.killpg(pgid, _SIGKILL)  # windows-footgun: ok — pgid is None off POSIX
+                except OSError:
+                    pass
+                if proc.returncode is None:
+                    try:
+                        await proc.wait()
+                    except ProcessLookupError:
+                        pass
+                return
+            await asyncio.sleep(GROUP_REAP_POLL)
+
+    def _signal_process(self, proc, sig: int, pgid: Optional[int] = None) -> None:
         """Signal the server *and its workers*, not just the supervisor PID.
 
         Real language servers are supervisors: ``typescript-language-server``
@@ -535,31 +633,29 @@ class LSPClient:
         reparenting, so a worker whose supervisor already exited is still
         reached -- which a PPID-based tree walk would miss.
 
-        Falls back to the single PID when the group cannot be resolved or
-        signalled (Windows has no process groups; ``proc.kill()`` there
-        keeps the previous behaviour).
+        ``pgid`` is the group captured at spawn time.  It is passed in
+        rather than resolved here because ``os.getpgid(proc.pid)`` raises
+        once the supervisor has been reaped -- precisely the case where
+        the surviving workers still need the signal.
+
+        Falls back to the single PID when no group was captured (Windows
+        has no process groups; ``proc.kill()`` there keeps the previous
+        behaviour).
         """
         def _signal_pid_only() -> None:
             (proc.kill if sig == _SIGKILL else proc.terminate)()
 
-        if not _HAS_PROCESS_GROUPS:
-            _signal_pid_only()
-            return
-        try:
-            pgid = os.getpgid(proc.pid)
-        except ProcessLookupError:
-            raise
-        except OSError:
-            pgid = None
-        # Never signal our own group: if the spawn silently lost its new
-        # session we would take down the gateway and every sibling server.
-        if pgid is None or pgid == os.getpgrp():
+        if not _HAS_PROCESS_GROUPS or pgid is None:
             _signal_pid_only()
             return
         try:
             os.killpg(pgid, sig)  # windows-footgun: ok — gated on _HAS_PROCESS_GROUPS
         except ProcessLookupError:
-            raise
+            # The whole group is gone.  If the supervisor handle still
+            # shows it running, fall through to the PID call so the
+            # caller's own bookkeeping stays honest.
+            if proc.returncode is None:
+                _signal_pid_only()
         except OSError:
             _signal_pid_only()
 
