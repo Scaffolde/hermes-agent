@@ -375,10 +375,16 @@ class LSPClient:
         # be signalled.
         self._pgid = None
         if _HAS_PROCESS_GROUPS:
-            try:
-                pgid = os.getpgid(self._proc.pid)
-            except OSError:
-                pgid = None
+            # A transport that exposes no pid (or a test double standing in
+            # for one) simply has no group we can address; that is a
+            # fallback to single-PID signalling, not a spawn failure.
+            pid = getattr(self._proc, "pid", None)
+            pgid = None
+            if pid is not None:
+                try:
+                    pgid = os.getpgid(pid)
+                except OSError:
+                    pgid = None
             # Never retain our own group: if the spawn silently lost its new
             # session, group-directed signals would take down the gateway
             # and every sibling server.
