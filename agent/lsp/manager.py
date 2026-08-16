@@ -1463,7 +1463,7 @@ class LSPService:
         # ``_touch`` and ``_reap_idle_once``) — these values are only
         # meaningful relative to each other, so reading a different
         # source here turns every age into the gap between two epochs.
-        now = time.time()
+        now = _idle_clock()
         with self._state_lock:
             clients = [
                 {
