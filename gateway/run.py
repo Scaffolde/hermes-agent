@@ -6044,30 +6044,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # in state_meta so it only actually executes once per
         # sessions.min_interval_hours.  Gateway is long-lived so blocking
         # a few seconds once per day is acceptable; failures are logged
-        # but never raised.
-        if self._session_db is not None:
-            try:
-                from hermes_cli.config import load_config as _load_full_config
-                _sess_cfg = (_load_full_config().get("sessions") or {})
-                # Non-destructive stale-session archive, independent of prune.
-                if _sess_cfg.get("auto_archive", False):
-                    self._session_db._db.maybe_auto_archive(
-                        idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
-                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
-                    )
-                if _sess_cfg.get("auto_prune", False):
-                    # Construction-time, before the loop serves traffic; sync DB is fine.
-                    self._session_db._db.maybe_auto_prune_and_vacuum(
-                        retention_days=int(_sess_cfg.get("retention_days", 90)),
-                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
-                        min_vacuum_interval_days=int(
-                            _sess_cfg.get("min_vacuum_interval_days", 30)
-                        ),
-                        vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
-                        sessions_dir=self.config.sessions_dir,
-                    )
-            except Exception as exc:
-                logger.debug("state.db auto-maintenance skipped: %s", exc)
+        # but never raised.  This construction-time pass covers startup (and
+        # is the only pass allowed to VACUUM — traffic is not being served
+        # yet); the hourly session-maintenance branch in
+        # _start_gateway_housekeeping re-runs the archive + prune (without
+        # VACUUM, per served profile) so a gateway that stays up for weeks
+        # keeps pruning instead of only doing so on its next restart
+        # (2026-08-15 disk-pressure incident: state.db reached 3GB because
+        # maintenance only ever ran at process startup).
+        self._run_state_db_maintenance_once()
 
         # Opportunistic shadow-repo cleanup — deletes stale checkpoint repos
         # under ~/.hermes/checkpoints/.  Opt-in via checkpoints.auto_prune,
@@ -11548,6 +11533,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         task.add_done_callback(_done)
         return task
+
+    def _run_state_db_maintenance_once(self) -> None:
+        """One opportunistic state.db auto-maintenance pass at STARTUP.
+
+        Row-level retention for ~/.hermes/state.db: archives stale sessions
+        (``sessions.auto_archive``) and prunes ended sessions inactive for
+        ``sessions.retention_days``, deleting their ``messages`` rows and
+        unreferenced ``system_prompts`` and following up with a throttled
+        VACUUM (``sessions.vacuum_after_prune`` /
+        ``min_vacuum_interval_days``) so SQLite actually returns the freed
+        pages.  Both sweeps are opt-in via config and self-throttled inside
+        SessionDB. Never raises.
+
+        This construction-time pass is the only place VACUUM may run: it
+        executes before the loop serves traffic, which is the safety window
+        ``SessionDB.vacuum()`` documents (exclusive lock for a full DB
+        rewrite — seconds per 100MB). The RECURRING cadence for long-lived
+        gateways lives in ``_start_gateway_housekeeping``'s hourly
+        session-maintenance branch, which prunes per served profile with
+        ``vacuum=False`` so a mid-traffic rewrite can never starve active
+        turns' persistence.
+        """
+        if self._session_db is None:
+            return
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            _sess_cfg = (_load_full_config().get("sessions") or {})
+            # Non-destructive stale-session archive, independent of prune.
+            if _sess_cfg.get("auto_archive", False):
+                self._session_db._db.maybe_auto_archive(
+                    idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
+                    min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                )
+            if _sess_cfg.get("auto_prune", False):
+                self._session_db._db.maybe_auto_prune_and_vacuum(
+                    retention_days=int(_sess_cfg.get("retention_days", 90)),
+                    min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                    min_vacuum_interval_days=int(
+                        _sess_cfg.get("min_vacuum_interval_days", 30)
+                    ),
+                    vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
+                    sessions_dir=self.config.sessions_dir,
+                )
+        except Exception as exc:
+            logger.debug("state.db auto-maintenance skipped: %s", exc)
 
     async def _handoff_watcher(self, interval: float = 2.0) -> None:
         """Background task that processes pending CLI→gateway session handoffs.
@@ -25859,7 +25889,10 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+def _start_gateway_housekeeping(
+    stop_event: threading.Event, adapters=None, loop=None, interval: int = 60,
+    multiplex: bool = False,
+):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -25872,6 +25905,11 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     image/audio/video/document/screenshot caches + expired ``hermes debug
     share`` pastes once per hour, and polls the curator hourly (its inner
     gate enforces the real weekly cadence).
+
+    ``multiplex`` mirrors ``gateway.multiplex_profiles``: when true, the
+    hourly session-maintenance sweep covers every served profile's
+    ``state.db`` (each under its own config/secret scope), not just the
+    process-default home.
     """
     from gateway.platforms.base import (
         cleanup_audio_cache,
@@ -25886,7 +25924,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
-    AUTO_ARCHIVE_EVERY = 60  # ticks — poll hourly (state_meta gate owns the real cadence)
+    SESSION_MAINTENANCE_EVERY = 60  # ticks — poll hourly (state_meta gate owns the real cadence)
     MEMORY_TRIM_EVERY = 1    # shared helper cooldown bounds actual allocator work
 
     # Every platform media cache prunes on the same hourly cadence — one loop
@@ -25974,27 +26012,59 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
             except Exception as e:
                 logger.debug("Org sync pull tick error: %s", e)
 
-        # Stale-session auto-archive — a live timer, so gateways that stay up
-        # for weeks keep sweeping on schedule (the startup hook fires once).
-        # maybe_auto_archive() is gated by sessions.min_interval_hours in
-        # state_meta; this is just the poll rate. Opens its own SessionDB —
-        # SQLite connections are thread-bound and this runs off-loop.
-        if tick_count % AUTO_ARCHIVE_EVERY == 0:
+        # Stale-session auto-archive + ended-session auto-prune — a live
+        # timer, so gateways that stay up for weeks keep sweeping on schedule
+        # (the startup hook fires once; the 2026-08-15 disk-pressure incident
+        # found a 3GB state.db on a weeks-resident gateway because the prune
+        # only ever ran at process startup). This is the ONE periodic
+        # scheduler for both chores — the maybe_* helpers are gated by
+        # sessions.min_interval_hours in state_meta, this is just the poll
+        # rate. Runs once per served profile so a multiplexed gateway sweeps
+        # every profiles/<name>/state.db under that profile's own config +
+        # secret scope. VACUUM is deliberately NOT run here: SessionDB.vacuum()
+        # holds an exclusive lock for a full DB rewrite and is only safe
+        # before traffic is served — the startup maintenance pass owns it.
+        # Opens its own SessionDB per profile — SQLite connections are
+        # thread-bound and this runs off-loop.
+        if tick_count % SESSION_MAINTENANCE_EVERY == 0:
             try:
                 from hermes_cli.config import load_config as _load_full_config
+                from hermes_cli.profiles import profiles_to_serve
                 from hermes_state import SessionDB
-                _sess_cfg = (_load_full_config().get("sessions") or {})
-                if _sess_cfg.get("auto_archive", False):
-                    _adb = SessionDB()
+                for _pname, _phome in profiles_to_serve(multiplex=multiplex):
                     try:
-                        _adb.maybe_auto_archive(
-                            idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
-                            min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                        with _profile_runtime_scope(Path(_phome)):
+                            _sess_cfg = (_load_full_config().get("sessions") or {})
+                            _archive_on = bool(_sess_cfg.get("auto_archive", False))
+                            _prune_on = bool(_sess_cfg.get("auto_prune", False))
+                            if not (_archive_on or _prune_on):
+                                continue
+                            _adb = SessionDB()
+                            try:
+                                if _archive_on:
+                                    _adb.maybe_auto_archive(
+                                        idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
+                                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                                    )
+                                if _prune_on:
+                                    _adb.maybe_auto_prune_and_vacuum(
+                                        retention_days=int(_sess_cfg.get("retention_days", 90)),
+                                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                                        min_vacuum_interval_days=int(
+                                            _sess_cfg.get("min_vacuum_interval_days", 30)
+                                        ),
+                                        vacuum=False,
+                                        sessions_dir=Path(_phome) / "sessions",
+                                    )
+                            finally:
+                                _adb.close()
+                    except Exception as e:
+                        logger.debug(
+                            "Session maintenance tick error (profile %s): %s",
+                            _pname, e,
                         )
-                    finally:
-                        _adb.close()
             except Exception as e:
-                logger.debug("Auto-archive tick error: %s", e)
+                logger.debug("Session maintenance tick error: %s", e)
 
         # This is the long-lived messaging-gateway counterpart to the TUI idle
         # reaper. The helper is config-gated and rate-limited, so calling it on
@@ -26657,7 +26727,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={
+            "adapters": runner.adapters,
+            "loop": asyncio.get_running_loop(),
+            "multiplex": bool(getattr(runner.config, "multiplex_profiles", False)),
+        },
         daemon=True,
         name="gateway-housekeeping",
     )
