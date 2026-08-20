@@ -1,0 +1,92 @@
+{
+  "note": "Raw readings behind LSP_SERVER_FOOTPRINT_BYTES (SCA-4688). Regenerate with scripts/measure_lsp_footprint.py.",
+  "measured_on": "2026-08-11",
+  "method": "physical footprint (vmmap --summary) summed over the spawned process subtree; peak of 3 samples after a 20s settle",
+  "runs": [
+    {
+      "server_id": "bash-language-server",
+      "workspace": "/Users/gary/Projects/hermes-worktrees/sca-4688-type-footprint",
+      "sample_file": "scripts/install.sh",
+      "pid": 85923,
+      "pids_measured": 1,
+      "status": "measured",
+      "footprint_bytes": 51485081,
+      "footprint_mib": 49.1,
+      "samples_mib": [
+        49.1,
+        49.1,
+        49.1
+      ],
+      "workspace_label": "hermes-agent"
+    },
+    {
+      "server_id": "typescript",
+      "workspace": "/Users/gary/Projects/hermes-worktrees/sca-4688-type-footprint",
+      "sample_file": "ui-tui/packages/hermes-ink/src/ink/ink.tsx",
+      "pid": 86329,
+      "pids_measured": 4,
+      "status": "measured",
+      "footprint_bytes": 524287998,
+      "footprint_mib": 500.0,
+      "samples_mib": [
+        500.0,
+        500.0,
+        500.0
+      ],
+      "workspace_label": "hermes-agent"
+    },
+    {
+      "server_id": "pyright",
+      "workspace": "/Users/gary/Projects/hermes-worktrees/sca-4688-type-footprint",
+      "sample_file": "cli.py",
+      "pid": 86787,
+      "pids_measured": 1,
+      "status": "measured",
+      "footprint_bytes": 664482611,
+      "footprint_mib": 633.7,
+      "samples_mib": [
+        633.7,
+        633.7,
+        633.7
+      ],
+      "workspace_label": "hermes-agent"
+    },
+    {
+      "server_id": "yaml-language-server",
+      "workspace": "/Users/gary/Projects/hermes-worktrees/sca-4688-type-footprint",
+      "sample_file": "locales/uk.yaml",
+      "pid": 87758,
+      "pids_measured": 1,
+      "status": "measured",
+      "footprint_bytes": 43201331,
+      "footprint_mib": 41.2,
+      "samples_mib": [
+        41.2,
+        41.2,
+        41.2
+      ],
+      "workspace_label": "hermes-agent"
+    },
+    {
+      "server_id": "typescript",
+      "workspace": "/Users/gary/Projects/scaffolde-ai",
+      "sample_file": "domains/self-improvement/Evals/EvalServer/prompt-invocation-runner.ts",
+      "pid": 89372,
+      "pids_measured": 4,
+      "status": "measured",
+      "footprint_bytes": 1770415717,
+      "footprint_mib": 1688.4,
+      "samples_mib": [
+        1688.4,
+        1688.4,
+        1688.4
+      ],
+      "workspace_label": "scaffolde-ai (large TypeScript project)"
+    }
+  ],
+  "host": {
+    "platform": "Darwin",
+    "machine": "arm64",
+    "memsize_bytes": 17179869184
+  }
+}
