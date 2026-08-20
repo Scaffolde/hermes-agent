@@ -242,9 +242,15 @@ jobs:
         run: uv cache prune --ci
 
       - name: Run e2e tests
+        # Canonical runner, not a bare `pytest tests/e2e/`. This was the last
+        # multi-file direct invocation left in CI, which made it the one lane
+        # where the cross-file-leakage banner fired against genuine results —
+        # labelling real e2e output untrustworthy and contradicting the
+        # banner's own claim that CI runs one file per subprocess (SCA-4692).
+        # Per-file isolation here also matches what the other test lanes get.
         run: |
           source .venv/bin/activate
-          python -m pytest tests/e2e/ -v --tb=short
+          scripts/run_tests.sh tests/e2e/ -v --tb=short
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
