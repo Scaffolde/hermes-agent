@@ -79,6 +79,79 @@ LSP_CLIENT_FOOTPRINT_BYTES = 1300 * 1024 * 1024
 LSP_MEMORY_BUDGET_FRACTION = 0.25
 MIN_CLIENT_CAP = 1
 MAX_CLIENT_CAP = 24
+
+_MIB = 1024 * 1024
+
+# Per-type cost.  Charging every server the typescript figure is what made
+# the derived cap 3 on a 16 GiB host while the measured healthy working set
+# was 7 (SCA-4688): the real fleet is mostly cheap servers, and a yaml
+# server was being charged 26x what it actually costs.
+#
+# Every value below comes from ``scripts/measure_lsp_footprint.py`` — a real
+# spawn against a real project, physical footprint summed over the process
+# subtree, peak of three samples after a 20s settle.  Raw readings are in
+# ``docs/lsp-footprint-measurements.json``.  RSS is not usable here: the
+# Node-based servers run behind a shim that reads 5-11 MB while the actual
+# analysis lives in a child process.
+#
+# Each stored value is its measurement rounded *up*.  Under-charging is the
+# direction that re-opens SCA-4389, so headroom always makes the cap
+# stricter than the measurement, never looser.
+LSP_SERVER_FOOTPRINT_BYTES: Dict[str, int] = {
+    # measured 1688.4 MiB against an 8.5k-file TypeScript project — the same
+    # workload class as the 13-process SCA-4389 incident, whose per-process
+    # range was 1.2-1.65 GiB.  A small project measures 500 MiB, but a cap
+    # sized from the cheap case is a cap that fails exactly when it matters.
+    "typescript": 1700 * _MIB,
+    # measured 633.7 MiB against an 8.5k-file Python project.
+    "pyright": 800 * _MIB,
+    # measured 41.2 MiB.  Charged 150 to leave room for a larger schema set.
+    "yaml-language-server": 150 * _MIB,
+    # measured 49.1 MiB.  Charged 150 for the same reason.
+    "bash-language-server": 150 * _MIB,
+}
+
+
+class _DeriveBudget:
+    """Sentinel: derive the byte budget from host memory.
+
+    Distinct from ``None``, which explicitly *disables* the byte half of
+    the bound.  A plain ``None`` default could not tell "read the host"
+    apart from "this fleet has no byte budget".
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<derive-from-host>"
+
+
+_DERIVE_BUDGET = _DeriveBudget()
+
+
+def footprint_for(server_id: str) -> int:
+    """What one *server_id* costs against the memory budget, in bytes.
+
+    An unmeasured type charges ``LSP_CLIENT_FOOTPRINT_BYTES`` — the value
+    every type was charged before this table existed.  So an unknown server
+    is admitted exactly as conservatively as it is today, and no type can
+    become cheaper merely by being absent from the table.  Types known to be
+    heavy but not yet measured (rust-analyzer, gopls, jdtls) are therefore
+    left unchanged rather than optimistically discounted.
+    """
+    return LSP_SERVER_FOOTPRINT_BYTES.get(server_id, LSP_CLIENT_FOOTPRINT_BYTES)
+
+
+def memory_budget_bytes(total_bytes: Optional[int] = None) -> Optional[int]:
+    """The byte budget the whole fleet is admitted against.
+
+    Deliberately the *same* share of host RAM as before per-type accounting
+    existed: the point is to fit more servers into the existing budget
+    because most of them are cheap, never to raise the ceiling.
+    """
+    if total_bytes is None:
+        total_bytes = host_memory_bytes()
+    if not total_bytes or total_bytes <= 0:
+        return None
+    return int(total_bytes * LSP_MEMORY_BUDGET_FRACTION)
 # Used only when host memory can't be read at all.  Deliberately the
 # small-host answer: under-caching costs a few seconds of respawn, while
 # over-caching costs gigabytes the host may not have.
@@ -134,13 +207,23 @@ def default_max_clients(total_bytes: Optional[int] = None) -> int:
     a cap of zero would disable the feature outright, and the ceiling
     keeps a very large host from accumulating an unbounded pool simply
     because it has the headroom to hide the growth.
+
+    This is now the *count* half of a two-part bound.  The memory half
+    (:meth:`LSPService._memory_overage_locked`) charges each live server
+    its own measured footprint, and that is what actually holds the fleet
+    inside the host's RAM.  So this divides by the cheapest server rather
+    than the most expensive one: sizing the count ceiling off typescript
+    made it bind at 3 on a 16 GiB host and evict during ordinary
+    multi-worktree work, even when every live server was a 41 MiB yaml
+    process that fitted the budget many times over (SCA-4688).
     """
     if total_bytes is None:
         total_bytes = host_memory_bytes()
     if not total_bytes or total_bytes <= 0:
         return FALLBACK_CLIENT_CAP
     budget = int(total_bytes * LSP_MEMORY_BUDGET_FRACTION)
-    derived = budget // LSP_CLIENT_FOOTPRINT_BYTES
+    cheapest = min([LSP_CLIENT_FOOTPRINT_BYTES, *LSP_SERVER_FOOTPRINT_BYTES.values()])
+    derived = budget // cheapest
     return max(MIN_CLIENT_CAP, min(MAX_CLIENT_CAP, int(derived)))
 
 
@@ -325,6 +408,7 @@ class LSPService:
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
         max_clients: Optional[int] = None,
+        memory_budget: Any = _DERIVE_BUDGET,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -336,6 +420,21 @@ class LSPService:
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
         self._max_clients = resolve_max_clients(max_clients)
+        # The byte half of the bound.  ``None`` on a host whose memory
+        # cannot be read, where the count cap is the only bound available.
+        #
+        # Injectable because deriving it from host RAM makes every test
+        # that exercises the *count* cap host-dependent: on a 1 GiB CI
+        # worker the derived budget is 256 MiB, so a fleet of fake
+        # pyright clients is charged 800 MiB each and the byte bound
+        # evicts down to the floor before the count cap under test can
+        # bind.  ``memory_budget=None`` disables the byte half outright;
+        # an explicit int pins it.
+        self._memory_budget = (
+            memory_budget_bytes()
+            if memory_budget is _DERIVE_BUDGET
+            else memory_budget
+        )
 
         self._loop = _BackgroundLoop()
         if self._enabled:
@@ -874,7 +973,7 @@ class LSPService:
             return
         self._schedule_cap_enforcement()
 
-    def _overage_locked(self) -> int:
+    def _overage_locked(self, *, exclude_draining: bool = False) -> int:
         """How far the fleet is over the cap.  Caller holds ``_state_lock``.
 
         Counts keys reserved in ``_spawning`` but not yet in
@@ -886,14 +985,105 @@ class LSPService:
         resident until the shutdown lands, and the cap bounds resident
         processes, not map entries.  Without this the fleet would look
         like it had free slots the host has not actually got back.
+
+        *exclude_draining* answers the different question the sweep's stop
+        condition needs: how far over we would STILL be once every
+        shutdown already in flight has landed.  See
+        :meth:`_binding_overage_locked`.
+        """
+        return self._binding_overage_locked(exclude_draining=exclude_draining)[0]
+
+    def _binding_overage_locked(
+        self, *, exclude_draining: bool = False
+    ) -> Tuple[int, str]:
+        """``(overage, reason)`` — how far over, and which bound says so.
+
+        The reason travels with the number because the two halves of the
+        bound fail for different operational causes and an operator has to
+        tell them apart: "cap 24 exceeded" logged against a three-client
+        fleet is nonsense, and it is what a byte-triggered eviction used
+        to report on a 16 GiB host, where three typescript servers blow
+        the 4 GiB budget while sitting far below the derived count cap.
         """
         pending = sum(1 for k in self._spawning if k not in self._clients)
-        return (
+        draining = 0 if exclude_draining else len(self._shutting_down)
+        count_overage = (
             len(self._clients)
             + pending
-            + len(self._shutting_down)
+            + draining
             - self._max_clients
         )
+        memory_overage = self._memory_overage_locked(
+            exclude_draining=exclude_draining
+        )
+        if memory_overage > count_overage:
+            budget_mib = (self._memory_budget or 0) // _MIB
+            return memory_overage, f"memory budget {budget_mib} MiB exceeded"
+        return count_overage, f"cap {self._max_clients} exceeded"
+
+    def _memory_overage_locked(self, *, exclude_draining: bool = False) -> int:
+        """How many clients must go to fit the byte budget.  Holds the lock.
+
+        The count cap alone cannot express "7 cheap servers are fine but 3
+        typescript servers are not" — that was SCA-4688.  This charges each
+        live server its own measured footprint and reports how many LRU
+        victims it would take to get back inside the budget, which is the
+        unit :meth:`_enforce_cap_async` already loops on.
+
+        Counts ``_spawning`` and ``_shutting_down`` for exactly the reasons
+        the count overage does: a server about to exist already owes its
+        memory, and an evicted one still holds its pages until the process
+        actually goes.
+
+        Never asks for the last client's eviction.  A single server larger
+        than the whole budget — typescript on a small host — would otherwise
+        be evicted the moment it spawned and respawned by the next request,
+        forever, which costs more than the memory it was meant to save.
+        ``MIN_CLIENT_CAP`` is the same floor the count path already applies.
+        """
+        budget = self._memory_budget
+        if not budget:
+            return 0
+        total = sum(footprint_for(sid) for sid, _root in self._clients)
+        total += sum(
+            footprint_for(sid)
+            for (sid, _root) in self._spawning
+            if (sid, _root) not in self._clients
+        )
+        # ``_shutting_down`` is keyed by task; the client key is the value.
+        if not exclude_draining:
+            total += sum(
+                footprint_for(sid) for sid, _root in self._shutting_down.values()
+            )
+        if total <= budget:
+            return 0
+        # Only live clients can be handed to the sweep: a pending spawn has
+        # not reached its caller and a shutting-down one is already leaving.
+        # Ordered least-recently-used first, matching ``_evictable``, so this
+        # is what the sweep will actually have to remove rather than an
+        # optimistic best case.
+        candidates = [key for key in self._clients if key not in self._spawning]
+        candidates.sort(key=lambda key: self._last_used.get(key, 0.0))
+        # The floor applies to the fleet that will EXIST, which includes a
+        # pending spawn — not to ``_clients`` alone.  Counting only live
+        # clients let one live server plus one pending one report zero
+        # overage: ``1 - MIN_CLIENT_CAP`` is nothing removable, so the
+        # pre-start sweep in ``_get_or_spawn`` admitted the new process
+        # and both indexed concurrently.  On a 4 GiB host that is two
+        # typescript servers (3.4 GiB) against a 1 GiB budget — exactly
+        # the peak this bound exists to prevent.  Evicting the live one
+        # here still leaves the pending one, so the floor is honoured.
+        eventual = len(self._clients) + sum(
+            1 for k in self._spawning if k not in self._clients
+        )
+        removable = max(0, eventual - MIN_CLIENT_CAP)
+        needed = 0
+        for key in candidates[:removable]:
+            total -= footprint_for(key[0])
+            needed += 1
+            if total <= budget:
+                break
+        return needed
 
     def _schedule_cap_enforcement(self) -> None:
         """Re-run cap enforcement on the background loop, fire-and-forget.
@@ -1040,10 +1230,12 @@ class LSPService:
         while True:
             with self._state_lock:
                 overage = self._overage_locked()
-                draining = len(self._shutting_down)
+                residual, reason = self._binding_overage_locked(
+                    exclude_draining=True
+                )
             if overage <= 0:
                 break
-            if draining >= overage:
+            if residual <= 0:
                 # Every slot still over the cap already has a shutdown
                 # running against it.  Evicting another would drain the
                 # fleet past what the overage justifies — the shutdowns
@@ -1051,6 +1243,18 @@ class LSPService:
                 # its reservation when its process is actually gone.
                 # (``handoff=None`` awaits completion, so this is only
                 # ever reachable from a bounded-handoff caller.)
+                #
+                # Asked as "would we still be over once the drains land?"
+                # rather than "are there at least as many drains as
+                # victims?".  Those agree only while every server costs
+                # the same.  With per-type footprints they do not: a
+                # 150 MiB yaml shutdown is one drain against a one-victim
+                # overage, so the count test stopped the sweep — and once
+                # that cheap process exited, three 1.7 GiB typescript
+                # servers were left over a 4 GiB budget with no sweep
+                # scheduled to notice.  Comparing bytes-after-drain keeps
+                # the original intent and is exactly equivalent whenever
+                # the fleet is homogeneous.
                 break
             victim = next(
                 (key for key, _ in self._evictable() if key != protect),
@@ -1065,17 +1269,15 @@ class LSPService:
                 # not the backstop here, and at ``idle_timeout: 0`` it
                 # does not run at all.
                 logger.debug(
-                    "LSP cap %d exceeded by %d but all clients are busy",
-                    self._max_clients,
-                    overage,
+                    "LSP %s by %d but all clients are busy",
+                    reason,
+                    residual,
                 )
                 break
             remaining = (
                 None if deadline is None else max(0.0, deadline - time.monotonic())
             )
-            if await self._evict(
-                victim, f"cap {self._max_clients} exceeded", handoff=remaining
-            ):
+            if await self._evict(victim, reason, handoff=remaining):
                 evicted.append(victim)
             elif victim in self._clients:
                 # It became busy between the scan and the pop, and is
