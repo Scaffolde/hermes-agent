@@ -15,14 +15,14 @@ import pytest
 
 
 @pytest.fixture()
-def isolated_kanban_home(monkeypatch):
+def isolated_kanban_home(monkeypatch, hermes_module_isolation):
     """Spin up a fresh HERMES_HOME with a clean kanban DB."""
     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
     monkeypatch.setenv("HERMES_HOME", test_home)
-    # Force-reimport so the fresh HERMES_HOME is picked up.
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
+    # Force-reimport so the fresh HERMES_HOME is picked up. The eviction AND
+    # its restore are owned by hermes_module_isolation: deleting from the
+    # process-global sys.modules without putting the originals back corrupts
+    # the rest of the run (SCA-4692).
     from hermes_cli import kanban_db
     yield kanban_db, test_home
     # Cleanup is best-effort; tempfile dir survives but pytest isolation
