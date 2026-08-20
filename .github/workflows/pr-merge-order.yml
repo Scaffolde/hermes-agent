@@ -1,0 +1,118 @@
+name: PR Merge-Order Sweep
+
+# GitHub's per-PR `mergeStateStatus` is never a measurement of the QUEUE.
+# On 2026-08-10 six PRs all reported CLEAN and the queue could not land in any
+# order, while four Paperclip issues sat "in_review" waiting on a merge path
+# that had been broken for days (SCA-4638). A queue that cannot land reads
+# exactly like a queue awaiting review.
+#
+# This runs scripts/pr_merge_order.py, which simulates the real three-way merge
+# of every candidate pair. Per SCA-4633: a detector nothing listens to is not a
+# fix, so the verdict lands in the job summary every run and opens (or updates)
+# a GitHub issue whenever the queue is un-landable.
+
+on:
+  schedule:
+    # Every 6 hours. The 2026-08-10 stall lasted days; the point is to catch it
+    # within one tick of the queue becoming un-landable, not to poll hard.
+    - cron: '20 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: pr-merge-order
+  cancel-in-progress: true
+
+jobs:
+  sweep:
+    # The fork's queue is the one this repository lands. Upstream carries tens
+    # of thousands of open PRs, where an all-pairs sweep is both meaningless
+    # here and enormously expensive.
+    if: github.repository == 'pai-scaffolde/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # merge-base/merge-tree need real history. A shallow clone makes every
+          # ancestry answer wrong, which would silently disable the stack
+          # divergence check this sweep depends on.
+          fetch-depth: 0
+
+      - name: Run the sweep
+        id: sweep
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          status=0
+          python3 scripts/pr_merge_order.py --repo "${{ github.repository }}" \
+            | tee merge-order-report.txt || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+          # The status -> outcome decision lives in a script so it can be
+          # executed by the test suite. Only 0 and 1 are verdicts; the gate
+          # rejects every other status (2 = unverified, 127 = no interpreter,
+          # 137 = killed) rather than letting it read as a clean queue.
+          gate_status=0
+          verdict=$(bash scripts/ci/pr_merge_order_gate.sh "$status") || gate_status=$?
+
+          {
+            echo "## PR merge-order sweep"
+            echo
+            echo "$verdict"
+            echo
+            echo '```'
+            cat merge-order-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$gate_status"
+
+      - name: Open or update the collision issue
+        if: steps.sweep.outputs.status == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE_PREFIX="[pr-merge-order]"
+          existing=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --search "in:title \"$TITLE_PREFIX\"" \
+            --json number,title \
+            --jq '.[] | select(.title | startswith("'"$TITLE_PREFIX"'")) | .number' \
+            | head -1)
+
+          # The report is the evidence; a summary line without it just tells
+          # someone to go and re-run the sweep by hand.
+          {
+            echo "The open PR queue has no landable order. Every PR below may still show"
+            echo "\`CLEAN\` on the board: GitHub compares each PR to its own base, never to"
+            echo "the other open PRs."
+            echo
+            echo "Sweep run: $RUN_URL"
+            echo
+            echo '```'
+            cat merge-order-report.txt
+            echo '```'
+            echo
+            echo "Resolving a mutual conflict is a decision, not a mechanical fix: pick which"
+            echo "PR lands first, then rebase or resolve the other. This issue is opened by"
+            echo ".github/workflows/pr-merge-order.yml — close it once the queue is landable"
+            echo "and the next sweep will reopen it if it is not."
+          } > issue-body.md
+
+          if [ -n "$existing" ]; then
+            echo "Appending to existing issue #$existing"
+            gh issue comment "$existing" --repo "${{ github.repository }}" --body-file issue-body.md
+          else
+            echo "Opening new merge-order issue"
+            gh issue create --repo "${{ github.repository }}" \
+              --title "$TITLE_PREFIX Open PR queue has no landable order" \
+              --body-file issue-body.md
+          fi
