@@ -36,11 +36,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import threading
 import time
+from concurrent.futures import Future
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from agent import cgroup_memory
 from agent.lsp import eventlog
 from agent.lsp.client import (
     DIAGNOSTICS_DOCUMENT_WAIT,
@@ -60,6 +63,237 @@ logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
+
+# Cap derivation.  ``idle_timeout`` bounds how *long* a client survives; it
+# does not bound how *many* exist at once.  Thirteen live
+# ``typescript-language-server`` processes holding ~16 GiB put pai-mac-mini
+# into swap while every one of them was inside its idle window, so the
+# reaper could not have helped.  A language server's cost is dominated by
+# the program it loads, not by anything we control, so the population has
+# to be bounded against the host rather than guessed.  1.3 GiB is the
+# median resident footprint measured across those 13 processes (range
+# 1.2-1.65 GiB, each with its own tsserver child).  A quarter of RAM is the
+# share we are willing to let editor tooling hold before it competes with
+# the actual workload — on a 16 GiB host that is 4 GiB, i.e. 3 servers.
+LSP_CLIENT_FOOTPRINT_BYTES = 1300 * 1024 * 1024
+LSP_MEMORY_BUDGET_FRACTION = 0.25
+MIN_CLIENT_CAP = 1
+MAX_CLIENT_CAP = 24
+
+_MIB = 1024 * 1024
+
+# Per-type cost.  Charging every server the typescript figure is what made
+# the derived cap 3 on a 16 GiB host while the measured healthy working set
+# was 7 (SCA-4688): the real fleet is mostly cheap servers, and a yaml
+# server was being charged 26x what it actually costs.
+#
+# Every value below comes from ``scripts/measure_lsp_footprint.py`` — a real
+# spawn against a real project, physical footprint summed over the process
+# subtree, peak of three samples after a 20s settle.  Raw readings are in
+# ``docs/lsp-footprint-measurements.json``.  RSS is not usable here: the
+# Node-based servers run behind a shim that reads 5-11 MB while the actual
+# analysis lives in a child process.
+#
+# Each stored value is its measurement rounded *up*.  Under-charging is the
+# direction that re-opens SCA-4389, so headroom always makes the cap
+# stricter than the measurement, never looser.
+LSP_SERVER_FOOTPRINT_BYTES: Dict[str, int] = {
+    # measured 1688.4 MiB against an 8.5k-file TypeScript project — the same
+    # workload class as the 13-process SCA-4389 incident, whose per-process
+    # range was 1.2-1.65 GiB.  A small project measures 500 MiB, but a cap
+    # sized from the cheap case is a cap that fails exactly when it matters.
+    "typescript": 1700 * _MIB,
+    # measured 633.7 MiB against an 8.5k-file Python project.
+    "pyright": 800 * _MIB,
+    # measured 41.2 MiB.  Charged 150 to leave room for a larger schema set.
+    "yaml-language-server": 150 * _MIB,
+    # measured 49.1 MiB.  Charged 150 for the same reason.
+    "bash-language-server": 150 * _MIB,
+}
+
+
+class _DeriveBudget:
+    """Sentinel: derive the byte budget from host memory.
+
+    Distinct from ``None``, which explicitly *disables* the byte half of
+    the bound.  A plain ``None`` default could not tell "read the host"
+    apart from "this fleet has no byte budget".
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<derive-from-host>"
+
+
+_DERIVE_BUDGET = _DeriveBudget()
+
+
+def footprint_for(server_id: str) -> int:
+    """What one *server_id* costs against the memory budget, in bytes.
+
+    An unmeasured type charges ``LSP_CLIENT_FOOTPRINT_BYTES`` — the value
+    every type was charged before this table existed.  So an unknown server
+    is admitted exactly as conservatively as it is today, and no type can
+    become cheaper merely by being absent from the table.  Types known to be
+    heavy but not yet measured (rust-analyzer, gopls, jdtls) are therefore
+    left unchanged rather than optimistically discounted.
+    """
+    return LSP_SERVER_FOOTPRINT_BYTES.get(server_id, LSP_CLIENT_FOOTPRINT_BYTES)
+
+
+def memory_budget_bytes(total_bytes: Optional[int] = None) -> Optional[int]:
+    """The byte budget the whole fleet is admitted against.
+
+    Deliberately the *same* share of host RAM as before per-type accounting
+    existed: the point is to fit more servers into the existing budget
+    because most of them are cheap, never to raise the ceiling.
+    """
+    if total_bytes is None:
+        total_bytes = host_memory_bytes()
+    if not total_bytes or total_bytes <= 0:
+        return None
+    return int(total_bytes * LSP_MEMORY_BUDGET_FRACTION)
+# Used only when host memory can't be read at all.  Deliberately the
+# small-host answer: under-caching costs a few seconds of respawn, while
+# over-caching costs gigabytes the host may not have.
+FALLBACK_CLIENT_CAP = 3
+
+# How long a spawning request waits for a victim's shutdown before
+# leaving it to drain in the background.  Cap enforcement runs inside
+# ``get_diagnostics_sync``'s outer budget, which allows the diagnostics
+# wait ``wait_timeout`` plus a 2s guard band; a victim that spends the
+# whole guard band leaves the wait unable to use the budget it was
+# promised, and the caller is told the server had nothing to say.  A
+# healthy shutdown is one ``shutdown`` round-trip — milliseconds — while
+# a wedged one costs the client's 2s request timeout plus
+# ``SHUTDOWN_GRACE``.  Half a second sits clear of both: normal
+# evictions still complete before the new server starts, so the fleet
+# does not overlap, and a wedged one is bounded well inside the guard
+# band instead of consuming it.
+EVICTION_HANDOFF_BUDGET = 0.5
+
+
+def host_memory_bytes() -> Optional[int]:
+    """Memory this process may actually use, or ``None`` if undeterminable.
+
+    ``SC_PHYS_PAGES``/``SC_PAGE_SIZE`` are present on Linux and macOS.
+    Anything else (Windows, an exotic libc, a sandbox that stubs sysconf)
+    falls through to ``None`` and the caller uses a conservative default.
+
+    A cgroup limit, when present, wins over the sysconf total whenever it
+    is smaller: deriving the cap from 64 GiB of node RAM inside a 4 GiB
+    container permits a client population that OOMs the container.
+    """
+    total: Optional[int]
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        total = None
+    else:
+        total = pages * page_size if pages > 0 and page_size > 0 else None
+
+    limit = cgroup_memory.cgroup_memory_limit_bytes()
+    if limit is not None:
+        return limit if total is None else min(total, limit)
+    return total
+
+
+def default_max_clients(total_bytes: Optional[int] = None) -> int:
+    """How many concurrent language servers this host can afford.
+
+    Pass ``total_bytes`` to compute the cap for a hypothetical host; omit
+    it to measure the current one.  The result is always clamped to
+    ``[MIN_CLIENT_CAP, MAX_CLIENT_CAP]`` — one server is the floor because
+    a cap of zero would disable the feature outright, and the ceiling
+    keeps a very large host from accumulating an unbounded pool simply
+    because it has the headroom to hide the growth.
+
+    This is now the *count* half of a two-part bound.  The memory half
+    (:meth:`LSPService._memory_overage_locked`) charges each live server
+    its own measured footprint, and that is what actually holds the fleet
+    inside the host's RAM.  So this divides by the cheapest server rather
+    than the most expensive one: sizing the count ceiling off typescript
+    made it bind at 3 on a 16 GiB host and evict during ordinary
+    multi-worktree work, even when every live server was a 41 MiB yaml
+    process that fitted the budget many times over (SCA-4688).
+    """
+    if total_bytes is None:
+        total_bytes = host_memory_bytes()
+    if not total_bytes or total_bytes <= 0:
+        return FALLBACK_CLIENT_CAP
+    budget = int(total_bytes * LSP_MEMORY_BUDGET_FRACTION)
+    cheapest = min([LSP_CLIENT_FOOTPRINT_BYTES, *LSP_SERVER_FOOTPRINT_BYTES.values()])
+    derived = budget // cheapest
+    return max(MIN_CLIENT_CAP, min(MAX_CLIENT_CAP, int(derived)))
+
+
+def resolve_max_clients(raw: Any) -> int:
+    """Turn a configured ``lsp.max_clients`` into an enforceable cap.
+
+    ``None`` means "derive from the host".  Anything unusable — zero, a
+    negative, a string, ``.nan``/``.inf`` (both valid YAML that survive
+    ``float()``) — also derives, because garbage must not silently
+    restore the unbounded accumulation this cap exists to stop.
+    """
+    if raw is None:
+        return default_max_clients()
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return default_max_clients()
+    if not math.isfinite(parsed) or parsed <= 0:
+        return default_max_clients()
+    return max(MIN_CLIENT_CAP, min(MAX_CLIENT_CAP, int(parsed)))
+
+
+def _log_cap_enforcement_result(fut: Future) -> None:
+    """Drain a fire-and-forget cap sweep so its failure is not silent.
+
+    Nobody calls ``.result()`` on a detached enforcement future, so an
+    exception inside the sweep would otherwise vanish — and a silently
+    dead sweep is exactly the failure mode this whole path exists to
+    close.  Never re-raises: this runs on the loop thread.
+    """
+    try:
+        fut.result()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("detached LSP cap enforcement failed: %s", e)
+
+
+def _idle_clock() -> float:
+    """Clock for idle bookkeeping — suspend-inclusive, never the wall clock.
+
+    ``_last_used`` and the reaper's cutoff are only ever compared to each
+    other, so they need elapsed time, not a date.  The wall clock supplies
+    neither guarantee: NTP correction and sleep/wake both step it, and a
+    backwards step of more than ``idle_timeout`` pushes every cutoff into
+    the past and stalls reaping until the clock catches up (a forwards step
+    does the opposite and reaps servers that are still in use).  Both
+    failure modes are silent, and reviving unbounded accumulation is the
+    exact leak the reaper exists to close.
+
+    ``CLOCK_MONOTONIC`` fixes the stepping but introduces the mirror-image
+    bug: on Linux it *stops* while the machine is suspended.  A laptop that
+    sleeps for longer than ``idle_timeout`` therefore wakes with every
+    ``_last_used`` stamp still inside the window, and each sleep/wake cycle
+    leaks another generation of servers — worse than the wall clock, which
+    at least aged them.  ``CLOCK_BOOTTIME`` is monotonic *and* counts
+    suspended time, so it is the only source that satisfies both halves.
+
+    Platforms without ``CLOCK_BOOTTIME`` (macOS, some BSDs) fall back to
+    ``monotonic()``.  The resolution is deliberately per-call rather than
+    cached at import: it keeps the module's ``time`` reference patchable by
+    the suspend/NTP tests, and a ``getattr`` is noise next to a sweep.
+    """
+    boottime_id = getattr(time, "CLOCK_BOOTTIME", None)
+    if boottime_id is not None:
+        try:
+            return time.clock_gettime(boottime_id)
+        except (OSError, ValueError, AttributeError):
+            # Kernel or libc refused the clock — degrade rather than take
+            # the whole reaper down with an unhandled error.
+            pass
+    return time.monotonic()
 
 
 class _BackgroundLoop:
@@ -117,6 +351,23 @@ class _BackgroundLoop:
             fut.cancel()
             raise
 
+    def schedule(self, coro) -> Optional[Future]:
+        """Submit a coroutine to the loop and return immediately.
+
+        Fire-and-forget counterpart to :meth:`run`: the caller is not
+        charged for the coroutine's runtime.  Returns the
+        :class:`concurrent.futures.Future` so callers can attach a
+        done-callback, or ``None`` when the loop is not running (the
+        coroutine is closed rather than leaked).
+        """
+        from agent.async_utils import safe_schedule_threadsafe
+        return safe_schedule_threadsafe(
+            coro,
+            self._loop,
+            logger=logger,
+            log_message="Failed to schedule LSP coroutine",
+        )
+
     def stop(self) -> None:
         loop = self._loop
         if loop is None:
@@ -156,6 +407,8 @@ class LSPService:
         init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        max_clients: Optional[int] = None,
+        memory_budget: Any = _DERIVE_BUDGET,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -166,6 +419,22 @@ class LSPService:
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
+        self._max_clients = resolve_max_clients(max_clients)
+        # The byte half of the bound.  ``None`` on a host whose memory
+        # cannot be read, where the count cap is the only bound available.
+        #
+        # Injectable because deriving it from host RAM makes every test
+        # that exercises the *count* cap host-dependent: on a 1 GiB CI
+        # worker the derived budget is 256 MiB, so a fleet of fake
+        # pyright clients is charged 800 MiB each and the byte bound
+        # evicts down to the floor before the count cap under test can
+        # bind.  ``memory_budget=None`` disables the byte half outright;
+        # an explicit int pins it.
+        self._memory_budget = (
+            memory_budget_bytes()
+            if memory_budget is _DERIVE_BUDGET
+            else memory_budget
+        )
 
         self._loop = _BackgroundLoop()
         if self._enabled:
@@ -175,7 +444,26 @@ class LSPService:
         self._clients: Dict[Tuple[str, str], LSPClient] = {}
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
+        # Shutdowns whose client has left ``_clients`` but whose process
+        # has not exited yet.  The mirror of ``_spawning``: it reserves
+        # the slot of a server that is about to stop, so a detached
+        # shutdown never reads as a free slot the host has not reclaimed.
+        #
+        # Keyed by TASK, not by ``(server_id, workspace_root)``.  Every
+        # reader of this map counts *processes* — ``_overage_locked``
+        # adds ``len()`` to the resident total, and ``_shutdown_async``
+        # awaits its members — and one workspace can have several
+        # shutdowns resident at once: evict a wedged client, respawn the
+        # same root, evict the replacement before the first drain lands.
+        # A per-key dict collapses those into one entry, so the surviving
+        # process is neither counted against the cap nor awaited at
+        # service stop.  Task identity is what is one-per-process.
+        self._shutting_down: Dict[asyncio.Task, Tuple[str, str]] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
+        # Refcounted per key rather than a boolean: two concurrent edits in
+        # the same project share one client, and the first to finish must
+        # not expose it to eviction while the second is still waiting.
+        self._inflight: Dict[Tuple[str, str], int] = {}
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
 
@@ -220,6 +508,17 @@ class LSPService:
             # mark the (server, workspace) pair broken for the process
             # lifetime.  Clamp to a safe floor (0 still disables).
             idle_timeout = MIN_IDLE_TIMEOUT
+        # Omitted (or unusable) derives the cap from host memory rather
+        # than pinning a constant: a 64 GiB CI box and a 16 GiB laptop
+        # cannot afford the same number of language servers.
+        raw_max_clients = lsp_cfg.get("max_clients")
+        max_clients = resolve_max_clients(raw_max_clients)
+        if raw_max_clients is not None and max_clients != raw_max_clients:
+            logger.debug(
+                "lsp.max_clients=%r resolved to %d",
+                raw_max_clients,
+                max_clients,
+            )
         servers_cfg = lsp_cfg.get("servers") or {}
         disabled = []
         binary_overrides: Dict[str, List[str]] = {}
@@ -251,6 +550,7 @@ class LSPService:
             init_overrides=init_overrides,
             disabled_servers=disabled,
             idle_timeout=idle_timeout,
+            max_clients=max_clients,
         )
 
     # ------------------------------------------------------------------
@@ -481,12 +781,16 @@ class LSPService:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return []
+        key = (client.server_id, client.workspace_root)
+        self._acquire(key)
         try:
             version = await client.open_file(file_path, language_id=language_id_for(file_path))
             fresh = await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
         except Exception as e:  # noqa: BLE001
             logger.debug("snapshot open/wait failed: %s", e)
             return []
+        finally:
+            self._release(key)
         self._touch(client)
         if not fresh:
             # No fresh data for the pre-edit content — an empty baseline
@@ -507,6 +811,8 @@ class LSPService:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return None
+        key = (client.server_id, client.workspace_root)
+        self._acquire(key)
         try:
             version = await client.open_file(file_path, language_id=language_id_for(file_path))
             await client.save_file(file_path)
@@ -516,6 +822,8 @@ class LSPService:
         except Exception as e:  # noqa: BLE001
             logger.debug("open/wait failed for %s: %s", file_path, e)
             return None
+        finally:
+            self._release(key)
         self._touch(client)
         if not fresh:
             return None
@@ -556,7 +864,7 @@ class LSPService:
         with self._state_lock:
             client = self._clients.get(key)
             if client is not None and client.is_running:
-                self._last_used[key] = time.time()
+                self._last_used[key] = _idle_clock()
                 eventlog.log_active(srv.server_id, per_server_root)
                 return client
             spawning = self._spawning.get(key)
@@ -598,6 +906,17 @@ class LSPService:
                 initialization_options=spec.initialization_options,
                 seed_diagnostics_on_first_push=spec.seed_diagnostics_on_first_push or srv.seed_first_push,
             )
+            # Make room BEFORE starting the process, not after.  ``key``
+            # is already registered in ``_spawning``, so the cap counts
+            # this server as occupying its slot and drains to leave room
+            # for it.  Evicting afterwards would let the fleet hold
+            # cap + 1 live servers, and the peak is what this bounds.
+            # No ``protect`` here: nothing is being returned yet, and a
+            # stale dead client under ``key`` should be reclaimed.
+            # Bounded handoff: this runs inside the caller's diagnostics
+            # budget, so a victim that will not die must not be able to
+            # spend it (SCA-4628).
+            await self._enforce_cap_async(handoff=EVICTION_HANDOFF_BUDGET)
             try:
                 await client.start()
             except Exception as e:  # noqa: BLE001
@@ -607,7 +926,14 @@ class LSPService:
                 return None
             with self._state_lock:
                 self._clients[key] = client
-                self._last_used[key] = time.time()
+                self._last_used[key] = _idle_clock()
+            # Second sweep, protecting the client this call returns:
+            # concurrent spawns for other roots can still have raced the
+            # reservation above. Evicting the caller's own client would
+            # make every spawn immediately undo itself.
+            await self._enforce_cap_async(
+                protect=key, handoff=EVICTION_HANDOFF_BUDGET
+            )
             eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
             return client
@@ -617,6 +943,361 @@ class LSPService:
 
     async def _start_idle_reaper(self) -> None:
         self._idle_reaper_task = asyncio.create_task(self._idle_reaper_loop())
+
+    # ------------------------------------------------------------------
+    # eviction: in-flight accounting and the concurrent cap
+    # ------------------------------------------------------------------
+
+    def _acquire(self, key: Tuple[str, str]) -> None:
+        """Mark a request as in-flight against *key*."""
+        with self._state_lock:
+            self._inflight[key] = self._inflight.get(key, 0) + 1
+
+    def _release(self, key: Tuple[str, str]) -> None:
+        with self._state_lock:
+            remaining = self._inflight.get(key, 0) - 1
+            if remaining > 0:
+                self._inflight[key] = remaining
+                return
+            self._inflight.pop(key, None)
+            # This release may have produced the first evictable client
+            # since ``_enforce_cap_async`` broke out over the cap with
+            # everything busy.  Nothing else closes that escape hatch:
+            # the spawn path only runs on the next spawn, and the idle
+            # reaper is disabled outright at ``idle_timeout: 0`` — a
+            # supported setting for keeping indexes warm.  Without this,
+            # "briefly over the cap" becomes "over the cap forever",
+            # which is the population blow-up the cap exists to bound.
+            over_cap = self._overage_locked() > 0
+        if not over_cap:
+            return
+        self._schedule_cap_enforcement()
+
+    def _overage_locked(self, *, exclude_draining: bool = False) -> int:
+        """How far the fleet is over the cap.  Caller holds ``_state_lock``.
+
+        Counts keys reserved in ``_spawning`` but not yet in
+        ``_clients`` — a server that is about to exist occupies its
+        slot, matching :meth:`_enforce_cap_async`.
+
+        Entries in ``_shutting_down`` count for the mirror-image reason: an
+        evicted server is out of ``_clients`` but its process is still
+        resident until the shutdown lands, and the cap bounds resident
+        processes, not map entries.  Without this the fleet would look
+        like it had free slots the host has not actually got back.
+
+        *exclude_draining* answers the different question the sweep's stop
+        condition needs: how far over we would STILL be once every
+        shutdown already in flight has landed.  See
+        :meth:`_binding_overage_locked`.
+        """
+        return self._binding_overage_locked(exclude_draining=exclude_draining)[0]
+
+    def _binding_overage_locked(
+        self, *, exclude_draining: bool = False
+    ) -> Tuple[int, str]:
+        """``(overage, reason)`` — how far over, and which bound says so.
+
+        The reason travels with the number because the two halves of the
+        bound fail for different operational causes and an operator has to
+        tell them apart: "cap 24 exceeded" logged against a three-client
+        fleet is nonsense, and it is what a byte-triggered eviction used
+        to report on a 16 GiB host, where three typescript servers blow
+        the 4 GiB budget while sitting far below the derived count cap.
+        """
+        pending = sum(1 for k in self._spawning if k not in self._clients)
+        draining = 0 if exclude_draining else len(self._shutting_down)
+        count_overage = (
+            len(self._clients)
+            + pending
+            + draining
+            - self._max_clients
+        )
+        memory_overage = self._memory_overage_locked(
+            exclude_draining=exclude_draining
+        )
+        if memory_overage > count_overage:
+            budget_mib = (self._memory_budget or 0) // _MIB
+            return memory_overage, f"memory budget {budget_mib} MiB exceeded"
+        return count_overage, f"cap {self._max_clients} exceeded"
+
+    def _memory_overage_locked(self, *, exclude_draining: bool = False) -> int:
+        """How many clients must go to fit the byte budget.  Holds the lock.
+
+        The count cap alone cannot express "7 cheap servers are fine but 3
+        typescript servers are not" — that was SCA-4688.  This charges each
+        live server its own measured footprint and reports how many LRU
+        victims it would take to get back inside the budget, which is the
+        unit :meth:`_enforce_cap_async` already loops on.
+
+        Counts ``_spawning`` and ``_shutting_down`` for exactly the reasons
+        the count overage does: a server about to exist already owes its
+        memory, and an evicted one still holds its pages until the process
+        actually goes.
+
+        Never asks for the last client's eviction.  A single server larger
+        than the whole budget — typescript on a small host — would otherwise
+        be evicted the moment it spawned and respawned by the next request,
+        forever, which costs more than the memory it was meant to save.
+        ``MIN_CLIENT_CAP`` is the same floor the count path already applies.
+        """
+        budget = self._memory_budget
+        if not budget:
+            return 0
+        total = sum(footprint_for(sid) for sid, _root in self._clients)
+        total += sum(
+            footprint_for(sid)
+            for (sid, _root) in self._spawning
+            if (sid, _root) not in self._clients
+        )
+        # ``_shutting_down`` is keyed by task; the client key is the value.
+        if not exclude_draining:
+            total += sum(
+                footprint_for(sid) for sid, _root in self._shutting_down.values()
+            )
+        if total <= budget:
+            return 0
+        # Only live clients can be handed to the sweep: a pending spawn has
+        # not reached its caller and a shutting-down one is already leaving.
+        # Ordered least-recently-used first, matching ``_evictable``, so this
+        # is what the sweep will actually have to remove rather than an
+        # optimistic best case.
+        candidates = [key for key in self._clients if key not in self._spawning]
+        candidates.sort(key=lambda key: self._last_used.get(key, 0.0))
+        # The floor applies to the fleet that will EXIST, which includes a
+        # pending spawn — not to ``_clients`` alone.  Counting only live
+        # clients let one live server plus one pending one report zero
+        # overage: ``1 - MIN_CLIENT_CAP`` is nothing removable, so the
+        # pre-start sweep in ``_get_or_spawn`` admitted the new process
+        # and both indexed concurrently.  On a 4 GiB host that is two
+        # typescript servers (3.4 GiB) against a 1 GiB budget — exactly
+        # the peak this bound exists to prevent.  Evicting the live one
+        # here still leaves the pending one, so the floor is honoured.
+        eventual = len(self._clients) + sum(
+            1 for k in self._spawning if k not in self._clients
+        )
+        removable = max(0, eventual - MIN_CLIENT_CAP)
+        needed = 0
+        for key in candidates[:removable]:
+            total -= footprint_for(key[0])
+            needed += 1
+            if total <= budget:
+                break
+        return needed
+
+    def _schedule_cap_enforcement(self) -> None:
+        """Re-run cap enforcement on the background loop, fire-and-forget.
+
+        Deliberately not awaited: the request that just finished must
+        not be charged for a victim's shutdown.  Making the releasing
+        caller wait would push the eviction cost into the diagnostics
+        timeout budget it is trying to leave.
+        """
+        if not self._enabled:
+            return
+        fut = self._loop.schedule(self._enforce_cap_async())
+        if fut is not None:
+            fut.add_done_callback(_log_cap_enforcement_result)
+
+    def _evictable(self) -> List[Tuple[Tuple[str, str], float]]:
+        """(key, last_used) for clients safe to shut down, oldest first.
+
+        Two things disqualify a client.  An outstanding request is the
+        obvious one.  The other is subtler: ``_get_or_spawn`` publishes
+        into ``_clients`` and only *then* returns, and its caller runs
+        ``_acquire`` after that return.  Through that whole window the
+        client is live with an in-flight count of zero, so it would
+        otherwise look idle to a concurrent spawn's sweep — which
+        carries no ``protect`` for it, since ``protect`` is per-call and
+        names only the sweeping caller's own key.  Evicting there hands
+        the victim's caller an already-shut-down client and silently
+        drops its diagnostics.  A key still registered in ``_spawning``
+        has not reached its caller yet, so it is not ours to reclaim.
+        """
+        with self._state_lock:
+            candidates = [
+                (key, self._last_used.get(key, 0.0))
+                for key in self._clients
+                if self._inflight.get(key, 0) == 0 and key not in self._spawning
+            ]
+        candidates.sort(key=lambda kv: kv[1])
+        return candidates
+
+    async def _evict(
+        self, key: Tuple[str, str], reason: str, *, handoff: Optional[float] = None
+    ) -> bool:
+        """Shut down the client at *key* and drop its bookkeeping.
+
+        The bookkeeping pop is synchronous; only the process shutdown is
+        awaited, and *handoff* decides how much of it the caller pays for.
+        ``None`` — the default, used by the hand-crank and the detached
+        sweeps — waits for the shutdown to finish.  A float waits at most
+        that long and then leaves the rest running, with the slot still
+        reserved in ``_shutting_down``.  That bound is what keeps a wedged
+        victim off a request's critical path.
+
+        Returns False if it vanished under us (a concurrent shutdown, or
+        a request that started between the scan and the pop) so callers
+        can keep their evicted-list honest.
+        """
+        with self._state_lock:
+            if self._inflight.get(key, 0) > 0:
+                return False
+            client = self._clients.pop(key, None)
+            self._last_used.pop(key, None)
+        if client is None:
+            return False
+        eventlog.log_evicted(key[0], key[1], reason)
+        # Reserve the slot the moment the task exists.  ``create_task``
+        # only schedules — the drain cannot have run and released the
+        # reservation before the registration below, because nothing
+        # awaits in between.
+        task = asyncio.create_task(self._drain_shutdown(key, client))
+        with self._state_lock:
+            self._shutting_down[task] = key
+        if handoff is None:
+            await asyncio.shield(task)
+        elif handoff > 0:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=handoff)
+            except asyncio.TimeoutError:
+                logger.debug(
+                    "evicted client %s is still shutting down after %.2fs; "
+                    "leaving it to drain with its slot reserved",
+                    key,
+                    handoff,
+                )
+        return True
+
+    async def _drain_shutdown(self, key: Tuple[str, str], client: LSPClient) -> None:
+        """Drive an evicted client's shutdown and free its reservation.
+
+        Always runs to completion even when the caller stopped waiting at
+        its handoff bound — a detached shutdown that nobody finishes would
+        orphan the process the cap exists to reclaim.  Failures are logged
+        rather than swallowed: nobody calls ``.result()`` on this task.
+
+        Releases its OWN reservation by task identity, so a concurrent
+        shutdown of the same workspace keeps its slot reserved instead of
+        being dropped by whichever drain happens to finish first.
+        """
+        try:
+            await client.shutdown()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("evicted client %s failed to shut down cleanly: %s", key, e)
+        finally:
+            # Always a Task here — this coroutine only ever runs via
+            # ``create_task`` in ``_evict`` — but ``current_task()`` is
+            # typed Optional, and silently skipping the release would
+            # leak the slot rather than surface the impossible case.
+            task = asyncio.current_task()
+            with self._state_lock:
+                if task is not None:
+                    self._shutting_down.pop(task, None)
+
+    async def _enforce_cap_async(
+        self,
+        protect: Optional[Tuple[str, str]] = None,
+        *,
+        handoff: Optional[float] = None,
+    ) -> List[Tuple[str, str]]:
+        """Drain to ``_max_clients``, evicting least-recently-used first.
+
+        *protect* is the key that just spawned: evicting the client the
+        caller is about to use would turn the cap into an infinite
+        spawn/evict loop.
+
+        A key registered in ``_spawning`` but not yet in ``_clients``
+        counts against the cap.  It is a server that is about to exist,
+        and the spawn path enforces the cap *before* ``client.start()``,
+        so that reservation is what keeps the fleet off ``cap + 1`` live
+        servers.  It also stops concurrent spawns for different roots
+        from each claiming the same single free slot.
+        """
+        evicted: List[Tuple[str, str]] = []
+        # ONE deadline for the whole sweep, not a fresh bound per victim.
+        # *handoff* is the caller's guard band — the slice of its request
+        # budget it is willing to spend making room.  Charging it once per
+        # victim made the cost scale with fleet overage: four wedged
+        # victims spent 4 x 0.5s before the replacement even started, so
+        # ``get_diagnostics_sync`` could still time out before
+        # ``wait_for_diagnostics`` got its configured budget — the silent
+        # no-diagnostics result this bound exists to prevent.  Past the
+        # deadline eviction continues at zero wait: the shutdowns detach
+        # and keep their slots reserved, which is the same trade ``_evict``
+        # already makes for a single wedged victim.
+        deadline = None if handoff is None else time.monotonic() + handoff
+        while True:
+            with self._state_lock:
+                overage = self._overage_locked()
+                residual, reason = self._binding_overage_locked(
+                    exclude_draining=True
+                )
+            if overage <= 0:
+                break
+            if residual <= 0:
+                # Every slot still over the cap already has a shutdown
+                # running against it.  Evicting another would drain the
+                # fleet past what the overage justifies — the shutdowns
+                # in flight are what close this gap, and each one frees
+                # its reservation when its process is actually gone.
+                # (``handoff=None`` awaits completion, so this is only
+                # ever reachable from a bounded-handoff caller.)
+                #
+                # Asked as "would we still be over once the drains land?"
+                # rather than "are there at least as many drains as
+                # victims?".  Those agree only while every server costs
+                # the same.  With per-type footprints they do not: a
+                # 150 MiB yaml shutdown is one drain against a one-victim
+                # overage, so the count test stopped the sweep — and once
+                # that cheap process exited, three 1.7 GiB typescript
+                # servers were left over a 4 GiB budget with no sweep
+                # scheduled to notice.  Comparing bytes-after-drain keeps
+                # the original intent and is exactly equivalent whenever
+                # the fleet is homogeneous.
+                break
+            victim = next(
+                (key for key, _ in self._evictable() if key != protect),
+                None,
+            )
+            if victim is None:
+                # Everything left is in-flight or protected.  Going over
+                # the cap briefly is the right trade against killing a
+                # live request.  ``_release`` re-runs this sweep the
+                # moment the first of them goes idle, so "briefly" is
+                # enforced rather than hoped for — the idle reaper is
+                # not the backstop here, and at ``idle_timeout: 0`` it
+                # does not run at all.
+                logger.debug(
+                    "LSP %s by %d but all clients are busy",
+                    reason,
+                    residual,
+                )
+                break
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            if await self._evict(victim, reason, handoff=remaining):
+                evicted.append(victim)
+            elif victim in self._clients:
+                # It became busy between the scan and the pop, and is
+                # still here — stop rather than spin on the same key.
+                break
+        return evicted
+
+    def enforce_cap_now(self) -> List[Tuple[str, str]]:
+        """Evict least-recently-used clients until the cap is satisfied.
+
+        The spawn path enforces the cap on its own; this is the
+        hand-crank for tests and ``hermes lsp`` tooling.
+        """
+        if not self._enabled:
+            return []
+        try:
+            return self._loop.run(self._enforce_cap_async(), timeout=15.0) or []
+        except Exception as e:  # noqa: BLE001
+            logger.debug("LSP cap enforcement failed: %s", e)
+            return []
 
     def _touch(self, client: LSPClient) -> None:
         """Refresh the last-used timestamp for a client we just used.
@@ -629,7 +1310,7 @@ class LSPService:
         key = (client.server_id, client.workspace_root)
         with self._state_lock:
             if key in self._clients:
-                self._last_used[key] = time.time()
+                self._last_used[key] = _idle_clock()
 
     async def _idle_reaper_loop(self) -> None:
         interval = min(60.0, self._idle_timeout)
@@ -646,12 +1327,17 @@ class LSPService:
                 logger.debug("LSP idle reaper sweep error: %s", e)
 
     async def _reap_idle_once(self) -> None:
-        cutoff = time.time() - self._idle_timeout
+        cutoff = _idle_clock() - self._idle_timeout
         with self._state_lock:
+            # The in-flight guard closes the residual race the
+            # MIN_IDLE_TIMEOUT clamp only makes unlikely: reaping a client
+            # mid-request makes the outer wait time out, and that handler
+            # marks the pair broken for the whole process lifetime.
             idle_keys = [
                 key
                 for key in self._clients
                 if self._last_used.get(key, 0) < cutoff
+                and self._inflight.get(key, 0) == 0
             ]
             clients = [self._clients.pop(key) for key in idle_keys]
             for key in idle_keys:
@@ -674,11 +1360,17 @@ class LSPService:
             await asyncio.gather(reaper, return_exceptions=True)
         with self._state_lock:
             clients = list(self._clients.values())
+            # Evictions whose handoff bound expired are still draining.
+            # Stopping the loop out from under them would orphan exactly
+            # the processes this shutdown exists to reclaim.
+            draining = list(self._shutting_down)
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
+            self._inflight.clear()
         await asyncio.gather(
             *(c.shutdown() for c in clients),
+            *draining,
             return_exceptions=True,
         )
 

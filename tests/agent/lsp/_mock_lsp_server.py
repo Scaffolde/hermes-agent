@@ -25,6 +25,11 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
   ``didChange`` sleeps ``MOCK_LSP_PUSH_DELAY`` seconds (default 1.0)
   and then pushes EMPTY diagnostics.  Models a server that fixes
   the ghost if you actually wait for it.  Pull endpoint rejects.
+- ``"hang_shutdown"`` — serves like ``errors``, but refuses to die:
+  never answers ``shutdown``, ignores ``exit``, and ignores SIGTERM.
+  Only SIGKILL ends it, so evicting one costs the client's full
+  ``shutdown`` request timeout plus ``SHUTDOWN_GRACE``.  Models the
+  wedged tsserver that makes an eviction expensive.
 
 The script writes JSON-RPC framed messages to stdout and reads from
 stdin.  No third-party dependencies — uses only stdlib so it runs
@@ -34,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import time
 
@@ -64,10 +70,21 @@ def write_message(obj):
 
 def main():
     script = os.environ.get("MOCK_LSP_SCRIPT", "clean")
+    if script == "hang_shutdown":
+        # Survive the SIGTERM in ``_cleanup_process`` so the eviction has
+        # to spend the whole SHUTDOWN_GRACE before SIGKILL lands.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
     while True:
         msg = read_message()
         if msg is None:
+            if script == "hang_shutdown":
+                # A genuinely wedged server does not tidy itself up when
+                # its stdin closes either.  Exiting here would let the
+                # eviction finish on the terminate() before SHUTDOWN_GRACE
+                # is ever spent, which understates what a hung victim costs.
+                while True:
+                    time.sleep(1.0)
             return 0
 
         if "id" in msg and msg.get("method") == "initialize":
@@ -143,7 +160,7 @@ def main():
                 )
                 continue
             diagnostics = []
-            if script == "errors":
+            if script in {"errors", "hang_shutdown"}:
                 diagnostics = error_diag
             write_message(
                 {
@@ -184,10 +201,16 @@ def main():
             continue
 
         if msg.get("method") == "shutdown":
+            if script == "hang_shutdown":
+                # No reply, ever.  The client waits out its request
+                # timeout, then escalates to signals we also ignore.
+                continue
             write_message({"jsonrpc": "2.0", "id": msg["id"], "result": None})
             continue
 
         if msg.get("method") == "exit":
+            if script == "hang_shutdown":
+                continue
             return 0
 
         # Unknown request: respond with method-not-found.
