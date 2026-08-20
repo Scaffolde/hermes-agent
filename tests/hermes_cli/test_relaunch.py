@@ -106,6 +106,12 @@ class TestRelaunch:
             calls.append((path, argv))
             raise SystemExit(0)
 
+        # relaunch() defaults original_argv to sys.argv[1:], so without pinning
+        # it the *pytest* command line is what gets scanned for inherited flags.
+        # `pytest -p no:randomly` then inherits as hermes's `-p/--profile` (they
+        # share the short flag) and lands in the relaunch argv, failing this
+        # assertion for a reason the test never set up (SCA-4692).
+        monkeypatch.setattr(relaunch_mod.sys, "argv", ["hermes"])
         monkeypatch.setattr(relaunch_mod.os, "execvp", fake_execvp)
         monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: "/usr/bin/hermes")
 
@@ -120,6 +126,9 @@ class TestRelaunch:
         hermes).  relaunch() must detect win32 and use subprocess.run +
         sys.exit instead."""
         monkeypatch.setattr(relaunch_mod.sys, "platform", "win32")
+        # Pin argv for the same reason as test_calls_execvp: the ambient pytest
+        # command line would otherwise be scanned for inherited flags.
+        monkeypatch.setattr(relaunch_mod.sys, "argv", ["hermes"])
         monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: r"C:\Users\test\hermes.exe")
 
         import subprocess as _subprocess

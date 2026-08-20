@@ -281,3 +281,98 @@ def _restore_dashboard_auth_required():
                 pass
         else:
             module.app.state.auth_required = previous
+
+
+@pytest.fixture(autouse=True)
+def _restore_hermes_main_namespace():
+    """Snapshot and restore ``hermes_cli.main``'s module namespace per test.
+
+    ``importlib.reload`` does NOT create a new module object — it re-executes the
+    source into the SAME ``__dict__``, rebinding every name in place. So a test
+    that reloads ``hermes_cli.main`` (``test_curator_recent_run_notice.py``,
+    ``test_env_export_prefix.py``) silently invalidates every reference other
+    test modules captured at collection time: their ``_UpdateOutputStream`` is
+    now a different class object than the one the reloaded module builds.
+
+    That is what broke
+    ``test_update_hangup_protection.py::test_wraps_stdout_and_stderr_with_mirror``.
+    It imports both ``_install_hangup_protection`` and ``_UpdateOutputStream`` at
+    collection; after a reload the function's ``__globals__`` IS the mutated
+    module dict, so it instantiates the NEW class, while the test still holds the
+    OLD one::
+
+        assert isinstance(sys.stdout, _UpdateOutputStream)
+        # False — where sys.stdout is <hermes_cli.main._UpdateOutputStream object>
+
+    Same-name, different-identity: the failure reads like nonsense precisely
+    because both sides print identically (SCA-4692).
+
+    Restoring the original namespace puts the collection-time objects back, so
+    references held across module boundaries stay valid. The snapshot is a
+    467-entry dict copy measured at ~0.7us, and the module object is captured at
+    setup rather than re-looked-up at teardown — under the eviction fixtures
+    above, sys.modules may legitimately hold a different object by then, and the
+    one to repair is the one everybody else still points at.
+    """
+    module = sys.modules.get("hermes_cli.main")
+    if module is None:
+        yield
+        return
+
+    saved = dict(module.__dict__)
+    try:
+        yield
+    finally:
+        if module.__dict__ != saved:
+            module.__dict__.clear()
+            module.__dict__.update(saved)
+
+
+@pytest.fixture(autouse=True)
+def _restore_dashboard_app_router():
+    """Snapshot and restore the process-global app's routes and lifespan.
+
+    ``app`` is a module-level FastAPI singleton and ``include_router`` mutates
+    it in place: it appends to ``app.router.routes`` and — the part that bites —
+    *rebinds* ``app.router.lifespan_context`` to a ``merged_lifespan`` closure
+    over the included router's lifespan (fastapi/routing.py). Nothing about that
+    is undone when the test that triggered it ends.
+
+    ``test_project_plugin_rce_bypass.py::TestEndToEndPocBlocked::test_full_chain_blocked``
+    patches ``importlib.util.spec_from_file_location`` and then calls
+    ``_mount_plugin_api_routes()``. The patch is correct for the payload plugin
+    the test is about, but *bundled* plugins legitimately have api files too (the
+    test says so itself), so for those the mocked loader yields a Mock module
+    whose ``router`` attribute is a Mock — and that Mock's ``lifespan_context``
+    gets merged into the singleton permanently.
+
+    The symptom lands far away and much later, in whichever test next actually
+    enters the lifespan, as FastAPI tries to ``**``-merge the mock as the yielded
+    state::
+
+        TypeError: AsyncMock.keys() returned a non-iterable (type coroutine)
+
+    That cost ``test_web_server.py::TestDesktopCronTicker`` and
+    ``test_web_server_boot_handshake.py`` two tests in the whole-tree run, for a
+    cause neither of them triggered (SCA-4692).
+
+    Restoring here fixes the class rather than the instance: any test that mounts
+    routes into the global app is undone, not just the plugin-RCE one. Like
+    ``_restore_dashboard_auth_required`` above, this deliberately does NOT import
+    web_server — it stays free for the ~490 files that never touch the dashboard.
+    """
+    module = sys.modules.get("hermes_cli.web_server")
+    if module is None:
+        yield
+        return
+
+    router = module.app.router
+    saved_routes = list(router.routes)
+    saved_lifespan = router.lifespan_context
+    try:
+        yield
+    finally:
+        # Slice-assign: `app.routes` IS `app.router.routes`, so rebinding the
+        # attribute would leave `app.routes` pointing at the mutated list.
+        router.routes[:] = saved_routes
+        router.lifespan_context = saved_lifespan
