@@ -23,8 +23,38 @@ def _reset():
 
 @pytest.fixture
 def caplog_lsp(caplog):
+    """Capture `hermes.lint.lsp` records WITHOUT letting them escape.
+
+    `caplog.set_level()` leaves propagation on, so records still climb to the
+    root logger. If a production file handler is installed in this process they
+    land in the operator's real `agent.log` — and at DEBUG, so even the
+    steady-state events the eventlog design deliberately keeps below INFO get
+    written out. Disabling propagation keeps them in caplog's handler, which is
+    all these tests read.
+
+    Capture has to survive that. pytest's capture handler lives on the *root*
+    logger, so switching propagation off could cut these tests off from their
+    own records. Under the pinned pytest, `set_level(logger=...)` also binds the
+    handler to the named logger, so it does not — but that is an implementation
+    detail rather than a documented promise. The bind below makes the capture
+    path explicit and self-contained: it is a no-op today (pytest has already
+    attached the same handler object), and becomes load-bearing only if that
+    behaviour ever changes. Teardown removes only a handler this fixture added,
+    so pytest's own handler lifecycle is left alone.
+    """
+    lg = logging.getLogger("hermes.lint.lsp")
+    previous = lg.propagate
     caplog.set_level(logging.DEBUG, logger="hermes.lint.lsp")
-    return caplog
+    attached_here = caplog.handler not in lg.handlers
+    if attached_here:
+        lg.addHandler(caplog.handler)
+    lg.propagate = False
+    try:
+        yield caplog
+    finally:
+        lg.propagate = previous
+        if attached_here:
+            lg.removeHandler(caplog.handler)
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +146,50 @@ def test_thousand_clean_writes_emit_one_info(caplog_lsp):
     info_records = [r for r in caplog_lsp.records if r.levelno == logging.INFO]
     assert len(info_records) == 1
     assert "active for" in info_records[0].getMessage()
+
+
+# ---------------------------------------------------------------------------
+# Containment: these records must never reach the root logger's handlers
+# ---------------------------------------------------------------------------
+
+
+def test_records_do_not_escape_to_root_handlers(caplog_lsp):
+    """The fixture must keep records out of every handler but caplog's.
+
+    Without this, `caplog.set_level()` leaves propagation on and the DEBUG
+    records climb to root. In any process holding a production file handler
+    that means writes into the operator's `~/.hermes/logs/agent.log`, where
+    the synthetic `/x*.py` paths below are indistinguishable from real
+    language-server traffic to anyone replaying the log.
+    """
+    escaped: list[logging.LogRecord] = []
+
+    class _Spy(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.name == "hermes.lint.lsp":
+                escaped.append(record)
+
+    spy = _Spy(level=logging.DEBUG)
+    root = logging.getLogger()
+    root.addHandler(spy)
+    previous_root_level = root.level
+    root.setLevel(logging.DEBUG)
+    try:
+        eventlog.log_active("pyright", "/proj")
+        eventlog.log_clean("pyright", "/proj/x.py")
+        for i in range(5):
+            eventlog.log_diagnostics("pyright", f"/x{i}.py", 1)
+        eventlog.log_spawn_failed("pyright", "/proj", FileNotFoundError("nope"))
+    finally:
+        root.removeHandler(spy)
+        root.setLevel(previous_root_level)
+
+    # caplog still sees everything — containment must not cost coverage.
+    assert caplog_lsp.records, "fixture stopped capturing records"
+    assert escaped == [], (
+        f"{len(escaped)} lsp record(s) reached the root logger and would be "
+        "written to any production file handler installed in this process"
+    )
 
 
 # ---------------------------------------------------------------------------

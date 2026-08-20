@@ -52,16 +52,30 @@ if str(PROJECT_ROOT) not in sys.path:
 # conftest is imported before any test module, so setting it here closes that
 # window. The per-test fixture still applies for everything after import.
 #
+# The sandbox is UNCONDITIONAL. It used to apply only when HERMES_HOME was
+# unset, which left the hole wide open for exactly the people most likely to
+# hit it: anyone running the suite from inside a Hermes agent or gateway
+# process, where HERMES_HOME is exported and points at the real root. In that
+# environment the block below was skipped, import-time `setup_logging()`
+# attached rotating handlers to the operator's real `agent.log`, and every
+# propagating logger in the suite wrote into it. `hermes.lint.lsp` is the
+# costly case: replaying its `log_active`/`log_reaped` pairs over the polluted
+# log reported 20 concurrent language-server clients climbing with no
+# balancing reaps, when ground truth was 0 — the pollution did not just add
+# noise, it inverted an accumulation verdict that a build decision rested on.
+# Tests never legitimately read the session-level HERMES_HOME anyway (the
+# per-test `_isolate_env` fixture rewires it to a tempdir regardless), and
+# nothing in CI sets it, so honoring a preset value bought nothing.
+#
 # ORDER MATTERS: the kanban write guard's deny-list (further down) must know
 # the REAL Hermes root — capture it BEFORE the sandbox rewires HERMES_HOME,
 # otherwise the deny-list would point at the throwaway tempdir and the guard
 # would silently stop protecting the operator's actual ~/.hermes (#69385).
 _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
 _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
-if not os.environ.get("HERMES_HOME"):
-    _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
-    os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
-    atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
+_SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
+os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
+atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
 
 #: HERMES_HOME as it stood when conftest was imported - i.e. before any test
 #: module could import code that configures logging. Recorded so the guard in
@@ -581,8 +595,21 @@ def _capture_real_kanban_root() -> Path:
     if _PRE_SANDBOX_HERMES_HOME:
         # HERMES_HOME was genuinely set before the sandbox — honor it via the
         # normal resolver (it may be a profile dir whose root matters).
+        #
+        # `get_default_hermes_root()` reads HERMES_HOME from the environment,
+        # and the sandbox at the top of this file has already replaced it with
+        # a tempdir. Restore the pre-sandbox value for the duration of the
+        # call, or the deny-list would resolve to the throwaway dir and stop
+        # protecting the operator's real root — the #69385 regression, just
+        # reached by a different route now that the sandbox is unconditional.
         from hermes_constants import get_default_hermes_root
-        return get_default_hermes_root().resolve()
+
+        sandboxed = os.environ.get("HERMES_HOME", "")
+        os.environ["HERMES_HOME"] = _PRE_SANDBOX_HERMES_HOME
+        try:
+            return get_default_hermes_root().resolve()
+        finally:
+            os.environ["HERMES_HOME"] = sandboxed
     # No pre-existing HERMES_HOME: the real root is the platform default,
     # NOT the sandbox tempdir now sitting in the env.
     return (Path.home() / ".hermes").resolve()
