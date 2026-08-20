@@ -254,6 +254,16 @@ down the least-recently-used one first. A server with a request in
 flight is never chosen — the cap waits rather than interrupting a live
 diagnostic — so a burst of concurrent edits can briefly exceed it.
 
+Evicting a server normally finishes well before the replacement starts.
+A server that has wedged is different: shutting it down costs a request
+timeout plus a kill grace, and that time would otherwise come out of the
+budget the triggering edit had for collecting diagnostics — leaving it
+to report no diagnostics as though the language server had nothing to
+say. The eviction hands off after half a second instead: the shutdown
+carries on in the background, still driven to completion, and the slot
+it is freeing stays reserved against the cap until the process is
+actually gone.
+
 ## Disabling
 
 Set `lsp.enabled: false` in `config.yaml` to disable the entire
