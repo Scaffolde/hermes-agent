@@ -2646,10 +2646,7 @@ DEFAULT_CONFIG = {
     # inserts, /resume listing, and insights queries.
     "sessions": {
         # When true, prune ended sessions inactive for retention_days once
-        # per (roughly) min_interval_hours at CLI/gateway/cron startup, and
-        # on the resident gateway's hourly housekeeping sweep (per served
-        # profile, without VACUUM) — so a gateway that stays up for weeks
-        # keeps pruning on cadence instead of only at its next restart.
+        # per (roughly) min_interval_hours at CLI/gateway/cron startup.
         # Activity is the latest message timestamp, falling back to creation
         # time for empty sessions. Active sessions are always preserved.
         # Default false: session history is valuable for search recall, and

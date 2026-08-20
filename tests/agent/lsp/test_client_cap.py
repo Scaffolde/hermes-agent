@@ -149,6 +149,7 @@ def test_cgroup_limit_wins_over_node_memory_when_smaller(monkeypatch, tmp_path):
     RAM; deriving the cap from that permits a population that OOMs."""
     limit_file = tmp_path / "memory.max"
     limit_file.write_text(str(4 * GIB), encoding="utf-8")
+    no_proc(monkeypatch, tmp_path)
     monkeypatch.setattr(manager_mod, "CGROUP_MEMORY_LIMIT_PATHS", (str(limit_file),))
     monkeypatch.setattr(manager_mod.os, "sysconf", lambda name: (64 * GIB) // 4096 if "PHYS" in name else 4096)
 
@@ -159,9 +160,248 @@ def test_cgroup_unlimited_sentinel_is_ignored(monkeypatch, tmp_path):
     """cgroup v1 writes a page-aligned LONG_MAX for "no limit"."""
     limit_file = tmp_path / "memory.limit_in_bytes"
     limit_file.write_text(str((1 << 63) - 4096), encoding="utf-8")
+    no_proc(monkeypatch, tmp_path)
     monkeypatch.setattr(manager_mod, "CGROUP_MEMORY_LIMIT_PATHS", (str(limit_file),))
 
     assert manager_mod._cgroup_memory_limit_bytes() is None
+
+
+# ----------------------------------------------------------------------
+# cgroup path resolution
+#
+# The two tests above monkeypatch ``CGROUP_MEMORY_LIMIT_PATHS`` to a temp
+# file, which proves the parsing and the min(), and can say nothing about
+# *which file* a deployed process reads.  The fixed paths are hierarchy
+# roots: under a systemd unit with ``MemoryMax=``, or in a container
+# without a private cgroup namespace, the limit that binds the process
+# lives at the path named in ``/proc/self/cgroup``, while the root reads
+# ``max``.  These build a whole fake ``/proc`` + cgroupfs so the path
+# resolution itself is the thing under test.
+# ----------------------------------------------------------------------
+
+
+V2_MOUNTINFO = (
+    "31 24 0:27 {mount_root} {mount_point} rw,nosuid,nodev,noexec,relatime"
+    " shared:9 - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot\n"
+)
+V1_MOUNTINFO = (
+    "24 23 0:21 / /sys/fs/cgroup ro,nosuid,nodev,noexec - tmpfs tmpfs ro,mode=755\n"
+    "31 24 0:27 {mount_root} {mount_point} rw,nosuid,nodev,noexec,relatime"
+    " - cgroup cgroup rw,memory\n"
+)
+
+
+def no_proc(monkeypatch, tmp_path) -> None:
+    """Point the resolver at a root with no ``/proc``, as on macOS.
+
+    Without this the tests that exercise the fixed-path fallback would
+    read the *real* ``/proc`` on Linux CI and stop being deterministic.
+    """
+    empty = tmp_path / "no-proc-root"
+    empty.mkdir(exist_ok=True)
+    monkeypatch.setattr(manager_mod, "CGROUP_FS_ROOT", str(empty))
+
+
+def fake_root(
+    tmp_path,
+    *,
+    cgroup: str,
+    mountinfo: str,
+    limits: dict,
+) -> str:
+    """Materialise a fake filesystem root and return its path.
+
+    *cgroup* is the ``/proc/self/cgroup`` body, *mountinfo* the
+    ``/proc/self/mountinfo`` body, and *limits* maps an absolute
+    cgroupfs path to the text of the limit file at it.
+    """
+    root = tmp_path / "root"
+    proc = root / "proc" / "self"
+    proc.mkdir(parents=True, exist_ok=True)
+    (proc / "cgroup").write_text(cgroup, encoding="utf-8")
+    (proc / "mountinfo").write_text(mountinfo, encoding="utf-8")
+    for abs_path, text in limits.items():
+        target = root / abs_path.lstrip("/")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    return str(root)
+
+
+def test_v2_limit_read_from_this_process_cgroup_not_the_hierarchy_root(monkeypatch, tmp_path):
+    """A systemd unit's ``MemoryMax=`` lives under its own cgroup path.
+
+    The hierarchy root reads ``max``.  Reading only the root reports
+    "unlimited", falls through to ``SC_PHYS_PAGES``, and sizes the fleet
+    off the node's 64 GiB while the unit may use 4 GiB.
+    """
+    root = fake_root(
+        tmp_path,
+        cgroup="0::/system.slice/hermes-agent.service\n",
+        mountinfo=V2_MOUNTINFO.format(mount_root="/", mount_point="/sys/fs/cgroup"),
+        limits={
+            "/sys/fs/cgroup/memory.max": "max\n",
+            "/sys/fs/cgroup/system.slice/memory.max": "max\n",
+            "/sys/fs/cgroup/system.slice/hermes-agent.service/memory.max": f"{4 * GIB}\n",
+        },
+    )
+    monkeypatch.setattr(manager_mod, "CGROUP_FS_ROOT", root)
+
+    assert manager_mod._cgroup_memory_limit_bytes() == 4 * GIB
+
+
+def test_v2_node_memory_does_not_size_the_cap_inside_a_constrained_unit(monkeypatch, tmp_path):
+    """The consequence: 12 servers against a budget that affords 1."""
+    root = fake_root(
+        tmp_path,
+        cgroup="0::/system.slice/hermes-agent.service\n",
+        mountinfo=V2_MOUNTINFO.format(mount_root="/", mount_point="/sys/fs/cgroup"),
+        limits={
+            "/sys/fs/cgroup/memory.max": "max\n",
+            "/sys/fs/cgroup/system.slice/hermes-agent.service/memory.max": f"{4 * GIB}\n",
+        },
+    )
+    monkeypatch.setattr(manager_mod, "CGROUP_FS_ROOT", root)
+    monkeypatch.setattr(
+        manager_mod.os, "sysconf", lambda name: (64 * GIB) // 4096 if "PHYS" in name else 4096
+    )
+
+    assert manager_mod.host_memory_bytes() == 4 * GIB
+    assert manager_mod.default_max_clients() == 1
+
+
+def test_an_ancestor_limit_binds_a_descendant(monkeypatch, tmp_path):
+    """A slice capped below its child's own cap is the one that binds.
+
+    The leaf may declare 8 GiB; if the enclosing slice allows 2 GiB the
+    process still gets 2 GiB, so the walk takes the minimum rather than
+    the first limit it finds.
+    """
+    root = fake_root(
+        tmp_path,
+        cgroup="0::/system.slice/hermes-agent.service\n",
+        mountinfo=V2_MOUNTINFO.format(mount_root="/", mount_point="/sys/fs/cgroup"),
+        limits={
+            "/sys/fs/cgroup/memory.max": "max\n",
+            "/sys/fs/cgroup/system.slice/memory.max": f"{2 * GIB}\n",
+            "/sys/fs/cgroup/system.slice/hermes-agent.service/memory.max": f"{8 * GIB}\n",
+        },
+    )
+    monkeypatch.setattr(manager_mod, "CGROUP_FS_ROOT", root)
+
+    assert manager_mod._cgroup_memory_limit_bytes() == 2 * GIB
+
+
+def test_v2_unlimited_everywhere_reports_no_limit(monkeypatch, tmp_path):
+    """An unconstrained host must still fall through to node memory."""
+    root = fake_root(
+        tmp_path,
+        cgroup="0::/user.slice/user-1000.slice\n",
+        mountinfo=V2_MOUNTINFO.format(mount_root="/", mount_point="/sys/fs/cgroup"),
+        limits={
+            "/sys/fs/cgroup/memory.max": "max\n",
+            "/sys/fs/cgroup/user.slice/memory.max": "max\n",
+            "/sys/fs/cgroup/user.slice/user-1000.slice/memory.max": "max\n",
+        },
+    )
+    monkeypatch.setattr(manager_mod, "CGROUP_FS_ROOT", root)
+
+    assert manager_mod._cgroup_memory_limit_bytes() is None
+
+
+def test_v1_memory_limit_read_from_the_controller_mount(monkeypatch, tmp_path):
+    """v1 puts the memory controller on its own mount, path from column 3."""
+    root = fake_root(
+        tmp_path,
+        cgroup="9:memory:/docker/deadbeef\n2:cpu,cpuacct:/docker/deadbeef\n",
+        mountinfo=V1_MOUNTINFO.format(
+            mount_root="/", mount_point="/sys/fs/cgroup/memory"
+        ),
+        limits={
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes": f"{(1 << 63) - 4096}\n",
+            "/sys/fs/cgroup/memory/docker/deadbeef/memory.limit_in_bytes": f"{3 * GIB}\n",
+        },
+    )
+    monkeypatch.setattr(manager_mod, "CGROUP_FS_ROOT", root)
+
+    assert manager_mod._cgroup_memory_limit_bytes() == 3 * GIB
+
+
+def test_mount_root_prefix_is_stripped_from_the_cgroup_path(monkeypatch, tmp_path):
+    """A bind-mounted subtree makes the cgroup path outer, the mount inner.
+
+    ``/proc/self/cgroup`` names ``/system.slice/hermes-agent.service``
+    while the mount exposes ``/system.slice`` at ``/sys/fs/cgroup``, so
+    the directory on disk is ``/sys/fs/cgroup/hermes-agent.service``.
+    Joining the raw cgroup path onto the mount point would miss it.
+    """
+    root = fake_root(
+        tmp_path,
+        cgroup="0::/system.slice/hermes-agent.service\n",
+        mountinfo=V2_MOUNTINFO.format(
+            mount_root="/system.slice", mount_point="/sys/fs/cgroup"
+        ),
+        limits={
+            "/sys/fs/cgroup/memory.max": "max\n",
+            "/sys/fs/cgroup/hermes-agent.service/memory.max": f"{5 * GIB}\n",
+        },
+    )
+    monkeypatch.setattr(manager_mod, "CGROUP_FS_ROOT", root)
+
+    assert manager_mod._cgroup_memory_limit_bytes() == 5 * GIB
+
+
+def test_a_bind_mount_listed_first_does_not_shadow_the_real_hierarchy(monkeypatch, tmp_path):
+    """Several cgroup2 mounts can exist; the first is not always ours.
+
+    A bind mount rooted outside this process's cgroup cannot map its
+    path at all.  Accepting the first mountinfo entry reads that
+    unrelated mount's root, finds it unlimited, and reports "no limit"
+    without ever consulting the full hierarchy that holds the real one.
+    """
+    root = fake_root(
+        tmp_path,
+        cgroup="0::/system.slice/hermes-agent.service\n",
+        mountinfo=(
+            V2_MOUNTINFO.format(mount_root="/other.slice", mount_point="/sys/fs/cgroup/bind")
+            + V2_MOUNTINFO.format(mount_root="/", mount_point="/sys/fs/cgroup")
+        ),
+        limits={
+            "/sys/fs/cgroup/bind/memory.max": "max\n",
+            "/sys/fs/cgroup/memory.max": "max\n",
+            "/sys/fs/cgroup/system.slice/hermes-agent.service/memory.max": f"{4 * GIB}\n",
+        },
+    )
+    monkeypatch.setattr(manager_mod, "CGROUP_FS_ROOT", root)
+
+    assert manager_mod._cgroup_memory_limit_bytes() == 4 * GIB
+
+
+def test_absent_proc_falls_back_to_the_fixed_paths(monkeypatch, tmp_path):
+    """macOS and Windows have no ``/proc``; the old behaviour is the floor."""
+    limit_file = tmp_path / "memory.max"
+    limit_file.write_text(str(6 * GIB), encoding="utf-8")
+    no_proc(monkeypatch, tmp_path)
+    monkeypatch.setattr(manager_mod, "CGROUP_MEMORY_LIMIT_PATHS", (str(limit_file),))
+
+    assert manager_mod._cgroup_memory_limit_bytes() == 6 * GIB
+
+
+def test_unparseable_proc_cgroup_falls_back_to_the_fixed_paths(monkeypatch, tmp_path):
+    """Garbage in ``/proc/self/cgroup`` must not lose the root reading."""
+    root = fake_root(
+        tmp_path,
+        cgroup="not a cgroup line\n",
+        mountinfo="junk\n",
+        limits={"/sys/fs/cgroup/memory.max": f"{7 * GIB}\n"},
+    )
+    monkeypatch.setattr(manager_mod, "CGROUP_FS_ROOT", root)
+    monkeypatch.setattr(
+        manager_mod,
+        "CGROUP_MEMORY_LIMIT_PATHS",
+        (str(tmp_path / "root" / "sys" / "fs" / "cgroup" / "memory.max"),),
+    )
+
+    assert manager_mod._cgroup_memory_limit_bytes() == 7 * GIB
 
 
 # ----------------------------------------------------------------------
