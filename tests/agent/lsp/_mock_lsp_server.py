@@ -68,12 +68,57 @@ def write_message(obj):
     sys.stdout.buffer.flush()
 
 
+def _spawn_grandchild():
+    """Fork a long-lived worker the way a real language server does.
+
+    ``typescript-language-server`` runs ``tsserver`` as a child, and
+    ``pyright-langserver`` forks node workers.  The worker inherits this
+    process's group -- we are the group leader, courtesy of
+    ``start_new_session=True`` in the client -- and it ignores SIGTERM, so
+    it survives anything aimed at this PID alone.  Its PID goes to
+    ``MOCK_LSP_CHILD_PIDFILE`` so the test can go looking for the corpse.
+    """
+    import subprocess
+
+    # The worker publishes its OWN pid, and only after SIG_IGN is armed.
+    # Writing it here (right after Popen returns) would race: shutdown could
+    # win, the still-default SIGTERM would kill the worker, and the test
+    # would pass without ever exercising the SIGKILL escalation it exists
+    # to prove.  The rename is atomic, so the reader never sees a partial
+    # write and never has to retry a half-written pid.
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os,signal,time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "pf = os.environ.get('MOCK_LSP_CHILD_PIDFILE')\n"
+            "if pf:\n"
+            "    tmp = pf + '.tmp'\n"
+            "    with open(tmp, 'w', encoding='utf-8') as fh:\n"
+            "        fh.write(str(os.getpid()))\n"
+            "        fh.flush()\n"
+            "        os.fsync(fh.fileno())\n"
+            "    os.replace(tmp, pf)\n"
+            "while True: time.sleep(0.05)\n",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return worker
+
+
 def main():
     script = os.environ.get("MOCK_LSP_SCRIPT", "clean")
     if script == "hang_shutdown":
         # Survive the SIGTERM in ``_cleanup_process`` so the eviction has
         # to spend the whole SHUTDOWN_GRACE before SIGKILL lands.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if script == "spawns_child":
+        # Hold the handle so the worker is not reaped by GC; it outlives
+        # us on purpose.
+        _spawn_grandchild()
 
     while True:
         msg = read_message()
