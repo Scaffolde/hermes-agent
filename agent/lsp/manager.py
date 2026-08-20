@@ -177,6 +177,42 @@ def _log_cap_enforcement_result(fut: Future) -> None:
         logger.debug("detached LSP cap enforcement failed: %s", e)
 
 
+def _idle_clock() -> float:
+    """Clock for idle bookkeeping — suspend-inclusive, never the wall clock.
+
+    ``_last_used`` and the reaper's cutoff are only ever compared to each
+    other, so they need elapsed time, not a date.  The wall clock supplies
+    neither guarantee: NTP correction and sleep/wake both step it, and a
+    backwards step of more than ``idle_timeout`` pushes every cutoff into
+    the past and stalls reaping until the clock catches up (a forwards step
+    does the opposite and reaps servers that are still in use).  Both
+    failure modes are silent, and reviving unbounded accumulation is the
+    exact leak the reaper exists to close.
+
+    ``CLOCK_MONOTONIC`` fixes the stepping but introduces the mirror-image
+    bug: on Linux it *stops* while the machine is suspended.  A laptop that
+    sleeps for longer than ``idle_timeout`` therefore wakes with every
+    ``_last_used`` stamp still inside the window, and each sleep/wake cycle
+    leaks another generation of servers — worse than the wall clock, which
+    at least aged them.  ``CLOCK_BOOTTIME`` is monotonic *and* counts
+    suspended time, so it is the only source that satisfies both halves.
+
+    Platforms without ``CLOCK_BOOTTIME`` (macOS, some BSDs) fall back to
+    ``monotonic()``.  The resolution is deliberately per-call rather than
+    cached at import: it keeps the module's ``time`` reference patchable by
+    the suspend/NTP tests, and a ``getattr`` is noise next to a sweep.
+    """
+    boottime_id = getattr(time, "CLOCK_BOOTTIME", None)
+    if boottime_id is not None:
+        try:
+            return time.clock_gettime(boottime_id)
+        except (OSError, ValueError, AttributeError):
+            # Kernel or libc refused the clock — degrade rather than take
+            # the whole reaper down with an unhandled error.
+            pass
+    return time.monotonic()
+
+
 class _BackgroundLoop:
     """A daemon thread that owns one asyncio event loop.
 
@@ -729,7 +765,7 @@ class LSPService:
         with self._state_lock:
             client = self._clients.get(key)
             if client is not None and client.is_running:
-                self._last_used[key] = time.time()
+                self._last_used[key] = _idle_clock()
                 eventlog.log_active(srv.server_id, per_server_root)
                 return client
             spawning = self._spawning.get(key)
@@ -791,7 +827,7 @@ class LSPService:
                 return None
             with self._state_lock:
                 self._clients[key] = client
-                self._last_used[key] = time.time()
+                self._last_used[key] = _idle_clock()
             # Second sweep, protecting the client this call returns:
             # concurrent spawns for other roots can still have raced the
             # reservation above. Evicting the caller's own client would
@@ -1072,7 +1108,7 @@ class LSPService:
         key = (client.server_id, client.workspace_root)
         with self._state_lock:
             if key in self._clients:
-                self._last_used[key] = time.time()
+                self._last_used[key] = _idle_clock()
 
     async def _idle_reaper_loop(self) -> None:
         interval = min(60.0, self._idle_timeout)
@@ -1089,7 +1125,7 @@ class LSPService:
                 logger.debug("LSP idle reaper sweep error: %s", e)
 
     async def _reap_idle_once(self) -> None:
-        cutoff = time.time() - self._idle_timeout
+        cutoff = _idle_clock() - self._idle_timeout
         with self._state_lock:
             # The in-flight guard closes the residual race the
             # MIN_IDLE_TIMEOUT clamp only makes unlikely: reaping a client

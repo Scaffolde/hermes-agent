@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 from agent.lsp.client import LSPClient
-from agent.lsp.manager import LSPService
+from agent.lsp.manager import LSPService, _idle_clock
 from agent.lsp.servers import SERVERS, ServerContext, ServerDef, SpawnSpec
 
 
@@ -153,8 +153,11 @@ def test_cap_holds_the_fleet_with_every_client_active(workspaces):
             f"cap={cap} must hold the fleet at {cap}, got {len(svc._clients)}"
         )
 
-        # Prove the reaper could not have produced this result.
-        cutoff = time.time() - svc._idle_timeout
+        # Prove the reaper could not have produced this result.  Read the
+        # service's own idle clock: ``_last_used`` is written with it, and
+        # comparing those values against a wall-clock cutoff compares an
+        # uptime to an epoch, which is vacuously false for every client.
+        cutoff = _idle_clock() - svc._idle_timeout
         assert all(ts > cutoff for ts in svc._last_used.values()), (
             "every surviving client must be non-idle, otherwise this test "
             "proves nothing the idle reaper does not already cover"
@@ -198,9 +201,12 @@ def test_the_least_recently_used_workspace_is_the_victim(workspaces):
         key_a = next(k for k in svc._clients if str(fa.parent) in k[1])
         key_b = next(k for k in svc._clients if str(fb.parent) in k[1])
 
-        # Make A unambiguously the least-recently-used.
-        svc._last_used[key_a] = time.time() - 120.0
-        svc._last_used[key_b] = time.time()
+        # Make A unambiguously the least-recently-used.  Seeded from the
+        # service's own idle clock so these stay comparable to the values
+        # the spawn path writes.
+        now = _idle_clock()
+        svc._last_used[key_a] = now - 120.0
+        svc._last_used[key_b] = now
 
         svc.get_diagnostics_sync(str(workspaces("c")))
 
@@ -228,7 +234,7 @@ def test_the_idle_reaper_still_works_under_the_cap(workspaces):
         assert not svc._idle_reaper_task.done()
 
         key = next(iter(svc._clients))
-        svc._last_used[key] = time.time() - (svc._idle_timeout + 60.0)
+        svc._last_used[key] = _idle_clock() - (svc._idle_timeout + 60.0)
         svc._loop.run(svc._reap_idle_once(), timeout=5.0)
 
         assert key not in svc._clients, "idle reaping must still work under the cap"
