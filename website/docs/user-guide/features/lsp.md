@@ -137,6 +137,12 @@ hermes lsp which <id>      # print resolved binary path
 languages will get semantic diagnostics today and which need a
 binary installed.
 
+It also reports the two bounds actually in force (`idle_timeout` and
+the resolved `max_clients`) plus, for each running server, how long it
+has been idle and how many requests it has in flight. That is what
+tells you whether a host sitting at its cap is holding servers it is
+still using or ones the reaper should already have taken.
+
 ## Configuration
 
 The defaults work for typical setups; nothing to set if the binaries
@@ -169,6 +175,9 @@ lsp:
   # relevant file operation. Set to 0 to disable idle reaping and keep
   # servers alive for the life of the process. Values below 30s are
   # clamped to 30 so a sweep can never reap a client mid-operation.
+  # Anything else unusable — a negative, a non-number, `.nan`, `.inf` —
+  # falls back to 600 rather than leaving the reaper disarmed, and the
+  # substitution is logged at WARNING.
   idle_timeout: 600
 
   # Maximum language servers held at once. `idle_timeout` bounds how long
@@ -242,6 +251,14 @@ one language-server process per workspace forever. A reaped server is
 respawned automatically on the next relevant file operation. Set
 `idle_timeout: 0` to disable reaping and hold every server's index warm
 for the life of the process.
+
+Write that `0` as a number, not as `off`. YAML resolves `off`/`no` to a
+boolean, and a boolean is rejected rather than read as `0` — both knobs
+fall back to their default instead, and log a warning naming the value
+that was not usable. The same goes
+for `on`/`yes`, and for a negative or non-finite value such as `.nan` or
+`.inf`: none of them is a duration or a count anyone can have meant, so
+none of them is allowed to quietly disarm the reaper or pin the fleet.
 
 Idle reaping bounds how *long* a server lives; `lsp.max_clients` bounds
 how *many* run at once. The two are independent, and only the second one

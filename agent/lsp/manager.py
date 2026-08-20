@@ -231,11 +231,11 @@ def resolve_max_clients(raw: Any) -> int:
     """Turn a configured ``lsp.max_clients`` into an enforceable cap.
 
     ``None`` means "derive from the host".  Anything unusable — zero, a
-    negative, a string, ``.nan``/``.inf`` (both valid YAML that survive
-    ``float()``) — also derives, because garbage must not silently
+    negative, a string, a ``bool``, ``.nan``/``.inf`` (all valid YAML that
+    survive ``float()``) — also derives, because garbage must not silently
     restore the unbounded accumulation this cap exists to stop.
     """
-    if raw is None:
+    if raw is None or isinstance(raw, bool):
         return default_max_clients()
     try:
         parsed = float(raw)
@@ -244,6 +244,76 @@ def resolve_max_clients(raw: Any) -> int:
     if not math.isfinite(parsed) or parsed <= 0:
         return default_max_clients()
     return max(MIN_CLIENT_CAP, min(MAX_CLIENT_CAP, int(parsed)))
+
+
+def resolve_idle_timeout(raw: Any) -> float:
+    """Turn a configured ``lsp.idle_timeout`` into an enforceable deadline.
+
+    The sibling of :func:`resolve_max_clients`, and deliberately shaped
+    like it: the two knobs bound the same fleet on different axes
+    (``max_clients`` how many, this one how long), and coercing them in
+    two different places is how they drifted apart in the first place.
+
+    ``.nan`` and ``.inf`` are the cases that motivated this.  Both are
+    valid YAML, both survive ``float()`` without raising, and both slip
+    a ``0 < x < MIN_IDLE_TIMEOUT`` clamp.  ``nan`` then fails the
+    ``idle_timeout > 0`` start guard so the reaper never starts, and
+    ``inf`` starts a reaper whose cutoff is ``-inf``, which no
+    ``_last_used`` stamp is ever below — so it sweeps forever and reaps
+    nothing.  Either way the fleet pins at ``max_clients`` and never
+    drains, silently.
+
+    ``0`` is the one non-positive value kept as written: the user guide
+    documents it as "hold every server's index warm for the life of the
+    process".  A negative reaches that same disabled state by accident
+    rather than by request, so it derives the default instead.
+
+    A ``bool`` is rejected before coercion for the same reason, and it is
+    the sharpest case: YAML 1.1 resolves ``off``/``no`` to ``False``, and
+    ``bool`` subclasses ``int``, so ``idle_timeout: off`` would sail
+    through ``float()`` as ``0.0`` and read as the documented disable —
+    silently reaching the dead reaper above by a different door.  ``on``
+    would land at ``1.0`` and clamp up to ``MIN_IDLE_TIMEOUT``.  Neither
+    is a duration anyone can have meant.
+    """
+    if raw is None or isinstance(raw, bool):
+        return float(DEFAULT_IDLE_TIMEOUT)
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return float(DEFAULT_IDLE_TIMEOUT)
+    if not math.isfinite(parsed) or parsed < 0:
+        return float(DEFAULT_IDLE_TIMEOUT)
+    if parsed == 0:
+        return 0.0
+    # Below the per-operation wait budget a sweep could reap a client
+    # mid-flight; the resulting outer timeout marks the (server,
+    # workspace) pair broken for the process lifetime.
+    return max(float(MIN_IDLE_TIMEOUT), parsed)
+
+
+def _bound_was_overridden(raw: Any, resolved: float) -> bool:
+    """True when a configured bound did not survive resolution as written.
+
+    Compares numerically so ``"4"`` and ``4`` do not read as a change —
+    otherwise every string-typed config would warn about an override
+    that never happened, and a warning on every startup is a warning
+    nobody reads.
+
+    A ``bool`` is always an override, decided before the numeric
+    comparison can excuse it.  ``MIN_CLIENT_CAP`` is 1, so on a small
+    host ``max_clients: on`` resolves to a default of 1 and would
+    compare equal to ``float(True)`` — leaving the one case where a
+    rejected value is corrected in silence.
+    """
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return True
+    try:
+        return float(raw) != float(resolved)
+    except (TypeError, ValueError):
+        return True
 
 
 def _log_cap_enforcement_result(fut: Future) -> None:
@@ -498,24 +568,26 @@ class LSPService:
         wait_mode = lsp_cfg.get("wait_mode", "document")
         wait_timeout = float(lsp_cfg.get("wait_timeout", DIAGNOSTICS_DOCUMENT_WAIT))
         install_strategy = lsp_cfg.get("install_strategy", "auto")
-        try:
-            idle_timeout = float(lsp_cfg.get("idle_timeout", DEFAULT_IDLE_TIMEOUT))
-        except (TypeError, ValueError):
-            idle_timeout = DEFAULT_IDLE_TIMEOUT
-        if 0 < idle_timeout < MIN_IDLE_TIMEOUT:
-            # A timeout below the per-operation wait budget could reap a
-            # client mid-flight; the resulting outer timeout would then
-            # mark the (server, workspace) pair broken for the process
-            # lifetime.  Clamp to a safe floor (0 still disables).
-            idle_timeout = MIN_IDLE_TIMEOUT
+        raw_idle_timeout = lsp_cfg.get("idle_timeout")
+        idle_timeout = resolve_idle_timeout(raw_idle_timeout)
         # Omitted (or unusable) derives the cap from host memory rather
         # than pinning a constant: a 64 GiB CI box and a 16 GiB laptop
         # cannot afford the same number of language servers.
         raw_max_clients = lsp_cfg.get("max_clients")
         max_clients = resolve_max_clients(raw_max_clients)
-        if raw_max_clients is not None and max_clients != raw_max_clients:
-            logger.debug(
-                "lsp.max_clients=%r resolved to %d",
+        # WARNING, not debug: an overridden bound is the operator
+        # believing a limit they configured is in force when a different
+        # one is.  That belief is what makes a pinned fleet or an
+        # unreaped one undiagnosable.
+        if _bound_was_overridden(raw_idle_timeout, idle_timeout):
+            logger.warning(
+                "lsp.idle_timeout=%r is not usable; using %.1fs instead",
+                raw_idle_timeout,
+                idle_timeout,
+            )
+        if _bound_was_overridden(raw_max_clients, max_clients):
+            logger.warning(
+                "lsp.max_clients=%r is not usable; using %d instead",
                 raw_max_clients,
                 max_clients,
             )
@@ -1379,7 +1451,19 @@ class LSPService:
     # ------------------------------------------------------------------
 
     def get_status(self) -> Dict[str, Any]:
-        """Return a snapshot of the service for the CLI status command."""
+        """Return a snapshot of the service for the CLI status command.
+
+        Carries the bounds in force alongside the fleet.  ``hermes lsp
+        status`` is how an operator audits a host that is pinned at its
+        cap; without the limits and the per-client ages, the only way to
+        learn what the cap *is* is to read this module and re-derive it
+        from host RAM.
+        """
+        # Must be the same clock that writes ``_last_used`` (see
+        # ``_touch`` and ``_reap_idle_once``) — these values are only
+        # meaningful relative to each other, so reading a different
+        # source here turns every age into the gap between two epochs.
+        now = _idle_clock()
         with self._state_lock:
             clients = [
                 {
@@ -1387,6 +1471,8 @@ class LSPService:
                     "workspace_root": k[1],
                     "state": c.state,
                     "running": c.is_running,
+                    "idle_seconds": max(0.0, now - self._last_used.get(k, now)),
+                    "inflight": self._inflight.get(k, 0),
                 }
                 for k, c in self._clients.items()
             ]
@@ -1396,6 +1482,8 @@ class LSPService:
             "wait_mode": self._wait_mode,
             "wait_timeout": self._wait_timeout,
             "install_strategy": self._install_strategy,
+            "idle_timeout": self._idle_timeout,
+            "max_clients": self._max_clients,
             "clients": clients,
             "broken": broken,
             "disabled_servers": sorted(self._disabled_servers),
