@@ -37,6 +37,32 @@ def _no_installer(monkeypatch):
     monkeypatch.setattr(lazy_deps.subprocess, "run", _boom)
 
 
+@pytest.fixture
+def reaches_the_install_ladder(monkeypatch):
+    """Stub the install ladder for the tests that must reach it.
+
+    These cases assert about *which* reason stopped the install, so execution
+    has to get past the managed guard and into ``_venv_pip_install``. Left
+    unstubbed that runs a real ``uv pip install some-pkg==1.0`` — and
+    ``_venv_pip_install`` sets ``VIRTUAL_ENV`` to
+    ``Path(sys.executable).parent.parent``, i.e. the venv pytest is running
+    in, so the install is aimed squarely at the live environment. It only
+    looked harmless because the spec does not exist on PyPI; the attempt is
+    real, needs the network, and is exactly the class SCA-4712's conftest
+    guard blocks (it fired here on CI slices 1/8 and 3/8).
+
+    Returning a failed result keeps every assertion below meaningful: the
+    reason becomes ``pip install failed: ...``, which is neither the managed
+    guard's wording nor a platform reason.
+    """
+    def _fake_install(_specs, **_kw):
+        return lazy_deps._InstallResult(
+            False, "", "simulated failure: no live-env install in tests"
+        )
+
+    monkeypatch.setattr(lazy_deps, "_venv_pip_install", _fake_install)
+
+
 def test_nixos_install_fails_fast_without_touching_the_installer(monkeypatch):
     monkeypatch.setattr("hermes_cli.config.get_managed_system", lambda: "nixos")
     _no_installer(monkeypatch)
@@ -62,7 +88,9 @@ def test_reason_is_classified_as_skipped_not_failed(monkeypatch):
     )
 
 
-def test_unmanaged_install_is_not_blocked_by_the_guard(monkeypatch):
+def test_unmanaged_install_is_not_blocked_by_the_guard(
+    monkeypatch, reaches_the_install_ladder
+):
     """On a normal pip install the guard must be transparent."""
     monkeypatch.setattr("hermes_cli.config.get_managed_system", lambda: None)
 
@@ -73,7 +101,9 @@ def test_unmanaged_install_is_not_blocked_by_the_guard(monkeypatch):
     assert "managed installs" not in excinfo.value.reason
 
 
-def test_durable_install_target_overrides_the_guard(monkeypatch, tmp_path):
+def test_durable_install_target_overrides_the_guard(
+    monkeypatch, tmp_path, reaches_the_install_ladder
+):
     """The container deployment sets HERMES_MANAGED *and* a writable target.
 
     Dockerfile sets HERMES_LAZY_INSTALL_TARGET and the NixOS container module
@@ -107,7 +137,7 @@ def test_platform_unsupported_takes_precedence(monkeypatch):
     assert excinfo.value.reason == "unsupported on win32"
 
 
-def test_unreadable_config_fails_open(monkeypatch):
+def test_unreadable_config_fails_open(monkeypatch, reaches_the_install_ladder):
     """A broken config must not block installs on a normal pip install."""
     def _raise():
         raise RuntimeError("config unreadable")

@@ -21,7 +21,9 @@ test runner at ``scripts/run_tests.sh``.
 
 import asyncio
 import atexit
+import functools
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -896,6 +898,446 @@ _LIVE_SYSTEM_GUARD_BYPASS_MARK = "live_system_guard_bypass"
 _REQUIRES_WAL_MARK = "requires_wal"
 
 
+# ── Running-environment package-manager guard (SCA-4712) ───────────────
+#
+# ``uv sync`` / ``uv pip install`` / ``pip install`` / ``ensurepip`` mutate a
+# Python environment in place. When a test reaches one of those code paths
+# without sandboxing the target, the environment it mutates is the one pytest
+# is executing in — and ``uv sync`` in particular PRUNES: syncing the checkout
+# with an extra set that excludes ``dev`` uninstalls ``pytest`` itself. The
+# run destroys its own ability to run again ("No module named pytest" on the
+# second invocation), and — worse — silently invalidates every uncontrolled
+# before/after measurement taken across two runs, because the second run
+# executes against a different environment than the first.
+#
+# CI never observes this: each shard gets a fresh environment and never runs
+# a second whole-tree pass in a mutated venv.
+#
+# The predicate below blocks ONLY mutations whose resolved target is the
+# running interpreter's own environment. A test that syncs or installs into a
+# ``tmp_path`` venv keeps exercising the real code path unchanged, which is
+# the point: the behaviour under test is legitimate, its blast radius is not.
+
+#: Subcommands that install into, or prune, an existing Python environment.
+#: Read-only verbs (``list``/``show``/``freeze``/``tree``/``check``) and
+#: environment-creating ones (``venv``, ``python``, ``tool``) are absent on
+#: purpose — see ``_pkg_command_mutates_an_env``.
+_PKG_MUTATING_VERBS = frozenset({"sync", "install", "uninstall", "remove", "add"})
+#: Flags that name the environment/interpreter a package manager should act on.
+_PKG_TARGET_FLAGS = ("--python", "--prefix", "--target", "--python-executable")
+#: Files whose presence makes a directory a uv project root.
+_UV_PROJECT_MARKERS = ("pyproject.toml", "uv.toml")
+#: Read-only modes: they report what WOULD change and mutate nothing.
+_PKG_READ_ONLY_FLAGS = frozenset({"--check", "--dry-run"})
+
+
+def _uv_project_root(tokens: list[str], cwd):
+    """The project directory a ``uv`` invocation actually resolves to.
+
+    Per ``uv help sync``, uv searches the current directory *and every parent*
+    for a project. Assuming ``<cwd>/.venv`` therefore under-reads the blast
+    radius: a ``uv sync`` launched from any subdirectory of the checkout
+    discovers the repository root and prunes the live root ``.venv`` — exactly
+    the corruption this guard exists to prevent (SCA-4712).
+
+    ``--project`` names the project directory outright; ``--directory``
+    changes the directory uv starts its search from. Both are honoured in
+    argv order so ``--directory sub --project .`` composes the way uv reads
+    it.
+    """
+    base = Path(cwd) if cwd else Path(os.getcwd())
+    for i, tok in enumerate(tokens):
+        low = tok.lower()
+        for flag in ("--project", "--directory"):
+            value = None
+            if low == flag and i + 1 < len(tokens):
+                value = tokens[i + 1]
+            elif low.startswith(flag + "="):
+                value = tok.split("=", 1)[1]
+            if value:
+                candidate = Path(value).expanduser()
+                base = candidate if candidate.is_absolute() else base / candidate
+
+    try:
+        base = base.resolve()
+    except OSError:
+        return base
+    for directory in (base, *base.parents):
+        for marker in _UV_PROJECT_MARKERS:
+            if (directory / marker).exists():
+                return directory
+    return base
+
+
+def _env_root_of(path_str: str, base=None):
+    """Best-effort environment root for an interpreter or prefix path.
+
+    ``/x/.venv/bin/python`` and ``/x/.venv`` both resolve to ``/x/.venv``.
+
+    *base* is the directory a RELATIVE path should be read against — the
+    guarded subprocess's ``cwd``, never pytest's. A test running
+    ``uv pip install --python .venv/bin/python`` with ``cwd=tmp_path`` names
+    the throwaway env under *tmp_path*; resolving that against pytest's own
+    working directory would attribute it to the checkout's live ``.venv`` and
+    block a safe command. The inverse arrangement misses a live target, which
+    is the worse direction.
+    """
+    try:
+        p = Path(path_str).expanduser()
+    except (OSError, ValueError):
+        return None
+    if not p.is_absolute() and base is not None:
+        p = Path(base) / p
+    # An interpreter path: strip bin/python or Scripts\python.exe.
+    if p.name.lower().startswith("python") and p.parent.name.lower() in {
+        "bin",
+        "scripts",
+    }:
+        p = p.parent.parent
+    try:
+        return p.resolve()
+    except OSError:
+        return p
+
+
+@functools.lru_cache(maxsize=1)
+def _running_env_roots() -> frozenset:
+    """Every path that identifies the environment pytest is executing in.
+
+    Cached: ``sys.prefix`` cannot change mid-process, and this sits on the
+    ``os.rename`` hot path.
+    """
+    roots = set()
+    for candidate in (
+        sys.prefix,
+        sys.base_prefix,
+        os.path.dirname(os.path.dirname(sys.executable)),
+    ):
+        if not candidate:
+            continue
+        try:
+            roots.add(Path(candidate).resolve())
+        except OSError:
+            roots.add(Path(candidate))
+    return frozenset(roots)
+
+
+@functools.lru_cache(maxsize=1)
+def _running_env_root_names() -> frozenset:
+    """Basenames of the running-env roots, for the cheap pre-filter."""
+    return frozenset(p.name for p in _running_env_roots())
+
+
+def _targets_running_env(path_str) -> str | None:
+    """Return the running-env root that *path_str* names, else ``None``.
+
+    Deliberately cheap: ``abspath`` is pure string work, and the ``realpath``
+    stat only runs once the basename already matches a running-env root, so
+    the thousands of unrelated ``os.rename`` calls in the suite pay almost
+    nothing.
+    """
+    if not path_str:
+        return None
+    try:
+        raw = os.fspath(path_str)
+    except TypeError:
+        return None
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode()
+        except UnicodeDecodeError:
+            return None
+
+    roots = _running_env_roots()
+    absolute = Path(os.path.abspath(raw))
+    if absolute in roots:
+        return str(absolute)
+    if absolute.name in _running_env_root_names():
+        try:
+            resolved = Path(os.path.realpath(raw))
+        except OSError:
+            return None
+        if resolved in roots:
+            return str(resolved)
+    return None
+
+
+#: Shells whose ``-c`` argument is a script the guard should look inside.
+_SHELL_STEMS = frozenset({"sh", "bash", "zsh", "dash", "ash", "ksh"})
+#: Words that precede the real command without being it. Wrappers
+#: (``env FOO=1 uv sync``, ``sudo pip install``) and the shell keywords that
+#: can share a line with a command (``if uv sync; then ...``).
+_CMD_PREFIX_SKIP = frozenset({
+    "env", "sudo", "command", "exec", "nohup", "time", "nice", "builtin",
+    "if", "then", "else", "elif", "do", "while", "until", "!",
+})
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _shell_segments(script: str):
+    """Split a shell script into per-command word lists, or ``None``.
+
+    Quote- and comment-aware, so a package-manager name that merely appears
+    inside a quoted string or a ``#`` comment never reaches command position.
+
+    Returns ``None`` when the script cannot be parsed unambiguously — a
+    heredoc, or unbalanced quotes. That is deliberate. The predecessor of
+    this function ``shlex.split`` the whole script and scanned every token,
+    which desynchronised on the first apostrophe inside a comment
+    (``didn't``) and on ``<<EOF`` bodies; downstream, words landed in
+    positions they never occupied. ``scripts/install.sh`` both logs the
+    literal text ``uv pip install -e '.[all]'`` from a ``log_info`` string
+    and mentions "the venv pip entry point" in an English comment, and the
+    old scan blocked the unrelated test that runs it (SCA-4712, CI slice
+    1/8). Refusing to guess is the correct failure mode here: the
+    in-process rename guard below is the backstop for the actual defect.
+    """
+    segments: list[list[str]] = []
+    current: list[str] = []
+    buf: list[str] = []
+    have_word = False
+    i = 0
+    n = len(script)
+
+    def end_word():
+        nonlocal buf, have_word
+        if have_word or buf:
+            current.append("".join(buf))
+        buf = []
+        have_word = False
+
+    def end_segment():
+        nonlocal current
+        end_word()
+        if current:
+            segments.append(current)
+        current = []
+
+    while i < n:
+        ch = script[i]
+
+        if ch == "\\":
+            # Line continuation joins the next line onto this command.
+            if i + 1 < n and script[i + 1] == "\n":
+                i += 2
+                continue
+            if i + 1 < n:
+                buf.append(script[i + 1])
+                have_word = True
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if ch == "'":
+            j = script.find("'", i + 1)
+            if j == -1:
+                return None  # unbalanced — refuse to guess
+            buf.append(script[i + 1:j])
+            have_word = True
+            i = j + 1
+            continue
+
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if script[j] == "\\" and j + 1 < n:
+                    buf.append(script[j + 1])
+                    j += 2
+                    continue
+                if script[j] == '"':
+                    break
+                buf.append(script[j])
+                j += 1
+            if j >= n:
+                return None  # unbalanced — refuse to guess
+            have_word = True
+            i = j + 1
+            continue
+
+        if ch == "#" and not have_word and not buf:
+            while i < n and script[i] != "\n":
+                i += 1
+            continue
+
+        if script.startswith("<<", i):
+            return None  # heredoc body is not parseable as commands
+
+        if ch in ";\n|&()":
+            end_segment()
+            i += 1
+            continue
+
+        if ch in " \t\r":
+            end_word()
+            i += 1
+            continue
+
+        buf.append(ch)
+        have_word = True
+        i += 1
+
+    end_segment()
+    return segments
+
+
+def _looks_like_package_manager(tokens: list[str]):
+    """Return ``(kind, index)`` for a package manager in COMMAND position.
+
+    Command position only, deliberately: see :func:`_shell_segments` for the
+    false positive that scanning every token produced. Env-var assignments
+    and wrappers are skipped so ``env FOO=1 uv sync`` and ``sudo pip
+    install`` still resolve to the manager they invoke.
+
+    The index matters: the subcommand check below has to read the arguments
+    that follow the manager, not the whole argv.
+    """
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        head = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+        # Windows installs uv/pip as ``uv.exe`` and as ``.cmd``/``.bat`` shims;
+        # all three are the same invocation.
+        stem = head
+        for suffix in (".exe", ".cmd", ".bat"):
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
+        if stem == "uv":
+            return "uv", i
+        if stem in {"pip", "pip3"} or stem.startswith("pip3."):
+            return "pip", i
+        if stem == "ensurepip":
+            return "ensurepip", i
+        # ``python -m pip`` / ``python -m ensurepip``
+        if stem.startswith("python"):
+            j = i + 1
+            while j < n and tokens[j].startswith("-") and tokens[j] != "-m":
+                j += 1
+            if j + 1 < n and tokens[j] == "-m":
+                nxt = tokens[j + 1].lower()
+                if nxt in {"pip", "ensurepip"}:
+                    return nxt, j + 1
+            return None
+        if _ENV_ASSIGN_RE.match(tok) or stem in _CMD_PREFIX_SKIP:
+            i += 1
+            continue
+        return None
+    return None
+
+
+def _pkg_command_mutates_an_env(tokens: list[str], manager: str, index: int) -> bool:
+    """True only for subcommands that install into / prune a Python env.
+
+    Precision matters here. ``uv python install`` populates uv's *interpreter*
+    store, ``uv venv`` creates a new environment, ``uv tool install`` installs
+    into uv's isolated tool dir — none of them touch the environment pytest is
+    running in, and blocking them would break unrelated tests that legitimately
+    provision throwaway runtimes.
+    """
+    rest = [t.lower() for t in tokens[index + 1:] if not t.startswith("-")]
+    # ``uv sync --check`` only reports whether the environment is already
+    # synchronized, and ``--dry-run`` explicitly avoids touching the lockfile
+    # or the project environment (``uv help sync``); pip's ``--dry-run`` is the
+    # same contract. Tests that validate dependency state against the running
+    # checkout mutate nothing and must not be rejected.
+    if any(t.lower() in _PKG_READ_ONLY_FLAGS for t in tokens[index + 1:]):
+        return False
+    if manager == "ensurepip":
+        return True
+    if manager == "pip":
+        return bool(rest) and rest[0] in _PKG_MUTATING_VERBS
+    # uv
+    if not rest:
+        return False
+    sub = rest[0]
+    if sub in {"sync", "add", "remove"}:
+        return True
+    if sub == "run":
+        # ``uv run`` syncs the project environment before running.
+        return True
+    if sub == "pip":
+        return len(rest) > 1 and rest[1] in _PKG_MUTATING_VERBS
+    # python / venv / tool / self / cache / build / publish / lock / export ...
+    return False
+
+
+def _pkg_mutation_target(tokens: list[str], manager: str, index: int, env, cwd):
+    """Resolve the environment a package-manager argv would mutate.
+
+    Returns ``None`` when the command mutates no environment, or when the
+    target cannot be attributed.
+    """
+    if not _pkg_command_mutates_an_env(tokens, manager, index):
+        return None
+
+    lowered = [t.lower() for t in tokens]
+
+    # Relative paths in argv and in the env belong to the CHILD's working
+    # directory, not pytest's.
+    cwd_base = cwd if cwd else None
+
+    # 1. An explicit target flag wins.
+    for i, tok in enumerate(lowered):
+        for flag in _PKG_TARGET_FLAGS:
+            if tok == flag and i + 1 < len(tokens):
+                return _env_root_of(tokens[i + 1], base=cwd_base)
+            if tok.startswith(flag + "="):
+                return _env_root_of(tokens[i].split("=", 1)[1], base=cwd_base)
+
+    # 2. ``--system`` explicitly means the running interpreter's environment.
+    if "--system" in lowered:
+        return _env_root_of(sys.executable)
+
+    # 3. ``UV_PROJECT_ENVIRONMENT`` overrides uv's environment choice outright.
+    env = env or {}
+    project_env = env.get("UV_PROJECT_ENVIRONMENT")
+    if project_env:
+        return _env_root_of(str(project_env), base=cwd_base)
+
+    # 3b. ``uv sync`` resolves to the PROJECT's environment, not the activated
+    # one: uv syncs ``<project>/.venv`` and merely warns when an unrelated
+    # VIRTUAL_ENV is active (``--active`` opts into the activated env). So the
+    # project root has to be consulted before the env vars below — checking
+    # VIRTUAL_ENV first attributes the sync to whatever venv happens to be
+    # activated and lets a real sync of the running env slip past whenever the
+    # two differ.
+    if manager == "uv" and "sync" in lowered and "--active" not in lowered:
+        return _uv_project_root(tokens, cwd) / ".venv"
+
+    # 3c. ``<interpreter> -m pip install`` names its target in the argv, so it
+    # outranks the env vars below: pip installs into the interpreter it is
+    # invoked with whatever VIRTUAL_ENV happens to say.
+    if manager in {"pip", "ensurepip"}:
+        head = tokens[0] if tokens else ""
+        stem = head.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+        if stem.startswith("python"):
+            return _env_root_of(head, base=cwd_base)
+
+    # 4. The environment variables uv/pip otherwise honour.
+    for key in ("VIRTUAL_ENV", "CONDA_PREFIX"):
+        value = env.get(key)
+        if value:
+            return _env_root_of(str(value), base=cwd_base)
+
+    # 4b. Bare ``pip install`` resolves through PATH — assume the running env,
+    # which is what an unsandboxed test would actually hit.
+    if manager in {"pip", "ensurepip"}:
+        return _env_root_of(sys.executable)
+
+    # 5. ``uv sync --active`` with no other target: uv's discovered project
+    # still owns the environment name.
+    if manager == "uv" and "sync" in lowered:
+        return _uv_project_root(tokens, cwd) / ".venv"
+
+    # 6. ``uv pip install`` with no target falls back to the active env.
+    if manager == "uv":
+        return _env_root_of(sys.executable)
+
+    return None
+
+
 def _wal_is_usable() -> bool:
     """True when Hermes will actually put a database into WAL mode here.
 
@@ -1256,7 +1698,81 @@ def _live_system_guard(request, monkeypatch):
             )
         )
 
-    def _check_subprocess_cmd(name, cmd):
+    def _is_live_env_package_mutation(cmd, kwargs) -> str | None:
+        """Detect a package-manager call that would mutate the RUNNING env.
+
+        Returns the offending environment root as a string, or ``None``.
+        """
+        cmd_str = _cmd_to_string(cmd)
+        low = cmd_str.lower()
+        # Cheap reject before any parsing — the overwhelming majority of
+        # subprocess calls in the suite mention none of these.
+        if not any(tok in low for tok in ("uv", "pip", "ensurepip")):
+            return None
+        if isinstance(cmd, (list, tuple)):
+            argv = [str(t) for t in cmd]
+        else:
+            # A shell string (``shell=True``, ``os.system``, ``os.popen``).
+            argv = None
+
+        # Candidate command word-lists to inspect. Each entry is ONE command's
+        # argv, so a package-manager name only ever counts when it stands in
+        # that command's own command position.
+        candidates: list[list[str]] = []
+        if argv:
+            candidates.append(argv)
+            # ``["bash", "-c", "uv pip install modal"]`` — inspect the script
+            # it wraps, or the wrapped mutation launders straight past.
+            head = argv[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+            stem = head[:-4] if head.endswith(".exe") else head
+            if stem in _SHELL_STEMS:
+                for k, tok in enumerate(argv[1:], 1):
+                    if tok == "-c" and k + 1 < len(argv):
+                        wrapped = _shell_segments(argv[k + 1])
+                        if wrapped:
+                            candidates.extend(wrapped)
+                        break
+        else:
+            parsed = _shell_segments(cmd_str)
+            if parsed:
+                candidates.extend(parsed)
+
+        kwargs = kwargs or {}
+        env = kwargs.get("env")
+        if env is None:
+            env = _os.environ
+
+        for tokens in candidates:
+            if not tokens:
+                continue
+            found = _looks_like_package_manager(tokens)
+            if found is None:
+                continue
+            manager, index = found
+            target = _pkg_mutation_target(
+                tokens, manager, index, env, kwargs.get("cwd")
+            )
+            if target is not None and target in _running_env_roots():
+                return str(target)
+        return None
+
+    def _check_subprocess_cmd(name, cmd, kwargs=None):
+        offending_env = _is_live_env_package_mutation(cmd, kwargs)
+        if offending_env is not None:
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — this command mutates the "
+                f"Python environment pytest is RUNNING IN ({offending_env}). "
+                "`uv sync` prunes to the requested extras, so an unsandboxed "
+                "sync uninstalls pytest itself and the run destroys its own "
+                "ability to run again; `pip install` into the live env skews "
+                "every later test in the same process. Point the command at a "
+                "throwaway venv under tmp_path (pass --python/--prefix/"
+                "--target, or set UV_PROJECT_ENVIRONMENT / VIRTUAL_ENV in the "
+                "subprocess env), or mock the subprocess call. Mark with "
+                "@pytest.mark.live_system_guard_bypass only if mutating the "
+                "running environment is genuinely the behaviour under test."
+            )
         if _is_blocked_systemctl(cmd):
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
@@ -1320,7 +1836,7 @@ def _live_system_guard(request, monkeypatch):
 
     def _wrap_subprocess(name, real):
         def _guarded(cmd, *args, **kwargs):
-            _check_subprocess_cmd(name, cmd)
+            _check_subprocess_cmd(name, cmd, kwargs)
             return real(cmd, *args, **kwargs)
         _guarded.__name__ = f"_guarded_{name}"
         # Make the wrapper subscriptable like the wrapped callable when
@@ -1338,7 +1854,7 @@ def _live_system_guard(request, monkeypatch):
 
         class _GuardedPopen(real):  # type: ignore[misc, valid-type]
             def __init__(self, cmd, *args, **kwargs):
-                _check_subprocess_cmd("Popen", cmd)
+                _check_subprocess_cmd("Popen", cmd, kwargs)
                 super().__init__(cmd, *args, **kwargs)
 
         _GuardedPopen.__name__ = "Popen"
@@ -1382,11 +1898,68 @@ def _live_system_guard(request, monkeypatch):
         return real_os_system(command)
 
     def _guarded_os_popen(cmd, *args, **kwargs):
-        _check_subprocess_cmd("os.popen", cmd)
+        _check_subprocess_cmd("os.popen", cmd, kwargs)
         return real_os_popen(cmd, *args, **kwargs)
 
     monkeypatch.setattr(_os, "system", _guarded_os_system)
     monkeypatch.setattr(_os, "popen", _guarded_os_popen)
+
+    # ── Running-environment replacement guard (SCA-4712) ───────────
+    #
+    # The most destructive live-env mutation is not a package command at
+    # all: ``managed_uv._cut_over_candidate`` renames the live venv aside
+    # and promotes a freshly-built one into its place. Reached from a test
+    # (``_pip_install`` → ``ensure_uv`` → runtime repair) with PROJECT_ROOT
+    # pointing at the real checkout, that SWAPS the venv pytest is running
+    # in for one built with ``--extra all`` — no ``dev`` extra, so no
+    # pytest. The guard above cannot see it: the ``uv sync`` legitimately
+    # targets the candidate; the damage is the rename afterwards.
+    #
+    # ``pathlib.Path.rename``/``.replace`` call ``os.rename``/``os.replace``
+    # directly on 3.11+, so patching the ``os`` functions covers both.
+    def _guard_env_path(op, *paths):
+        for candidate in paths:
+            hit = _targets_running_env(candidate)
+            if hit is not None:
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked {op} on "
+                    f"{hit} — that is the Python environment pytest is "
+                    "RUNNING IN. A test reached the managed-runtime repair / "
+                    "venv cut-over path with the project root pointing at the "
+                    "live checkout, which replaces the running venv and "
+                    "silently invalidates the rest of the run (and every "
+                    "before/after measurement taken across two runs). Point "
+                    "the code under test at a tmp_path project root, or mock "
+                    "the cut-over. Mark with "
+                    "@pytest.mark.live_system_guard_bypass only if replacing "
+                    "the running environment is genuinely under test."
+                )
+
+    real_os_rename = _os.rename
+    real_os_replace = _os.replace
+    real_shutil_move = shutil.move
+    real_shutil_rmtree = shutil.rmtree
+
+    def _guarded_rename(src, dst, *args, **kwargs):
+        _guard_env_path("os.rename", src, dst)
+        return real_os_rename(src, dst, *args, **kwargs)
+
+    def _guarded_replace(src, dst, *args, **kwargs):
+        _guard_env_path("os.replace", src, dst)
+        return real_os_replace(src, dst, *args, **kwargs)
+
+    def _guarded_move(src, dst, *args, **kwargs):
+        _guard_env_path("shutil.move", src, dst)
+        return real_shutil_move(src, dst, *args, **kwargs)
+
+    def _guarded_rmtree(path, *args, **kwargs):
+        _guard_env_path("shutil.rmtree", path)
+        return real_shutil_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(_os, "rename", _guarded_rename)
+    monkeypatch.setattr(_os, "replace", _guarded_replace)
+    monkeypatch.setattr(shutil, "move", _guarded_move)
+    monkeypatch.setattr(shutil, "rmtree", _guarded_rmtree)
 
     # pty.spawn — POSIX-only.
     try:
@@ -1410,12 +1983,14 @@ def _live_system_guard(request, monkeypatch):
 
         async def _guarded_async_exec(program, *args, **kwargs):
             _check_subprocess_cmd(
-                "asyncio.create_subprocess_exec", [program, *args]
+                "asyncio.create_subprocess_exec", [program, *args], kwargs
             )
             return await real_async_exec(program, *args, **kwargs)
 
         async def _guarded_async_shell(cmd, *args, **kwargs):
-            _check_subprocess_cmd("asyncio.create_subprocess_shell", cmd)
+            _check_subprocess_cmd(
+                "asyncio.create_subprocess_shell", cmd, kwargs
+            )
             return await real_async_shell(cmd, *args, **kwargs)
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
