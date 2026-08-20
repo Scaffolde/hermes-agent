@@ -19,9 +19,20 @@ from hermes_cli import main as hermes_main
 # ``shutil.which`` so the existing test setup keeps working without
 # per-test changes.
 @pytest.fixture(autouse=True)
-def _patch_managed_uv(request):
-    """Make managed_uv helpers follow shutil.which mocking in tests."""
+def _patch_managed_uv(monkeypatch):
+    """Make managed_uv helpers follow shutil.which mocking in tests.
+
+    Uses ``monkeypatch`` rather than ``mock.patch`` for the same reason as the
+    copy of this fixture in ``test_cmd_update.py``: a test that re-patches one
+    of these attributes through a second, independent undo stack can leave the
+    stand-in installed on the process-global module after teardown. No test in
+    THIS file currently does that, so the leak is latent here — but the fixture
+    is the same shape one re-patch away from the same failure, so it gets the
+    same single-undo-stack treatment (SCA-4692).
+    """
     import shutil
+
+    from hermes_cli import managed_uv as _managed_uv
 
     # resolve_uv delegates to shutil.which("uv") so that test patches
     # on shutil.which flow through naturally.
@@ -34,10 +45,10 @@ def _patch_managed_uv(request):
     def _fake_update_managed_uv(**kwargs):
         return None  # never actually self-update in tests
 
-    with patch("hermes_cli.managed_uv.resolve_uv", side_effect=_fake_resolve_uv), \
-         patch("hermes_cli.managed_uv.ensure_uv", side_effect=_fake_ensure_uv), \
-         patch("hermes_cli.managed_uv.update_managed_uv", side_effect=_fake_update_managed_uv):
-        yield
+    monkeypatch.setattr(_managed_uv, "resolve_uv", _fake_resolve_uv)
+    monkeypatch.setattr(_managed_uv, "ensure_uv", _fake_ensure_uv)
+    monkeypatch.setattr(_managed_uv, "update_managed_uv", _fake_update_managed_uv)
+    yield
 
 
 
