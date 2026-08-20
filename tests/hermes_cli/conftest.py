@@ -2,9 +2,177 @@
 
 from __future__ import annotations
 
+import contextlib
 import sys
+from types import ModuleType
 
 import pytest
+
+
+def hermes_module_names() -> list[str]:
+    """Every currently-imported hermes module an isolation fixture evicts.
+
+    The ``isinstance(name, str)`` filter is load-bearing. A test that patches
+    ``importlib.util.spec_from_file_location`` with a ``MagicMock`` makes
+    production code run ``sys.modules[spec.name] = module``, putting a MagicMock
+    in as the KEY. ``MagicMock.startswith(...)`` auto-creates a truthy mock, so
+    such a key matches every prefix below and is picked up as a hermes module —
+    which would then have this package's eviction machinery applied to it.
+    """
+    return [
+        name
+        for name in list(sys.modules.keys())
+        if isinstance(name, str)
+        and (
+            name.startswith("hermes_cli")
+            or name.startswith("hermes_state")
+            or name == "hermes_constants"
+        )
+    ]
+
+
+def hermes_module_leaks(before: dict, after: dict) -> tuple[list[str], list[str]]:
+    """Report hermes modules that a block dropped or swapped without restoring.
+
+    ``before``/``after`` are ``sys.modules`` snapshots restricted to
+    :func:`hermes_module_names`. Returns ``(dropped, swapped)``:
+
+    * ``dropped`` — present before, absent after. Any spelling gets here:
+      ``del sys.modules[x]``, ``sys.modules.pop(x)``, or a ``del`` through an
+      alias (``m = sys.modules; del m[x]``), because this compares state, not
+      source text.
+    * ``swapped`` — present after, but a DIFFERENT object. This is the one that
+      actually breaks later files: they hold the original identity, so a
+      ``patch("hermes_cli.x.y")`` lands on the replacement while the code under
+      test still calls the original (SCA-4692).
+
+    An in-place ``importlib.reload`` mutates the existing module object rather
+    than rebinding the name, so it is correctly NOT a leak. Modules imported
+    for the first time during the block are additions, not leaks, and are
+    likewise ignored — only the identities a later file could already be
+    holding matter.
+    """
+    dropped = sorted(name for name in before if name not in after)
+    swapped = sorted(
+        name for name in before if name in after and after[name] is not before[name]
+    )
+    return dropped, swapped
+
+
+@contextlib.contextmanager
+def isolated_hermes_modules():
+    """Evict the hermes modules for the duration of the block, then restore.
+
+    The eviction forces the hermes modules to re-import against the caller's
+    temporary ``HERMES_HOME`` instead of whatever the process already had
+    bound. It MUST be undone: ``sys.modules`` is process-global, and every
+    other test module in the run captured its imports at collection time.
+
+    Leaving the eviction in place means a later ``patch("hermes_cli.x.y")``
+    re-imports a SECOND module object and patches that, while the test under
+    test still calls the function bound to the original object — so the patch
+    silently does nothing and unrelated tests fail for a cause they never
+    triggered (SCA-4692).
+    """
+    saved = {name: sys.modules[name] for name in hermes_module_names()}
+    for name in saved:
+        del sys.modules[name]
+    try:
+        yield saved
+    finally:
+        # Drop whatever the block imported against the temp HERMES_HOME,
+        # then put the original module objects back so identities that other
+        # test modules already hold stay valid.
+        for name in hermes_module_names():
+            del sys.modules[name]
+        sys.modules.update(saved)
+
+
+@pytest.fixture()
+def hermes_module_isolation():
+    """Fixture form of :func:`isolated_hermes_modules`.
+
+    Request it from any fixture that needs a fresh ``HERMES_HOME`` to be
+    re-imported. Eviction happens during this fixture's setup, so a
+    requesting fixture's own body (which sets ``HERMES_HOME`` and then
+    imports) still sees a cleared module cache; the restore runs after the
+    requesting fixture tears down.
+    """
+    with isolated_hermes_modules() as saved:
+        yield saved
+
+
+# Session-wide pin: the identity each hermes module was first seen with.
+#
+# A per-test before/after pair is not enough. Any snapshot taken during fixture
+# SETUP misses a module the test imports inside its own body, and evicting that
+# module then goes unseen. That is the common case, not a corner:
+# scripts/run_tests.sh gives every FILE its own interpreter, so in CI the first
+# import of a hermes module usually happens inside a test body and a per-test
+# snapshot starts empty. Pinning on first observation fixes the identity for the
+# rest of the process the moment any test boundary sees it.
+_HERMES_MODULE_IDENTITIES: dict = {}
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    """Pin the identity of every hermes module already imported (SCA-4692)."""
+    for name in hermes_module_names():
+        _HERMES_MODULE_IDENTITIES.setdefault(name, sys.modules[name])
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    """SCA-4692 class guard: fail the test that leaks a hermes module eviction.
+
+    A behavioral invariant, not a source scan: it compares the identity of the
+    hermes modules this package's isolation fixtures own (see
+    :func:`hermes_module_names`) against the session pin. A hand-rolled eviction
+    is caught however it is spelled — ``del``, ``.pop()``, or through an alias —
+    and an eviction outside the hermes namespace (an optional dependency a test
+    drops to exercise an ImportError path) is correctly ignored.
+
+    This is a ``trylast`` hook rather than an autouse fixture on purpose. A
+    fixture's teardown runs BEFORE ``monkeypatch`` undoes itself, so the guard
+    saw every legitimate ``monkeypatch.setitem(sys.modules, ...)`` stub as a
+    live leak — measured as 12 false errors across 6 files, on files run alone.
+    ``pytest_runtest_teardown`` with ``trylast=True`` runs after all fixture
+    finalization, which is the only point where "the test left global state
+    dirty" is a well-defined statement.
+
+    The originals are put back BEFORE the failure is raised. Without that, one
+    offender would fail and then corrupt every file collected after it —
+    precisely the 138-failure cascade with misattributed blame that SCA-4692 is
+    about. Restoring first means the offender fails alone and names itself.
+
+    The pin is only ever recorded at test setup, never from teardown state, so a
+    test cannot install an impostor and have it become the baseline for later
+    tests. A module first imported inside a test body is therefore unpinned, so
+    ``stubbed`` covers the dangerous half of that gap: an unpinned hermes name
+    left bound to something that is not a module (the usual ``MagicMock``
+    stand-in) is a leak, because the next file to import it gets the stub.
+    Importing a module and simply dropping it again in one body stays uncaught
+    and is harmless — no earlier file holds an identity for it.
+    """
+    dropped, swapped = hermes_module_leaks(_HERMES_MODULE_IDENTITIES, sys.modules)
+    stubbed = sorted(
+        name
+        for name in hermes_module_names()
+        if name not in _HERMES_MODULE_IDENTITIES
+        and not isinstance(sys.modules[name], ModuleType)
+    )
+    for name in dropped + swapped:
+        sys.modules[name] = _HERMES_MODULE_IDENTITIES[name]
+    for name in stubbed:
+        del sys.modules[name]
+    if dropped or swapped or stubbed:
+        pytest.fail(
+            "this test left the process-global sys.modules mutated for hermes "
+            "modules; wrap the eviction in the isolated_hermes_modules / "
+            "hermes_module_isolation fixture, which restores what it evicts "
+            f"(SCA-4692). dropped={dropped} swapped={swapped} stubbed={stubbed}",
+            pytrace=False,
+        )
 
 
 @pytest.fixture
