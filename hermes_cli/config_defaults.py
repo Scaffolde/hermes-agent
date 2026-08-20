@@ -2832,6 +2832,16 @@ DEFAULT_CONFIG = {
         # to disable idle reaping and keep servers for process lifetime.
         "idle_timeout": 600.0,
 
+        # Maximum language servers held at once.  ``idle_timeout`` bounds
+        # how LONG a server survives; it does not bound HOW MANY exist,
+        # and a session that moves across many worktrees can hold dozens
+        # simultaneously while every one of them is still inside its idle
+        # window.  ``null`` derives the cap from host memory (roughly a
+        # quarter of RAM at ~1.3 GiB per server, clamped to 1-24); set an
+        # integer to pin it.  Over the cap, the least-recently-used server
+        # is shut down first, skipping any with a request in flight.
+        "max_clients": None,
+
         # Per-server overrides.  Each key is a server_id from the
         # registry (``pyright``, ``typescript``, ``gopls``,
         # ``rust-analyzer``, etc.) and accepts:
