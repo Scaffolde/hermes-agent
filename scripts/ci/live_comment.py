@@ -86,10 +86,10 @@ _CONCLUSION_MAP = {
     "success": "success",
     "failure": "failure",
     "skipped": "skipped",
-    "cancelled": "skipped",
+    "cancelled": "failure",
     "neutral": "skipped",
     "timed_out": "failure",
-    "action_required": "skipped",
+    "action_required": "failure",
 }
 
 def classify_jobs(api_jobs: list[dict]) -> tuple[dict[str, str], list[str], dict[str, str]]:
