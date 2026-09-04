@@ -18,6 +18,14 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
+@pytest.fixture(autouse=True)
+def _seed_mutable_app_state():
+    """Keep monkeypatch teardown valid when start_server clears state keys."""
+    for name in ("auth_required", "bound_host", "bound_port", "trusted_public_hosts"):
+        if not hasattr(web_server.app.state, name):
+            setattr(web_server.app.state, name, None)
+
+
 @pytest.fixture
 def client_loopback():
     # Pin the bound-host state for host_header_middleware so requests with

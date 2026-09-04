@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import subprocess
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
@@ -189,7 +189,8 @@ class TestDetectAudioEnvironmentTermuxFallback:
         )
 
         from tools.voice_mode import detect_audio_environment
-        result = detect_audio_environment()
+        with patch("builtins.open", mock_open(read_data="Linux version 6.8.0")):
+            result = detect_audio_environment()
 
         assert result["available"] is True, (
             f"Voice mode should be available when the binary is on PATH "

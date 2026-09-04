@@ -516,7 +516,11 @@ def test_refresh_error_body_bounded_and_readable_with_real_client():
             self.send_response(400)
             self.send_header("Content-Length", str(len(big_body)))
             self.end_headers()
-            self.wfile.write(big_body)
+            try:
+                self.wfile.write(big_body)
+            except (BrokenPipeError, ConnectionResetError):
+                # The client intentionally stops after its bounded error read.
+                pass
 
         def log_message(self, *args):
             pass

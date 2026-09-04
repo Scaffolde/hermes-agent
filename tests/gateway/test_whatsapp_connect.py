@@ -14,6 +14,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 
 import asyncio
 import signal
+import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -48,7 +49,8 @@ def _make_adapter():
     adapter.config = MagicMock()
     adapter._bridge_port = 19876
     adapter._bridge_script = "/tmp/test-bridge.js"
-    adapter._session_path = Path("/tmp/test-wa-session")
+    adapter._test_session_tmpdir = tempfile.TemporaryDirectory(prefix="hermes-wa-test-")
+    adapter._session_path = Path(adapter._test_session_tmpdir.name)
     adapter._bridge_log_fh = None
     adapter._bridge_log = None
     adapter._bridge_process = None

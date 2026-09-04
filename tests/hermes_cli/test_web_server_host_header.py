@@ -14,6 +14,16 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _seed_mutable_app_state():
+    """Keep monkeypatch teardown valid when WebSocket cleanup clears keys."""
+    from hermes_cli.web_server import app
+
+    for name in ("auth_required", "bound_host", "trusted_public_hosts"):
+        if not hasattr(app.state, name):
+            setattr(app.state, name, None)
+
 _repo = str(Path(__file__).resolve().parents[1])
 if _repo not in sys.path:
     sys.path.insert(0, _repo)
