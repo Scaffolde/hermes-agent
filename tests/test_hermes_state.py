@@ -2951,6 +2951,10 @@ class TestVacuum:
 
     def test_auto_maintenance_retries_after_failed_vacuum(self, db, monkeypatch):
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
+        # WSL clocks can step backward between two immediate calls. A zero
+        # throttle means "always run", regardless of that wall-clock step.
+        timestamps = iter((100.0, 99.0))
+        monkeypatch.setattr(hermes_state.time, "time", lambda: next(timestamps))
         vacuum_calls = []
 
         def fail_first_vacuum():
