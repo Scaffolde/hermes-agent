@@ -33,6 +33,8 @@ class FakeChild:
         self.api_mode = "chat_completions"
         self.interrupted = False
         self.interrupt_kind = None
+        self.interrupt_message = None
+        self.tool_reason = None
         self.session_id = f"session-{ident}"
         self.valid_tool_names = {"read_file", "write_file"}
         self.tools = [
@@ -51,9 +53,11 @@ class FakeChild:
         self.interrupted = True
         self.interrupt_kind = "soft"
 
-    def hard_interrupt(self, _reason):
+    def hard_interrupt(self, reason, *, tool_reason=None):
         self.interrupted = True
         self.interrupt_kind = "hard"
+        self.interrupt_message = reason
+        self.tool_reason = tool_reason
 
     def close(self):
         self.closed = True
@@ -225,6 +229,8 @@ def test_cancel_uses_explicit_hard_interrupt(lifecycle):
     assert lifecycle.cancel(handle, reason="explicit user cancel").accepted
 
     assert record.agent.interrupt_kind == "hard"
+    assert "explicit user cancel" in record.agent.interrupt_message
+    assert record.agent.tool_reason == "subagent cancellation requested"
     lifecycle.wait(handle, timeout_seconds=1)
 
 

@@ -68,7 +68,7 @@ WHATSAPP_SESSION_LOGGED_OUT_EXIT_CODE = 64
 
 
 def _load_or_create_bridge_token(session_path: Path) -> str:
-    """Return a stable private token for the local Python↔Node bridge channel."""
+    """Return a stable private token for the local Python to Node bridge."""
     session_path.mkdir(parents=True, exist_ok=True)
     token_path = session_path / ".bridge-token"
     try:
@@ -101,14 +101,13 @@ def _load_or_create_bridge_token(session_path: Path) -> str:
 
 
 def _bridge_auth_headers(session_path: Path) -> Dict[str, str]:
-    """Load auth headers for out-of-process bridge clients without creating state."""
+    """Load bridge auth headers without creating state."""
     try:
         token = (session_path / ".bridge-token").read_text(encoding="utf-8").strip()
     except OSError:
         return {}
-    if len(token) < 32:
-        return {}
-    return {"Authorization": f"Bearer {token}"}
+    return {"Authorization": f"Bearer {token}"} if len(token) >= 32 else {}
+
 
 def _listener_pids_on_port(port: int) -> list:
     """PIDs of processes *listening* on ``port`` (POSIX) — never clients.
@@ -148,16 +147,32 @@ def _listener_pids_on_port(port: int) -> list:
     return pids
 
 
+def _pid_looks_like_node_bridge(pid: int) -> bool:
+    """Fail-closed check that *pid* is plausibly a stale node bridge.
+
+    ``_kill_port_process`` discovers PIDs from a netstat/lsof scan of a TCP
+    port — a bare number naming a *stranger* process (#89614 class: an
+    unverified scan-time PID force-killed later can be anything, including a
+    critical system process). Before any kill, require the live process to
+    actually look like our Baileys bridge: a ``node`` executable. Any
+    ambiguity (process gone, unreadable cmdline) refuses the kill.
+    """
+    try:
+        import psutil
+
+        proc = psutil.Process(pid)
+        name = (proc.name() or "").lower()
+        cmdline = " ".join(proc.cmdline() or []).lower()
+        return "node" in name or "node" in cmdline.split(" ", 1)[0]
+    except Exception:
+        return False
+
+
 def _kill_port_process(
     port: int,
     session_path: Optional[Path] = None,
 ) -> list[tuple[int, Optional[int]]]:
-    """Signal verified bridge listeners and return identities to await.
-
-    Managed call sites pass ``session_path`` so only listeners whose cmdline
-    matches this WhatsApp session are killed. The optional default preserves
-    legacy private-test callers; production cleanup paths must pass it.
-    """
+    """Signal verified bridge listeners and return identities to await."""
     owners: list[tuple[int, Optional[int]]] = []
     try:
         if _IS_WINDOWS:
@@ -178,22 +193,42 @@ def _kill_port_process(
                             pid = int(parts[4])
                         except ValueError:
                             continue
-                        if session_path is not None and not _bridge_pid_is_ours(pid, session_path, None):
+                        # Never taskkill a bare netstat-scanned PID: verify
+                        # the live process is a node bridge first (fail
+                        # closed). taskkill /F on a mistyped or recycled PID
+                        # is unrecoverable.
+                        if pid <= 0 or not _pid_looks_like_node_bridge(pid):
+                            logger.warning(
+                                "[whatsapp] Not killing PID %s on port %d: "
+                                "process is not a node bridge (or identity "
+                                "unverifiable)", pid, port)
+                            continue
+                        if session_path is not None and not _bridge_pid_is_ours(
+                            pid, session_path, None
+                        ):
                             continue
                         owners.append((pid, None))
                         try:
                             subprocess.run(
-                                ["taskkill", "/PID", parts[4], "/F"],
+                                ["taskkill", "/PID", str(pid), "/F"],
                                 capture_output=True, timeout=5,
                                 creationflags=windows_hide_flags(),
                             )
                         except subprocess.SubprocessError:
                             pass
         else:
-            # POSIX: only ever signal a process LISTENING on the port and
-            # validate it is the bridge for this exact session before signalling.
+            # POSIX: only ever signal a process LISTENING on the port. A client
+            # whose connection happens to involve this port number (a browser
+            # tab on a local dev server, etc.) must never be killed.
             for pid in _listener_pids_on_port(port):
-                if session_path is not None and not _bridge_pid_is_ours(pid, session_path, None):
+                if not _pid_looks_like_node_bridge(pid):
+                    logger.warning(
+                        "[whatsapp] Not killing PID %s on port %d: process is "
+                        "not a node bridge (or identity unverifiable)", pid, port)
+                    continue
+                if session_path is not None and not _bridge_pid_is_ours(
+                    pid, session_path, None
+                ):
                     continue
                 owners.append((pid, None))
                 try:
@@ -236,7 +271,9 @@ def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
     return ("node" in cmdline) and (str(session_path) in cmdline)
 
 
-def _kill_stale_bridge_by_pidfile(session_path: Path) -> list[tuple[int, Optional[int]]]:
+def _kill_stale_bridge_by_pidfile(
+    session_path: Path,
+) -> list[tuple[int, Optional[int]]]:
     """Kill a bridge process recorded in a PID file from a previous run.
 
     The bridge writes ``bridge.pid`` into the session directory when it
@@ -637,8 +674,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             logger.warning("[%s] Could not acquire session lock (non-fatal): %s", self.name, e)
 
         try:
-            # Token creation must share the session ownership lock. Creating it
-            # in __init__ lets two fresh adapters race and overwrite each other.
+            # Token creation shares the session ownership lock so competing
+            # fresh adapters cannot overwrite one another's bridge secret.
             self._session_path.mkdir(parents=True, exist_ok=True)
             self._bridge_token = _load_or_create_bridge_token(self._session_path)
             # Auto-install npm dependencies when node_modules is missing OR
@@ -676,6 +713,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     )
                     if install_result.returncode != 0:
                         print(f"[{self.name}] npm install failed: {install_result.stderr}")
+                        self._set_fatal_error(
+                            "whatsapp_npm_install_failed",
+                            f"WhatsApp bridge npm install failed. Run `cd {bridge_dir} && {_npm_bin} install` manually, then restart `hermes gateway`.",
+                            retryable=False,
+                        )
                         return False
                     print(f"[{self.name}] Dependencies installed")
                     if _pkg_hash:
@@ -685,6 +727,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             pass  # Stamp is an optimization; install still succeeded
                 except Exception as e:
                     print(f"[{self.name}] Failed to install dependencies: {e}")
+                    self._set_fatal_error(
+                        "whatsapp_npm_install_failed",
+                        f"WhatsApp bridge npm install failed ({e}). Run `cd {bridge_dir} && {_npm_bin} install` manually, then restart `hermes gateway`.",
+                        retryable=False,
+                    )
                     return False
 
             # Ensure session directory exists
@@ -693,7 +740,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Check if bridge is already running and connected
             import aiohttp
             try:
-                async with aiohttp.ClientSession(headers=_bridge_auth_headers(self._session_path)) as session:
+                async with aiohttp.ClientSession(
+                    headers=_bridge_auth_headers(self._session_path)
+                ) as session:
                     async with session.get(
                         f"http://127.0.0.1:{self._bridge_port}/health",
                         timeout=aiohttp.ClientTimeout(total=2)
@@ -724,8 +773,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
                                     self._mark_connected()
                                     self._bridge_process = None  # Not managed by us
-                                    self._http_session = aiohttp.ClientSession(headers=_bridge_auth_headers(self._session_path))
+                                    self._http_session = aiohttp.ClientSession(
+                                        headers=_bridge_auth_headers(self._session_path)
+                                    )
                                     self._poll_task = asyncio.create_task(self._poll_messages())
+                                    # Plugin-registered native handlers.
+                                    self._wire_plugin_handlers(None)
                                     return True
                                 stale_reason = (
                                     f"running={running_hash or 'unversioned'}, disk={disk_hash}"
@@ -837,7 +890,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     self._close_bridge_log()
                     return False
                 try:
-                    async with aiohttp.ClientSession(headers=_bridge_auth_headers(self._session_path)) as session:
+                    async with aiohttp.ClientSession(
+                        headers=_bridge_auth_headers(self._session_path)
+                    ) as session:
                         async with session.get(
                             f"http://127.0.0.1:{self._bridge_port}/health",
                             timeout=aiohttp.ClientTimeout(total=2)
@@ -869,7 +924,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         self._close_bridge_log()
                         return False
                     try:
-                        async with aiohttp.ClientSession(headers=_bridge_auth_headers(self._session_path)) as session:
+                        async with aiohttp.ClientSession(
+                            headers=_bridge_auth_headers(self._session_path)
+                        ) as session:
                             async with session.get(
                                 f"http://127.0.0.1:{self._bridge_port}/health",
                                 timeout=aiohttp.ClientTimeout(total=2)
@@ -889,13 +946,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     print(f"[{self.name}]   If session expired, re-pair: hermes whatsapp")
             
             # Create a persistent HTTP session for all bridge communication
-            self._http_session = aiohttp.ClientSession(headers=_bridge_auth_headers(self._session_path))
+            self._http_session = aiohttp.ClientSession(
+                headers=_bridge_auth_headers(self._session_path)
+            )
 
             # Start message polling task
             self._poll_task = asyncio.create_task(self._poll_messages())
             
             self._mark_connected()
             print(f"[{self.name}] Bridge started on port {self._bridge_port}")
+            # Plugin-registered native handlers.
+            self._wire_plugin_handlers(None)
             return True
             
         except Exception as e:
@@ -1485,7 +1546,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
+            profile=self._session_key_profile(event.source),
         )
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
@@ -1817,7 +1878,9 @@ async def _standalone_send(
         # a caption is never silently repeated across a multi-file send.
         media_caption = caption if (caption and len(media) == 1) else None
         last_message_id = None
-        async with aiohttp.ClientSession(headers=_bridge_auth_headers(session_path)) as session:
+        async with aiohttp.ClientSession(
+            headers=_bridge_auth_headers(session_path)
+        ) as session:
             # 1) Text first (skip the /send call when this chunk is media-only
             #    or when the text is delivered as the media caption instead).
             if text.strip() and not media_caption:
