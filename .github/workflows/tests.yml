@@ -23,6 +23,12 @@ jobs:
     # 82s). A second slice divides work that is already at that floor, and
     # adds a second setup.
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "Linux", "X64"]') || 'ubuntu-latest' }}
+    # Keep the self-hosted Plex capacity while isolating tests from the host's
+    # WSL identity, long-lived processes, browser installation, and user home.
+    # The image is digest-pinned so the environment cannot drift under a green
+    # commit. GitHub-hosted external-fork jobs use the same clean boundary.
+    container:
+      image: python@sha256:35d3a4a3d5e42e02ab916d44513a050689f12c0533d45598d229672503fe77ca
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -38,7 +44,7 @@ jobs:
             "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
           echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
           tar -xzf "$RG_TARBALL"
-          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
           rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
           rg --version
 
