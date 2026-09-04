@@ -84,15 +84,7 @@ PUSH_DEBOUNCE = 0.15
 SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
 GROUP_REAP_POLL = 0.02  # seconds between process-group liveness probes
 
-# POSIX process groups let us reap a language server together with the
-# workers it supervises.  Windows has no equivalent primitive, so the
-# shutdown path there stays on the single-PID calls it has always used.
 _HAS_PROCESS_GROUPS = hasattr(os, "killpg") and hasattr(os, "getpgid")
-
-# Windows has no SIGKILL at all -- referencing it raises AttributeError --
-# and SIGTERM is the strongest signal available there.  ``proc.kill()`` on
-# Windows is itself an alias for ``terminate()``, so collapsing the two is
-# exactly what the platform already does.
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 # Retry policy for transient ContentModified errors.
@@ -101,12 +93,7 @@ RETRY_BASE_DELAY = 0.5  # 0.5, 1.0, 2.0 — exponential
 
 
 def _group_alive(pgid: Optional[int]) -> bool:
-    """True while any process still sits in ``pgid``.
-
-    Signal 0 performs the permission and existence checks without
-    delivering anything, so this is the cheapest honest probe of whether
-    the workers we are trying to reap are still resident.
-    """
+    """True while any process still sits in ``pgid``."""
     if pgid is None or not _HAS_PROCESS_GROUPS:
         return False
     try:
@@ -114,8 +101,6 @@ def _group_alive(pgid: Optional[int]) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
-        # Someone in the group outlived us and changed credentials; it is
-        # still resident, which is what the caller is asking about.
         return True
     except OSError:
         return False
@@ -240,12 +225,10 @@ class LSPClient:
 
         # Process + streams
         self._proc: Optional[asyncio.subprocess.Process] = None
-        # Captured at spawn, not at cleanup: a cooperative server may have
-        # already exited by the time we tear down, and ``os.getpgid`` on a
-        # reaped PID raises -- which would strand its workers unaddressable.
         self._pgid: Optional[int] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._reader_task: Optional[asyncio.Task] = None
+        self._cleanup_lock = asyncio.Lock()
 
         # Request/response correlation
         self._next_id: int = 0
@@ -294,7 +277,20 @@ class LSPClient:
 
     @property
     def is_running(self) -> bool:
-        return self._state == "running" and self._proc is not None and self._proc.returncode is None
+        return self._state == "running" and self._connection_is_open()
+
+    def _connection_is_open(self) -> bool:
+        proc = self._proc
+        reader = self._reader_task
+        return (
+            self._state in {"starting", "running"}
+            and proc is not None
+            and proc.returncode is None
+            and proc.stdin is not None
+            and not proc.stdin.is_closing()
+            and reader is not None
+            and not reader.done()
+        )
 
     @property
     def state(self) -> str:
@@ -313,6 +309,8 @@ class LSPClient:
         try:
             await self._spawn()
             await self._initialize()
+            if not self._connection_is_open():
+                raise LSPProtocolError("server connection closed during initialization")
             self._state = "running"
         except Exception:
             self._state = "error"
@@ -366,18 +364,8 @@ class LSPClient:
                 f"LSP server binary not found: {cmd[0]} ({e})"
             ) from e
 
-        # Resolve the group NOW, while the leader is guaranteed alive.
-        # start_new_session=True makes this server its own group leader, so
-        # the group holds it and its workers and nothing else.  Reading it
-        # at cleanup instead would raise once a cooperative server has
-        # already exited on our `exit` notification, and the workers that
-        # outlive it -- the ones actually holding the memory -- would never
-        # be signalled.
         self._pgid = None
         if _HAS_PROCESS_GROUPS:
-            # A transport that exposes no pid (or a test double standing in
-            # for one) simply has no group we can address; that is a
-            # fallback to single-PID signalling, not a spawn failure.
             pid = getattr(self._proc, "pid", None)
             pgid = None
             if pid is not None:
@@ -385,9 +373,6 @@ class LSPClient:
                     pgid = os.getpgid(pid)
                 except OSError:
                     pgid = None
-            # Never retain our own group: if the spawn silently lost its new
-            # session, group-directed signals would take down the gateway
-            # and every sibling server.
             if pgid is not None and pgid != os.getpgrp():
                 self._pgid = pgid
 
@@ -434,11 +419,16 @@ class LSPClient:
         except (asyncio.CancelledError, OSError):
             pass
         finally:
+            unexpected_close = not self._stopping and self._state in {"starting", "running"}
+            if unexpected_close:
+                self._state = "error"
             # Wake up any pending requests so they can fail fast.
             for fut in list(self._pending.values()):
                 if not fut.done():
                     fut.set_exception(LSPProtocolError("server connection closed"))
             self._pending.clear()
+            if unexpected_close:
+                await self._cleanup_process()
 
     async def _initialize(self) -> None:
         params = {
@@ -538,53 +528,52 @@ class LSPClient:
             await self._cleanup_process()
 
     async def _cleanup_process(self) -> None:
-        if self._reader_task is not None and not self._reader_task.done():
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        if self._stderr_task is not None and not self._stderr_task.done():
-            self._stderr_task.cancel()
-            try:
-                await self._stderr_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        proc = self._proc
-        pgid = self._pgid
-        self._proc = None
-        self._pgid = None
-        if proc is None:
-            return
+        async with self._cleanup_lock:
+            current_task = asyncio.current_task()
+            reader_task = self._reader_task
+            self._reader_task = None
+            if (
+                reader_task is not None
+                and reader_task is not current_task
+                and not reader_task.done()
+            ):
+                reader_task.cancel()
+                try:
+                    await reader_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            stderr_task = self._stderr_task
+            self._stderr_task = None
+            if stderr_task is not None and not stderr_task.done():
+                stderr_task.cancel()
+                try:
+                    await stderr_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            proc = self._proc
+            pgid = self._pgid
+            self._proc = None
+            self._pgid = None
+            if proc is None:
+                return
 
-        # One budget for the whole teardown, not one per wait: a slow victim
-        # must not cost the caller two graces (SCA-4628).
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + SHUTDOWN_GRACE
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + SHUTDOWN_GRACE
 
-        if proc.returncode is None or _group_alive(pgid):
-            # The `or` matters: a cooperative supervisor can exit on our
-            # `exit` notification while its workers keep running, and those
-            # workers have not been asked to stop yet.
-            try:
-                self._signal_process(proc, signal.SIGTERM, pgid)
-            except ProcessLookupError:
-                pass
+            if proc.returncode is None or _group_alive(pgid):
+                try:
+                    self._signal_process(proc, signal.SIGTERM, pgid)
+                except ProcessLookupError:
+                    pass
+            if proc.returncode is None:
+                try:
+                    await asyncio.wait_for(
+                        proc.wait(), timeout=max(0.0, deadline - loop.time())
+                    )
+                except (asyncio.TimeoutError, ProcessLookupError):
+                    pass
 
-        if proc.returncode is None:
-            try:
-                await asyncio.wait_for(
-                    proc.wait(), timeout=max(0.0, deadline - loop.time())
-                )
-            except (asyncio.TimeoutError, ProcessLookupError):
-                pass
-
-        # `proc.wait()` observes the *supervisor* alone.  When a worker
-        # ignores SIGTERM but its supervisor honours it, that wait returns
-        # immediately, the timeout never fires, and a PID-shaped teardown
-        # would skip the SIGKILL that reaps the worker -- the exact leak
-        # this path exists to close.  Escalate on the group instead.
-        await self._reap_group(proc, pgid, deadline)
+            await self._reap_group(proc, pgid, deadline)
 
     async def _reap_group(
         self,
@@ -592,12 +581,9 @@ class LSPClient:
         pgid: Optional[int],
         deadline: float,
     ) -> None:
-        """Wait out the grace on the *group*, then SIGKILL what remains."""
+        """Wait out the grace on the group, then SIGKILL what remains."""
         loop = asyncio.get_running_loop()
-
         if pgid is None:
-            # No group to reap (Windows, or a spawn that lost its session).
-            # Keep the previous single-PID escalation.
             if proc.returncode is None:
                 try:
                     self._signal_process(proc, _SIGKILL, None)
@@ -609,7 +595,7 @@ class LSPClient:
         while _group_alive(pgid):
             if loop.time() >= deadline:
                 try:
-                    os.killpg(pgid, _SIGKILL)  # windows-footgun: ok — pgid is None off POSIX
+                    os.killpg(pgid, _SIGKILL)  # windows-footgun: ok — POSIX only
                 except OSError:
                     pass
                 if proc.returncode is None:
@@ -621,33 +607,7 @@ class LSPClient:
             await asyncio.sleep(GROUP_REAP_POLL)
 
     def _signal_process(self, proc, sig: int, pgid: Optional[int] = None) -> None:
-        """Signal the server *and its workers*, not just the supervisor PID.
-
-        Real language servers are supervisors: ``typescript-language-server``
-        runs ``tsserver``, ``pyright-langserver`` forks node workers, and it
-        is the worker that holds the project graph.  Signalling ``proc.pid``
-        alone leaves that worker resident and reparented to init, so the
-        fleet cap bounds the supervisor count while the memory it exists to
-        bound walks away unowned.
-
-        ``start()`` spawns with ``start_new_session=True``, so this server
-        leads its own process group.  That is what makes a group-directed
-        signal safe *and* correct here: the group holds the server and its
-        descendants and nothing else -- in particular not the gateway or the
-        TUI parent, which is the accident the ``start_new_session`` comment
-        in ``start()`` exists to prevent.  Group membership also survives
-        reparenting, so a worker whose supervisor already exited is still
-        reached -- which a PPID-based tree walk would miss.
-
-        ``pgid`` is the group captured at spawn time.  It is passed in
-        rather than resolved here because ``os.getpgid(proc.pid)`` raises
-        once the supervisor has been reaped -- precisely the case where
-        the surviving workers still need the signal.
-
-        Falls back to the single PID when no group was captured (Windows
-        has no process groups; ``proc.kill()`` there keeps the previous
-        behaviour).
-        """
+        """Signal the server process group, falling back to the single PID."""
         def _signal_pid_only() -> None:
             (proc.kill if sig == _SIGKILL else proc.terminate)()
 
@@ -655,11 +615,8 @@ class LSPClient:
             _signal_pid_only()
             return
         try:
-            os.killpg(pgid, sig)  # windows-footgun: ok — gated on _HAS_PROCESS_GROUPS
+            os.killpg(pgid, sig)  # windows-footgun: ok — POSIX only
         except ProcessLookupError:
-            # The whole group is gone.  If the supervisor handle still
-            # shows it running, fall through to the PID call so the
-            # caller's own bookkeeping stays honest.
             if proc.returncode is None:
                 _signal_pid_only()
         except OSError:
@@ -670,8 +627,9 @@ class LSPClient:
     # ------------------------------------------------------------------
 
     async def _send_request(self, method: str, params: Any) -> Any:
-        if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
-            raise LSPProtocolError(f"cannot send {method!r}: stdin closed")
+        if not self._connection_is_open():
+            raise LSPProtocolError(f"cannot send {method!r}: server connection closed")
+        assert self._proc is not None and self._proc.stdin is not None
         loop = asyncio.get_running_loop()
         req_id = self._next_id
         self._next_id += 1
@@ -705,8 +663,9 @@ class LSPClient:
                 raise
 
     async def _send_notification(self, method: str, params: Any) -> None:
-        if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
-            return
+        if not self._connection_is_open():
+            raise LSPProtocolError(f"cannot send {method!r}: server connection closed")
+        assert self._proc is not None and self._proc.stdin is not None
         try:
             self._proc.stdin.write(encode_message(make_notification(method, params)))
             await self._proc.stdin.drain()
@@ -1047,6 +1006,10 @@ class LSPClient:
         abs_path = os.path.abspath(path)
 
         while True:
+            if not self._connection_is_open():
+                raise LSPProtocolError(
+                    "server connection closed while waiting for diagnostics"
+                )
             remaining = deadline - asyncio.get_event_loop().time()
             if remaining <= 0:
                 return False

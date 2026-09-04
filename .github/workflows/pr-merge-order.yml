@@ -32,7 +32,7 @@ jobs:
     # of thousands of open PRs, where an all-pairs sweep is both meaningless
     # here and enormously expensive.
     if: github.repository == 'pai-scaffolde/hermes-agent'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "Linux", "X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 25
     steps:
       - name: Checkout with full history

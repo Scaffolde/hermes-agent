@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   docs-site-checks:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "Linux", "X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -49,5 +49,8 @@ jobs:
         working-directory: website
 
       - name: Build Docusaurus
-        run: npm run build
+        # Build only the default (en) locale in CI — the full bilingual
+        # build runs in deploy-site.yml on push-to-main / release.
+        # Same pattern Docusaurus uses internally (build:fast --locale en).
+        run: npm run build:fast
         working-directory: website

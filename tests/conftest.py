@@ -22,6 +22,7 @@ test runner at ``scripts/run_tests.sh``.
 import asyncio
 import atexit
 import functools
+import importlib
 import os
 import re
 import shutil
@@ -75,8 +76,25 @@ if str(PROJECT_ROOT) not in sys.path:
 # would silently stop protecting the operator's actual ~/.hermes (#69385).
 _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
 _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
+
+
+def _hermes_home_points_at_production(value: str) -> bool:
+    """Return whether a configured Hermes home is the production root."""
+    if not value:
+        return True
+    try:
+        resolved = Path(value).expanduser().resolve()
+        real_root = (Path.home() / ".hermes").resolve()
+    except Exception:
+        return True
+    if resolved == real_root:
+        return True
+    return resolved.parent.name == "profiles" and resolved.parent.parent == real_root
+
+
 _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
 os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
+os.environ["HERMES_TEST_ISOLATION"] = _SESSION_HERMES_HOME
 atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
 
 #: HERMES_HOME as it stood when conftest was imported - i.e. before any test
@@ -321,6 +339,8 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_VOICE",
     "HERMES_VOICE_TTS",
     "HERMES_YOLO_MODE",
+    "HERMES_REAL_HOME",
+    "TERMINAL_HOME_MODE",
     "HERMES_INTERACTIVE",
     "HERMES_QUIET",
     "HERMES_TOOL_PROGRESS",
@@ -491,6 +511,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "DISCORD_REQUIRE_MENTION",
     "DISCORD_FREE_RESPONSE_CHANNELS",
     "TELEGRAM_REQUIRE_MENTION",
+    "TELEGRAM_GROUP_ALLOWED_USERS",
+    "TELEGRAM_GROUP_ALLOWED_CHATS",
+    "QQ_ALLOWED_USERS",
+    "QQ_GROUP_ALLOWED_USERS",
     "WHATSAPP_REQUIRE_MENTION",
     "DINGTALK_REQUIRE_MENTION",
     "MATRIX_REQUIRE_MENTION",
@@ -538,6 +562,8 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    monkeypatch.setenv("HERMES_TEST_ISOLATION", str(fake_hermes_home))
+    monkeypatch.delenv("HERMES_STATE_DB_GUARD_BYPASS", raising=False)
 
     # 3b. hermes_state computes ``DEFAULT_DB_PATH = get_hermes_home() / "state.db"``
     #     at import time. When the module is first imported at collection (any
@@ -588,6 +614,9 @@ def _hermetic_environment(tmp_path, monkeypatch):
     try:
         import hermes_cli.plugins as _plugins_mod
         monkeypatch.setattr(_plugins_mod, "_plugin_manager", None)
+        reset_managers = getattr(_plugins_mod, "_reset_plugin_managers_for_tests", None)
+        if callable(reset_managers):
+            reset_managers()
     except Exception:
         pass
     # Explicitly clear provider-specific base URL overrides that don't match
@@ -602,6 +631,18 @@ def _hermetic_environment(tmp_path, monkeypatch):
 def _isolate_hermes_home(_hermetic_environment):
     """Alias preserved for any test that yields this name explicitly."""
     return None
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_kanban_memory_guard(request, monkeypatch):
+    """Keep ordinary kanban tests independent of live system memory pressure."""
+    if request.node.get_closest_marker("real_memory_guard"):
+        return
+    try:
+        from hermes_cli import kanban_db as _kb_mod
+    except Exception:
+        return
+    monkeypatch.setattr(_kb_mod, "_system_memory_sample", lambda: {}, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -640,17 +681,17 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
     if request.node.get_closest_marker(_ALLOW_MACOS_KEYCHAIN_MARK):
         return None
 
-    try:
-        import agent.anthropic_adapter as _anthropic_adapter
-    except Exception:
-        return None
-
-    monkeypatch.setattr(
-        _anthropic_adapter,
-        "_read_claude_code_credentials_from_keychain",
-        lambda *_args, **_kwargs: None,
-        raising=False,
-    )
+    for module_name in ("agent.anthropic_credentials", "agent.anthropic_adapter"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        monkeypatch.setattr(
+            module,
+            "_read_claude_code_credentials_from_keychain",
+            lambda *_args, **_kwargs: None,
+            raising=False,
+        )
     return None
 
 
@@ -755,6 +796,28 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
         )
 
     monkeypatch.setattr(_kdb, "connect", _guarded_connect)
+
+
+@pytest.fixture(autouse=True)
+def _state_db_write_guard(request, monkeypatch):
+    """Refuse test writes to a production Hermes state database."""
+    _hs = sys.modules.get("hermes_state")
+    if _hs is None or not hasattr(_hs, "_STATE_DB_GUARD_BYPASS"):
+        yield
+        return
+    if request.node.get_closest_marker("live_system_guard_bypass") is not None:
+        monkeypatch.setattr(_hs, "_STATE_DB_GUARD_BYPASS", True)
+        yield
+        return
+    extra_roots = []
+    if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_points_at_production(
+        _PRE_SANDBOX_HERMES_HOME
+    ):
+        extra_roots.append(Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve())
+    monkeypatch.setattr(
+        _hs, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots)
+    )
+    yield
 
 
 # ── Module-level state reset — replaced by per-file process isolation ──────
@@ -1758,6 +1821,12 @@ def _wal_is_usable() -> bool:
 _AUDIO_GUARD_BYPASS_MARK = "real_audio_playback"
 _ALLOW_MACOS_KEYCHAIN_MARK = "allow_macos_keychain"
 
+_OS_MARKS = {
+    "linux_only": (lambda: sys.platform.startswith("linux"), "Linux"),
+    "macos_only": (lambda: sys.platform == "darwin", "macOS"),
+    "windows_only": (lambda: sys.platform == "win32", "native Windows"),
+}
+
 
 def pytest_configure(config):  # noqa: D401 — pytest hook
     """Register markers used by hermetic conftest."""
@@ -1816,6 +1885,15 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         f"{_ALLOW_MACOS_KEYCHAIN_MARK}: allow a test to exercise the macOS "
         "Keychain credential reader with its own subprocess/platform mocks.",
     )
+    config.addinivalue_line(
+        "markers",
+        "require_symlinks: skip when symbolic links cannot be created.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "real_memory_guard: bypass the fixture that neutralizes live kanban "
+        "memory-pressure sampling.",
+    )
 
     # The pyproject addopts pin ``--timeout-method=signal`` relies on
     # ``signal.SIGALRM``, which does not exist on Windows — pytest-timeout
@@ -1831,6 +1909,32 @@ def pytest_unconfigure(config):  # noqa: D401 — pytest hook
     _disarm_session_env_guard()
 
 
+_symlink_supported_cache = None
+
+
+def _check_symlink_support() -> bool:
+    global _symlink_supported_cache
+    if _symlink_supported_cache is not None:
+        return _symlink_supported_cache
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            source.touch()
+            (Path(directory) / "link").symlink_to(source)
+        _symlink_supported_cache = True
+    except OSError:
+        _symlink_supported_cache = False
+    return _symlink_supported_cache
+
+
+def pytest_runtest_setup(item):
+    if item.get_closest_marker("require_symlinks") and not _check_symlink_support():
+        pytest.skip(
+            "Environment does not support symbolic links "
+            "(requires admin/developer mode on Windows)"
+        )
+
+
 def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
     """Skip ``requires_wal`` tests when the linked SQLite can't use WAL.
 
@@ -1842,6 +1946,28 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
     module keeps exactly one ``pytest_collection_modifyitems`` definition.
     """
     _warn_on_direct_multi_file_run(config, items)
+
+    for item in items:
+        marks = sorted({m.name for m in item.iter_markers() if m.name in _OS_MARKS})
+        if len(marks) > 1:
+            raise pytest.UsageError(
+                f"{item.nodeid} carries multiple host OS markers: {', '.join(marks)}"
+            )
+    for mark_name, (is_host, label) in _OS_MARKS.items():
+        if is_host():
+            continue
+        skip_os = pytest.mark.skip(
+            reason=f"{label}-only test (marked {mark_name}); host is {sys.platform}"
+        )
+        for item in items:
+            if item.get_closest_marker(mark_name) is not None:
+                item.add_marker(skip_os)
+
+    if not hasattr(os, "symlink"):
+        skip_symlink = pytest.mark.skip(reason="symbolic links are unavailable")
+        for item in items:
+            if item.get_closest_marker("require_symlinks") is not None:
+                item.add_marker(skip_symlink)
 
     if _wal_is_usable():
         return
@@ -2389,3 +2515,15 @@ def _isolate_computer_use_approval_state():
             _cu_tool._session_auto_approve.clear()
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _moa_caches_isolated():
+    """Prevent provider-resolution caches from leaking between MoA tests."""
+    import agent.moa_loop as moa
+
+    moa._preset_cache.clear()
+    moa._runtime_cache.clear()
+    yield
+    moa._preset_cache.clear()
+    moa._runtime_cache.clear()
