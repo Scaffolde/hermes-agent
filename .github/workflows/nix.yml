@@ -33,7 +33,7 @@ jobs:
   # flake inputs. On push the classifier fails open and every lane is true.
   detect:
     name: Detect affected areas
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "Linux", "X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     outputs:
       nix: ${{ steps.classify.outputs.nix }}
@@ -54,7 +54,7 @@ jobs:
     # takes minutes and not seconds when the cache misses. `nix flake check`
     # builds 21 checks, and --max-jobs defaults to the core count. It uses the
     # wider runner with no more configuration.
-    runs-on: ubuntu-latest-32-core
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "Linux", "X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - name: Checkout code

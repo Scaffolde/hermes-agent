@@ -57,7 +57,7 @@ jobs:
 
   emit-status:
     name: Emit review status
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "Linux", "X64"]') || 'ubuntu-latest' }}
     needs: scan
     if: always()
     outputs:

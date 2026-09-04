@@ -21,7 +21,7 @@ jobs:
   publish:
     name: Publish inline E2E evidence
     if: github.event.workflow_run.event == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "Linux", "X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     environment: gh-image
     steps:

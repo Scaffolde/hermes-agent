@@ -48,7 +48,10 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            # Plex is Linux, so this modality-specific lane stays on a real
+            # Windows host. The Nous-only 32-core label never schedules in the
+            # Scaffolde fork; use GitHub's standard Windows image here.
+            runner: windows-latest
             marker: windows_only
     steps:
       - name: Checkout code

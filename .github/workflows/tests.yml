@@ -14,14 +14,15 @@ concurrency:
 jobs:
   test:
     name: Run tests
-    # One 96-core runner for the whole suite. There is no slicing. Slicing
-    # existed to spread the suite over 4-core runners. It cost a matrix job, a
-    # duration cache, a per-slice artifact and a merge job to do it.
+    # Trusted same-repository runs use the Scaffolde Plex pool. External fork
+    # PRs stay on GitHub-hosted runners so untrusted code never reaches Plex.
+    # There is no slicing. Slicing cost a matrix job, a duration cache, a
+    # per-slice artifact and a merge job to do it.
     #
     # 96 cores clear the floor that the slowest single test file sets (about
     # 82s). A second slice divides work that is already at that floor, and
     # adds a second setup.
-    runs-on: ubuntu-latest-96-core
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "Linux", "X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -102,7 +103,8 @@ jobs:
           # This is the maximum number of test FILES that run together.
           # run_tests_parallel.py starts one pytest subprocess for each file
           # from a single ThreadPoolExecutor, so this value IS the limit. The
-          # default is cpu_count*2, which is 192 here.
+          # Plex exposes the host's 32 cores to every runner listener, so using
+          # the old 96-core Nous value would oversubscribe a shared machine.
           #
           # Measured on this runner (96-core EPYC 7763, 377GB). Whole suite,
           # two repetitions for each value. See run 32549672063:
@@ -119,14 +121,14 @@ jobs:
           # across a 6x range. The suite has sufficient concurrency at this
           # size. The remaining time is the slowest files plus the setup.
           # Workers above the core count only add contention.
-          HERMES_TEST_WORKERS: 96
+          HERMES_TEST_WORKERS: 8
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
 
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "Linux", "X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - name: Checkout code
