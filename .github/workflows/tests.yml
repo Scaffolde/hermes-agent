@@ -29,6 +29,9 @@ jobs:
     # commit. GitHub-hosted external-fork jobs use the same clean boundary.
     container:
       image: python@sha256:35d3a4a3d5e42e02ab916d44513a050689f12c0533d45598d229672503fe77ca
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 30
     steps:
       - name: Checkout code
