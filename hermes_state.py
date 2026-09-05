@@ -15546,7 +15546,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if last_raw:
                 try:
                     last_ts = float(last_raw)
-                    if now - last_ts < min_interval_hours * 3600:
+                    if (
+                        min_interval_hours > 0
+                        and now - last_ts < min_interval_hours * 3600
+                    ):
                         result["skipped"] = True
                         return result
                 except (TypeError, ValueError):

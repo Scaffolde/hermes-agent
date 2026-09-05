@@ -149,8 +149,8 @@ def collect_failed_jobs(
     """Build error items for failed CI jobs from the ``needs`` context.
 
     ``needs_json`` is the JSON string emitted by ``all-checks-pass`` — a
-    ``{job_name: result}`` dict where result is ``success`` / ``failure``
-    / ``skipped``. Only ``failure`` entries become error items.
+    ``{job_name: result}`` dict. Every terminal result rejected by the
+    aggregate gate becomes an error item.
 
     ``exclude_sources`` is a set of ``source`` values from status objects
     declared by workflow_call jobs. Job names containing any of these
@@ -177,7 +177,7 @@ def collect_failed_jobs(
 
     items: list[ReviewItem] = []
     for name, result in sorted(needs.items()):
-        if result != "failure":
+        if result not in {"failure", "cancelled", "timed_out", "action_required"}:
             continue
         if norm_sources:
             norm = name.lower().replace("-", " ")

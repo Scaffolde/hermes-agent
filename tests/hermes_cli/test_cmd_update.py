@@ -10,6 +10,14 @@ import pytest
 from hermes_cli.main import cmd_update, PROJECT_ROOT
 
 
+@pytest.fixture(autouse=True)
+def _keep_mocked_update_modules_loaded(monkeypatch):
+    """The update unit tests must retain their patched pre-pull module graph."""
+    from hermes_cli import main as hermes_main
+
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+
+
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
     """Build a side_effect function for subprocess.run that simulates git commands."""
 

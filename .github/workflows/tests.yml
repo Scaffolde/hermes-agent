@@ -122,6 +122,10 @@ jobs:
           # size. The remaining time is the slowest files plus the setup.
           # Workers above the core count only add contention.
           HERMES_TEST_WORKERS: 8
+          # The 245-case state-store file takes 6-7 minutes under concurrent
+          # Plex load. Keep each attempt bounded without misclassifying normal
+          # shared-runner dilation as a hung test process.
+          HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

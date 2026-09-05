@@ -79,6 +79,20 @@ def test_watched_run_jobs_carry_the_workflow_name_into_the_comment():
     assert job_urls[f"{DOCKER} / build (amd64)"] == "https://example/1"
 
 
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out", "action_required"])
+def test_blocking_terminal_conclusions_are_reported_as_failures(conclusion):
+    completed, pending, _urls = classify_jobs([
+        {
+            "name": "Python tests",
+            "status": "completed",
+            "conclusion": conclusion,
+            "html_url": "https://example/job",
+        }
+    ])
+    assert completed == {"Python tests": "failure"}
+    assert pending == []
+
+
 def test_parse_watch_workflows_keeps_commas_inside_a_name():
     """Workflow names contain commas, so the list is newline-separated."""
     assert _mod.parse_watch_workflows("Docker Build, Test, and Publish\n") == [

@@ -964,6 +964,15 @@ class TestReviewRound3:
         import tools.browser_tool as bt
         bt._real_profile_cdp_cache.clear()
         proc = Mock(returncode=0, stdout="", stderr="")
+        browser_proc = Mock()
+        browser_proc.poll.return_value = None
+
+        def fake_popen(_argv, **_kwargs):
+            (tmp_path / "DevToolsActivePort").write_text(
+                "9251\n/devtools/browser/x\n"
+            )
+            return browser_proc
+
         with patch.object(bt, "_use_real_profile", return_value=True), \
              patch.object(bt, "_using_lightpanda_engine", return_value=False), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
@@ -974,6 +983,7 @@ class TestReviewRound3:
                           side_effect=[None, "http://127.0.0.1:9251"]), \
              patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
              patch.object(bt.subprocess, "run", return_value=proc), \
+             patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
              patch.object(bt, "_is_headed_mode", return_value=False):
             cdp, err = bt._real_profile_cdp()
         assert err is None

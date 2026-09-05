@@ -100,6 +100,20 @@ def test_failed_jobs_empty_needs():
     assert _mod.collect_failed_jobs("", "https://run") == []
 
 
+def test_failed_jobs_include_every_aggregate_blocking_result():
+    needs = json.dumps({
+        "failed": "failure",
+        "cancelled": "cancelled",
+        "timed-out": "timed_out",
+        "action": "action_required",
+        "skipped": "skipped",
+    })
+    items = _mod.collect_failed_jobs(needs, "https://run")
+    assert {item.title for item in items} == {
+        "failed", "cancelled", "timed-out", "action"
+    }
+
+
 
 
 
@@ -353,5 +367,4 @@ def test_render_both_emitted_link_and_job_url():
     assert "[View job](https://github.com/run/1/job/5)" in body
     # Both links on the same line, separated by ·
     assert " · " in body
-
 

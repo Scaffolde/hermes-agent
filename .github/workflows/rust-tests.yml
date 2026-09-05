@@ -52,6 +52,11 @@ jobs:
             libssl-dev \
             patchelf
 
+      - name: Add the runner's Rust toolchain to PATH
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" --version
+
       # Keyed on Cargo.toml, not Cargo.lock: apps/bootstrap-installer/.gitignore
       # excludes the lockfile (a create-tauri-app scaffold default), so there is
       # nothing pinned to hash and `--locked` cannot be used. That also means

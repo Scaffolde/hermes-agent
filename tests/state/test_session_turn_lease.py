@@ -279,14 +279,16 @@ def test_turn_lease_refresh_and_release_are_owner_fenced(tmp_path):
     )
 
 
-def test_expired_turn_lease_is_reclaimed(tmp_path):
+def test_expired_turn_lease_is_reclaimed(tmp_path, monkeypatch):
     db = SessionDB(tmp_path / "state.db")
     db.create_session("shared", source="test")
+    timestamps = iter((100.0, 101.0))
+    monkeypatch.setattr(
+        hermes_state.time, "time", lambda: next(timestamps, 101.0)
+    )
     assert db.try_acquire_session_turn_lease(
         "shared", "legacy-holder", ttl_seconds=0.05
     )
-
-    time.sleep(0.15)
 
     assert db.try_acquire_session_turn_lease(
         "shared", "pid=202:turn=reclaimer", ttl_seconds=5

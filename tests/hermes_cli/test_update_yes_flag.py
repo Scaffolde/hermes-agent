@@ -12,7 +12,27 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.main import cmd_update
+
+
+@pytest.fixture(autouse=True)
+def _keep_mocked_update_modules_loaded(monkeypatch):
+    """Keep update unit tests inside their mocked process boundary."""
+    from hermes_cli import main as hermes_main
+    from hermes_cli import gateway as hermes_gateway
+
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr(
+        hermes_gateway, "find_gateway_pids", lambda **_kwargs: []
+    )
+    monkeypatch.setattr(
+        hermes_gateway, "find_profile_gateway_processes", lambda **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        hermes_gateway, "_get_service_pids", lambda *_args, **_kwargs: []
+    )
 
 
 def _make_run_side_effect(

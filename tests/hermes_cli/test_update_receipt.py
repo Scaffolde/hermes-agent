@@ -207,6 +207,14 @@ class TestCommandBoundaryFinalization:
 
         from hermes_cli import main as hermes_main
 
+        for name in (
+            "detect_install_method",
+            "_install_hangup_protection",
+            "_finalize_update_output",
+        ):
+            if not hasattr(hermes_main, name):
+                setattr(hermes_main, name, None)
+
         def _fake_impl(args, gateway_mode):
             ur.begin_update_receipt()
             ur.record_step("windows_preflight", False, "hermes.exe holds venv")

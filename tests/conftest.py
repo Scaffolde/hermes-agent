@@ -1935,6 +1935,21 @@ def pytest_runtest_setup(item):
         )
 
 
+def _reject_multiple_os_marks(items):
+    """Fail collection when one test carries two host-OS markers."""
+    offenders = []
+    for item in items:
+        marks = sorted({m.name for m in item.iter_markers() if m.name in _OS_MARKS})
+        if len(marks) > 1:
+            offenders.append(f"  {item.nodeid}: {', '.join(marks)}")
+    if offenders:
+        raise pytest.UsageError(
+            "a test may carry at most one host-OS marker "
+            f"({', '.join(_OS_MARKS)}); these carry several and would be "
+            "skipped on every host:\n" + "\n".join(offenders)
+        )
+
+
 def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
     """Skip ``requires_wal`` tests when the linked SQLite can't use WAL.
 
@@ -1947,12 +1962,7 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
     """
     _warn_on_direct_multi_file_run(config, items)
 
-    for item in items:
-        marks = sorted({m.name for m in item.iter_markers() if m.name in _OS_MARKS})
-        if len(marks) > 1:
-            raise pytest.UsageError(
-                f"{item.nodeid} carries multiple host OS markers: {', '.join(marks)}"
-            )
+    _reject_multiple_os_marks(items)
     for mark_name, (is_host, label) in _OS_MARKS.items():
         if is_host():
             continue

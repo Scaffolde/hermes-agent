@@ -8642,20 +8642,26 @@ def _minimax_response_error_text(
             text = response.text
             return text[:limit] + ("...[truncated]" if len(text) > limit else "")
 
-        for chunk in response.iter_bytes():
-            if not chunk:
-                continue
-            remaining = limit + 1 - total
-            if remaining <= 0:
-                truncated = True
-                break
-            if len(chunk) > remaining:
-                chunks.append(chunk[:remaining])
-                total += remaining
-                truncated = True
-                break
-            chunks.append(chunk)
-            total += len(chunk)
+        try:
+            for chunk in response.iter_bytes(chunk_size=4096):
+                if not chunk:
+                    continue
+                remaining = limit + 1 - total
+                if remaining <= 0:
+                    truncated = True
+                    break
+                if len(chunk) > remaining:
+                    chunks.append(chunk[:remaining])
+                    total += remaining
+                    truncated = True
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+        except httpx.HTTPError:
+            # A peer may reset the stream after sending enough of an error
+            # response to explain the failure. Preserve that bounded prefix
+            # instead of leaking a transport exception from an auth path.
+            truncated = True
         raw = b"".join(chunks)
         if len(raw) > limit:
             raw = raw[:limit]

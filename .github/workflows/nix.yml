@@ -60,6 +60,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Activate an existing Nix installation
+        run: |
+          if [ -x /nix/var/nix/profiles/default/bin/nix ]; then
+            echo "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
+          fi
+
       - name: Install Nix
         uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
         with:
